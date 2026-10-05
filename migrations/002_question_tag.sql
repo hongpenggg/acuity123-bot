@@ -15,5 +15,5 @@ alter table questions
 
 commit;
 
--- Optional: load the tag for the bank in seeds/01_preclinical_mcqs.sql by
+-- Optional: load the tag for the bank in seeds/01_preclin_mcqs.sql by
 -- re-running that file against an empty questions table.

@@ -210,8 +210,8 @@ commit;
 --
 -- Load AFTER schema.sql, in file order:
 --   psql "$DATABASE_URL" -f schema.sql
---   psql "$DATABASE_URL" -f seeds/01_preclinical_mcqs.sql
---   psql "$DATABASE_URL" -f seeds/02_clinical_mcqs.sql
+--   psql "$DATABASE_URL" -f seeds/01_preclin_mcqs.sql
+--   psql "$DATABASE_URL" -f seeds/02_clin_mcqs.sql
 --   psql "$DATABASE_URL" -f seeds/03_postmbbs_mcqs.sql
 --
 -- Re-running is blocked by the guard below. To reload from scratch:
