@@ -35,7 +35,7 @@ async def on_error(event: ErrorEvent) -> None:
               exc_info=event.exception)
     if isinstance(event.update.event, CallbackQuery):
         with contextlib.suppress(Exception):
-            await event.update.event.answer("Something went wrong — please try again.")
+            await event.update.event.answer("Something went wrong. Please try again.")
 
 
 async def main() -> None:

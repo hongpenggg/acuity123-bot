@@ -13,11 +13,31 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
 
-from bot.text import MAX_OPTIONS, render
+from bot.text import MAX_OPTIONS, esc, explanation_block, render
+
+
+def _balanced_telegram_html(body: str) -> bool:
+    """True if `body` only uses the tags the bot emits, properly nested."""
+    stack: list[str] = []
+    ok = True
+
+    class Check(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            nonlocal ok
+            ok &= tag in ("b", "i") and not attrs
+            stack.append(tag)
+
+        def handle_endtag(self, tag):
+            nonlocal ok
+            ok &= bool(stack) and stack.pop() == tag
+
+    Check(convert_charrefs=True).feed(body)
+    return ok and not stack
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("TEST_DATABASE_URL"),
@@ -103,9 +123,14 @@ async def test_every_question_is_renderable(bank):
     for row in rows:
         body, count = render(row)
         sizes[count] += 1
-        assert body.startswith(f"[{row['topic']}]")
-        assert row["text"] in body
+        assert body.startswith(f"👁 <b>{esc(row['topic'])}</b>")
+        assert esc(row["text"]) in body
         assert count <= MAX_OPTIONS
+        # Telegram rejects the whole message if the HTML is malformed, so check
+        # both the fresh card and the answered one with its explanation.
+        answered, _ = render(row, chosen=0)
+        for html_body in (body, f"{answered}\n\n{explanation_block(row['explanation'])}"):
+            assert _balanced_telegram_html(html_body), row["id"]
 
     assert sizes[5] == 118
     assert sizes[4] == 2

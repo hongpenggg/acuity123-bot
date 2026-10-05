@@ -197,6 +197,25 @@ async def record_attempt(uid: int, question, idx: int, correct: bool,
     return row is not None
 
 
+async def practice_streak(uid: int) -> int:
+    """How many /practice answers in a row the user has got right, counting back
+    from the latest. Capped by the limit, which is far beyond what we display."""
+    conn = _require_pool()
+    rows = await conn.fetch(
+        """select correct from attempts
+            where user_id = $1 and mode = 'practice'
+            order by id desc
+            limit 50""",
+        uid,
+    )
+    streak = 0
+    for row in rows:
+        if not row["correct"]:
+            break
+        streak += 1
+    return streak
+
+
 async def save_explanation(qid: int, text: str) -> None:
     """Single-writer cache: if two people tap Explain at the same moment only the
     first answer is kept, so a stale explanation can never overwrite a fresh one."""

@@ -3,8 +3,10 @@ import json
 
 import pytest
 
-from bot.text import (MAX_OPTIONS, chunks, letter, letters, mask,
-                      parse_options, render)
+import random
+
+from bot.text import (MAX_OPTIONS, WEEKLY_HEADER, chunks, explanation_block, letter,
+                      letters, mask, parse_options, render, verdict)
 
 
 def q(options, correct_idx=0, topic="Sample", text="Question?"):
@@ -31,8 +33,51 @@ def test_render_handles_every_allowed_option_count(count):
     options = [f"option {i}" for i in range(count)]
     body, n = render(q(options, correct_idx=count - 1))
     assert n == count
-    assert f"{letter(count - 1)}. option {count - 1}" in body
-    assert body.startswith("[Sample]\nQuestion?")
+    assert f"<b>{letter(count - 1)}.</b> option {count - 1}" in body
+    assert body.startswith("👁 <b>Sample</b>\n\nQuestion?")
+
+
+def test_render_escapes_stored_text_for_html():
+    body, _ = render(q(["IOP < 21", "a & b"], text="Which is <normal>?", topic="R&D"))
+    assert "<b>R&amp;D</b>" in body
+    assert "Which is &lt;normal&gt;?" in body
+    assert "IOP &lt; 21" in body and "a &amp; b" in body
+
+
+def test_answered_card_marks_the_options_in_place():
+    body, _ = render(q(["w", "x", "y"], correct_idx=2), chosen=0)
+    assert "❌ <b>A.</b> w" in body
+    assert "<b>B.</b> x" in body and "❌ <b>B.</b>" not in body and "✅ <b>B.</b>" not in body
+    assert "✅ <b>C.</b> y" in body
+
+    right, _ = render(q(["w", "x"], correct_idx=1), chosen=1)
+    assert "✅ <b>B.</b> x" in right and "❌" not in right
+
+
+def test_long_options_get_breathing_room():
+    short, _ = render(q(["III", "IV", "VI"]))
+    assert "\n\n<b>B.</b>" not in short
+    long_opts = ["a fairly long option that wraps onto two lines on a phone"] * 3
+    spaced, _ = render(q(long_opts))
+    assert "\n\n<b>B.</b>" in spaced
+
+
+def test_weekly_header_sits_above_the_topic():
+    body, _ = render(q(["a", "b"]), header=WEEKLY_HEADER)
+    assert body.startswith(WEEKLY_HEADER + "\n👁 <b>Sample</b>")
+
+
+def test_verdict_lines():
+    rng = random.Random(0)
+    assert verdict(True, 0, rng=rng).startswith("✅ <b>")
+    assert "🔥 4 in a row" in verdict(True, 0, streak=4, rng=rng)
+    assert "🔥" not in verdict(True, 0, streak=2, rng=rng)
+    wrong = verdict(False, 4, rng=rng)
+    assert wrong.startswith("❌ <b>") and wrong.endswith("The answer is <b>E</b>.")
+
+
+def test_explanation_block_is_escaped():
+    assert explanation_block(" A < B \n") == "💡 <b>Why</b>\nA &lt; B"
 
 
 def test_render_accepts_jsonb_returned_as_text():

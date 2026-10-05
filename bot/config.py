@@ -34,12 +34,16 @@ LEVELS: dict[str, str] = {
     "postmbbs": "Post-MBBS",
 }
 DEFAULT_LEVEL = "preclin"
+LEVEL_EMOJI: dict[str, str] = {
+    "preclin": "📖",
+    "clin": "🩺",
+    "postmbbs": "🎓",
+}
 
+# Shown in italics at the foot of /start and /help.
 CREDIT = (
-    "👁 LKC OphSoc Tele Bot\n"
-    "LKC Ophthalmology Society\n"
-    "Made by Zhong Han (Vice-Chairperson, LKC OphSoc 26/27)\n"
-    "and the Acuity Team — Zhong Han, Rahul, Hongpeng, Jeromy"
+    "Made by Zhong Han (Vice-Chairperson, LKC OphSoc 26/27) and the Acuity Team: "
+    "Zhong Han, Rahul, Hongpeng and Jeromy."
 )
 
-DISCLAIMER = "Educational revision only — not clinical advice."
+DISCLAIMER = "For revision only, not clinical advice."

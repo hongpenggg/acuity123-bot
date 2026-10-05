@@ -1,10 +1,14 @@
 """Pure presentation helpers: option letters, question rendering, name masking.
 
 Kept free of aiogram and database imports so they can be unit-tested directly.
+Question cards are Telegram HTML, so every piece of stored text goes through
+`esc()` before it is placed inside markup.
 """
 from __future__ import annotations
 
+import html
 import json
+import random
 from typing import Any
 
 # Keep in step with the `jsonb_array_length(options) between 2 and ...` CHECK in
@@ -37,11 +41,67 @@ def parse_options(raw: Any) -> list[str]:
     return opts
 
 
-def render(question) -> tuple[str, int]:
-    """Return (message body, option count) for a question row."""
+def esc(text: Any) -> str:
+    """Escape stored text for Telegram's HTML parse mode."""
+    return html.escape(str(text), quote=False)
+
+
+# Options longer than this get a blank line between them, so a card full of
+# two-line answers doesn't read as one wall of text.
+_SPACED_OPTION_LEN = 40
+
+WEEKLY_HEADER = "📅 <b>Question of the week</b>"
+
+_RIGHT = ("Correct!", "Nice one!", "Spot on!")
+_WRONG = ("Not quite.", "Not this one.")
+STREAK_FROM = 3
+
+
+def render(question, *, chosen: int | None = None,
+           header: str | None = None) -> tuple[str, int]:
+    """Return (HTML body, option count) for a question row.
+
+    With `chosen` set the card is shown answered: ✅ on the right option and ❌
+    on a wrong pick, so the verdict line never has to repeat a long option.
+    """
     opts = parse_options(question["options"])
-    body = "\n".join(f"{letter(i)}. {o}" for i, o in enumerate(opts))
-    return f"[{question['topic']}]\n{question['text']}\n\n{body}", len(opts)
+    correct = question["correct_idx"] if chosen is not None else None
+
+    lines = []
+    for i, option in enumerate(opts):
+        mark = ""
+        if chosen is not None:
+            if i == correct:
+                mark = "✅ "
+            elif i == chosen:
+                mark = "❌ "
+        lines.append(f"{mark}<b>{letter(i)}.</b> {esc(option)}")
+    gap = "\n\n" if max(len(o) for o in opts) > _SPACED_OPTION_LEN else "\n"
+
+    top = f"👁 <b>{esc(question['topic'])}</b>"
+    if header:
+        top = f"{header}\n{top}"
+    return f"{top}\n\n{esc(question['text'])}\n\n{gap.join(lines)}", len(opts)
+
+
+def verdict(correct: bool, answer_idx: int, streak: int = 0,
+            rng: random.Random | None = None) -> str:
+    """The line under an answered card. Short on purpose: the options above
+    already show which one was right."""
+    pick = (rng or random).choice
+    if correct:
+        line = f"✅ <b>{pick(_RIGHT)}</b>"
+        if streak >= STREAK_FROM:
+            line += f"\n🔥 {streak} in a row"
+        return line
+    return f"❌ <b>{pick(_WRONG)}</b> The answer is <b>{letter(answer_idx)}</b>."
+
+
+EXPLANATION_HEADING = "💡 <b>Why</b>"
+
+
+def explanation_block(text: str) -> str:
+    return f"{EXPLANATION_HEADING}\n{esc(text.strip())}"
 
 
 def mask(username: str | None, uid: int) -> str:
