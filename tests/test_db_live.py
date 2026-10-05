@@ -140,7 +140,7 @@ async def test_schema_rejects_a_correct_idx_outside_the_options(pool):
 
     from bot import db
 
-    with pytest.raises(asyncpg.exceptions.CheckViolation):
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
         await db.pool.execute(
             """insert into questions (level, topic, text, options, correct_idx)
                values ('preclin', 'X', 'Q', '["a","b"]'::jsonb, 5)"""

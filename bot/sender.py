@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from . import db
+from .config import LEVELS
 from .text import TELEGRAM_LIMIT, chunks, letter, render
 
 log = logging.getLogger(__name__)
@@ -83,6 +84,29 @@ async def send_question(bot: Bot, uid: int, question, mode: str) -> bool:
     return await safe_send(bot, uid, body, reply_markup=question_kb(question["id"], count, mode))
 
 
+async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> bool:
+    """A question at this level, or a clear explanation of why there isn't one.
+
+    The Clinical and Post-MBBS banks are still being written, so a student who
+    picks one of those levels must be told what is available rather than being
+    met with silence or a crash.
+    """
+    question = await db.pick_question(uid, level)
+    if question is not None:
+        return await send_question(bot, uid, question, mode)
+
+    available = await db.levels_with_questions()
+    if not available:
+        return await send_question(bot, uid, None, mode)
+
+    names = ", ".join(LEVELS.get(name, name) for name in available)
+    return await safe_send(
+        bot, uid,
+        f"No {LEVELS.get(level, level)} questions yet — that bank is still being "
+        f"written.\nAvailable now: {names}.\nSwitch with /level.",
+    )
+
+
 async def ack(c: CallbackQuery, text: str | None = None, alert: bool = False) -> None:
     """Close the client-side spinner on a callback query.
 
@@ -126,4 +150,5 @@ __all__ = [
     "question_kb",
     "safe_send",
     "send_question",
+    "send_question_for_level",
 ]

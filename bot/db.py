@@ -122,6 +122,16 @@ async def topics(level: str) -> list[str]:
     return [r["topic"] for r in rows]
 
 
+async def levels_with_questions() -> list[str]:
+    """Which audience levels actually have content — so the bot can tell a
+    student whose level is still being written what is available instead of
+    looking broken."""
+    conn = _require_pool()
+    rows = await conn.fetch(
+        "select distinct level from questions order by level")
+    return [r["level"] for r in rows]
+
+
 async def get_question(qid: int):
     conn = _require_pool()
     return await conn.fetchrow("select * from questions where id = $1", qid)

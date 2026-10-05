@@ -1,3 +1,5 @@
 pytest>=8.0
 pytest-asyncio>=0.23
 pglast>=7.0
+python-docx>=1.1
+ruff>=0.6

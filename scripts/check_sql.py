@@ -88,7 +88,12 @@ def statements_from(path: Path) -> list[str]:
 
 
 def main() -> int:
-    files = [ROOT / "schema.sql", *(ROOT / "migrations").glob("*.sql"), ROOT / "bot" / "db.py"]
+    files = [
+        ROOT / "schema.sql",
+        *(ROOT / "migrations").glob("*.sql"),
+        *(ROOT / "seeds").glob("*.sql"),
+        ROOT / "bot" / "db.py",
+    ]
 
     failures = 0
     parsed = 0

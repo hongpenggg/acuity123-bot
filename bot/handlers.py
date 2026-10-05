@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from . import db, jobs, llm
 from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVELS, TZ
-from .sender import ack, deliver_verdict, safe_send, send_question
+from .sender import ack, deliver_verdict, safe_send, send_question_for_level
 from .text import letter, mask, parse_options
 
 log = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ async def practice(m: Message, bot: Bot):
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = _level(await db.get_level(uid))
-    await send_question(bot, uid, await db.pick_question(uid, level), "practice")
+    await send_question_for_level(bot, uid, level, "practice")
 
 
 @router.callback_query(F.data == "next")
@@ -137,7 +137,7 @@ async def next_question(c: CallbackQuery, bot: Bot):
         answered = True
         uid = c.from_user.id
         level = _level(await db.get_level(uid))
-        await send_question(bot, uid, await db.pick_question(uid, level), "practice")
+        await send_question_for_level(bot, uid, level, "practice")
     except Exception:
         log.exception("next failed")
     finally:
@@ -238,7 +238,11 @@ async def on_explain(c: CallbackQuery, bot: Bot):
         except Exception:
             log.exception("explain failed for question %s", question["id"])
             text = "Sorry, explanations are unavailable right now."
-        await safe_send(bot, uid, f"💡 {text}\n\n({DISCLAIMER})")
+        if text:
+            await safe_send(bot, uid, f"💡 {text}\n\n({DISCLAIMER})")
+        else:
+            # No stored explanation and no provider configured.
+            await safe_send(bot, uid, "No written explanation for this question yet.")
     except Exception:
         log.exception("on_explain failed")
     finally:

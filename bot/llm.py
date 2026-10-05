@@ -10,7 +10,7 @@ import logging
 import httpx
 
 from . import db
-from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from .config import LLM_API_KEY, LLM_BASE_URL, LLM_ENABLED, LLM_MODEL
 from .text import letter, parse_options
 
 log = logging.getLogger(__name__)
@@ -37,10 +37,18 @@ def build_prompt(question) -> str:
     )
 
 
-async def explain(question) -> str:
-    """Cached per question; the cache write is a no-op if someone else won the race."""
+async def explain(question) -> str | None:
+    """A written explanation for this question, or None if there isn't one.
+
+    Returns the stored explanation when present — which is the case for the whole
+    preclinical bank, so the LLM is never called for it. Returns None when no
+    provider is configured, letting the caller say so plainly instead of
+    erroring. The cache write is a no-op if someone else won the race.
+    """
     if question["explanation"]:
         return question["explanation"]
+    if not LLM_ENABLED:
+        return None
 
     prompt = build_prompt(question)
     last_error: Exception | None = None
