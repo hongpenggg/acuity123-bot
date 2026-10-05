@@ -1,0 +1,5 @@
+aiogram>=3.13,<4
+asyncpg
+apscheduler<4
+httpx
+python-dotenv
