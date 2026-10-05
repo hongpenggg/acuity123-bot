@@ -69,8 +69,15 @@ async def bank():
 
 @pytest.fixture(autouse=True)
 async def _clean(bank):
-    """Each test starts with no answers on record."""
-    await bank.pool.execute("truncate attempts restart identity cascade")
+    """Each test starts with no answers and no tournament on record.
+
+    The tournaments have to go too: `active_tournament()` returns the *first*
+    active row, so a tournament left open by an earlier test would shadow the one
+    this test creates and mask a real failure.
+    """
+    await bank.pool.execute(
+        "truncate attempts, tournament_answers, tournament_points, tournaments "
+        "restart identity cascade")
     yield
 
 
