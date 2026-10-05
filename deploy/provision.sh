@@ -29,6 +29,7 @@ set -euo pipefail
 APP_DIR=/opt/studybot
 APP_USER=deploy
 REPO_URL="${REPO_URL:-https://github.com/hongpenggg/acuity123-bot.git}"
+BRANCH="${BRANCH:-main}"
 DB_NAME="${DB_NAME:-studybot}"
 DB_USER="${DB_USER:-studybot}"
 SWAP_MB="${SWAP_MB:-1024}"
@@ -186,8 +187,8 @@ if [ -d "$APP_DIR/.git" ]; then
     ok "repo already present (not overwriting local changes)"
 else
     install -d -o "$APP_USER" -g "$APP_USER" "$APP_DIR"
-    sudo -u "$APP_USER" git clone --quiet "$REPO_URL" "$APP_DIR"
-    ok "cloned"
+    sudo -u "$APP_USER" git clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+    ok "cloned branch ${BRANCH}"
 fi
 
 log "Creating the virtualenv"
@@ -200,12 +201,54 @@ sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install -q --upgrade pip
 sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 ok "$("$APP_DIR/.venv/bin/python" -c 'import aiogram, asyncpg, apscheduler; print("aiogram", aiogram.__version__)')"
 
+# ------------------------------------------------------- 8b. schema and banks
+# Idempotent: only applies what is missing, so a re-run never trips the seeds'
+# own double-load guard (which would abort the script under `set -e`).
+if [ -n "${DB_PASSWORD:-}" ]; then
+    export DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@127.0.0.1:5432/${DB_NAME}"
+
+    log "Applying the schema"
+    if [ "$(psql "$DATABASE_URL" -tAc "select to_regclass('public.questions') is not null" 2>/dev/null || echo f)" = "t" ]; then
+        ok "schema already applied"
+    else
+        psql "$DATABASE_URL" -q -f "$APP_DIR/schema.sql"
+        ok "schema applied"
+    fi
+
+    log "Loading the question banks"
+    LOADED=$(psql "$DATABASE_URL" -tAc "select count(*) from questions" 2>/dev/null || echo 0)
+    if [ "${LOADED:-0}" -eq 0 ]; then
+        for seed in "$APP_DIR"/seeds/*.sql; do
+            psql "$DATABASE_URL" -q -f "$seed" >/dev/null
+            ok "loaded $(basename "$seed")"
+        done
+    else
+        ok "already loaded (${LOADED} questions)"
+    fi
+
+    log "Content in the database"
+    psql "$DATABASE_URL" -c "select level, count(*) as questions from questions group by level order by level"
+else
+    warn "DB_PASSWORD not set — skipping schema and question banks"
+fi
+
 # ----------------------------------------------------------------- 9. systemd
 log "Installing the systemd unit"
 install -m 644 "$APP_DIR/deploy/studybot.service" /etc/systemd/system/studybot.service
 systemctl daemon-reload
 systemctl enable studybot >/dev/null 2>&1
-ok "enabled (not started — .env comes next)"
+ok "enabled"
+
+# ------------------------------------------------------------------ 10. start
+if [ -f "$APP_DIR/.env" ] && grep -qE '^BOT_TOKEN=.+' "$APP_DIR/.env"; then
+    log "Starting the bot"
+    systemctl restart studybot
+    sleep 4
+    ok "studybot is $(systemctl is-active studybot || true)"
+    journalctl -u studybot -n 15 --no-pager || true
+else
+    warn "no usable ${APP_DIR}/.env yet — installed but not started"
+fi
 
 log "Done"
 cat <<NEXT
