@@ -768,7 +768,11 @@ def test_html_is_never_sent_without_parse_mode():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            name = getattr(node.func, "attr", None)
+            # `m.answer(...)` is an Attribute; bare `safe_send(...)` is a Name.
+            # Only checking the first let every safe_send call in bot/ through,
+            # and the tournament announcement shipped literal <b> tags to every
+            # user because of it.
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
             if name not in senders or "parse_mode" in {k.arg for k in node.keywords}:
                 continue
             # safe_send(bot, uid, text); everything else takes the text first.
@@ -938,12 +942,27 @@ async def test_resources_by_code_sends_the_pdf_itself(fake):
 
 @pytest.mark.asyncio
 async def test_tapping_a_sheet_sends_it(fake):
-    c = FakeCallback("res:get:b:B14", message=FakeMessage())
+    fake.users[1] = "preclin"
+    c = FakeCallback("res:get:preclin:b:B14", message=FakeMessage())
 
     await handlers.resources_cb(c, fake.bot)
 
     assert c.answers, "the client spinner must always be closed"
     assert any("document" in m for m in fake.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_a_sheet_button_from_another_stream_is_refused(fake):
+    """Codes repeat across levels, so a button drawn before the student switched
+    stream would otherwise hand over whatever carries that code at the new level,
+    silently, and mark it delivered so /notes skips it."""
+    fake.users[1] = "clin"
+    c = FakeCallback("res:get:preclin:b:B14", message=FakeMessage())
+
+    await handlers.resources_cb(c, fake.bot)
+
+    assert not any("document" in m for m in fake.bot.sent), "wrong level served"
+    assert any("switched stream" in (a.get("text") or "") for a in c.answers)
 
 
 @pytest.mark.asyncio

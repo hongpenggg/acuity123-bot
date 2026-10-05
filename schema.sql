@@ -49,7 +49,10 @@ create table attempts (
   topic        text        not null,
   chosen_idx   int         not null,
   correct      boolean     not null,
-  mode         text        not null check (mode in ('practice', 'weekly')),
+  -- 'review' is its own mode so it cannot score: a student who answers wrong in
+  -- /quizme is shown the correct option, so letting a /review re-answer award a
+  -- tournament point would let anyone reach full marks regardless of knowledge.
+  mode         text        not null check (mode in ('practice', 'weekly', 'review')),
   msg_id       bigint      not null,
   created_at   timestamptz not null default now(),
   unique (user_id, msg_id)

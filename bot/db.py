@@ -8,6 +8,8 @@ Conventions:
 """
 from __future__ import annotations
 
+from collections.abc import Collection
+
 import asyncpg
 
 pool: asyncpg.Pool | None = None
@@ -225,11 +227,15 @@ _SET_COUNTS_SQL = """
 #: recency rank; `partial_set` is the tail of that — the answers already in the
 #: set being built, which is the only sense in which a set has members.
 _PICK_SQL = """
+    -- Ordered by each question's FIRST attempt, not its latest. A /review
+    -- answer is always a later attempt, so collapsing on the latest would
+    -- re-date an old question into the set being built and push a genuine
+    -- member out of it.
     with history as (
       select distinct on (question_id) question_id, id
         from attempts
        where user_id = $1 and level = $2
-       order by question_id, id desc
+       order by question_id, id asc
     ),
     recent as (
       select question_id,
@@ -249,11 +255,16 @@ _PICK_SQL = """
     -- coalesce below is mid-range and not 0.0: a topic nobody has tried should
     -- rank ahead of one the student has mastered but behind one they are
     -- failing, so a student still meets new material.
+    -- One vote per question, and it is the student's LATEST answer that says
+    -- where they stand: aggregating raw attempt rows let a /review answer count
+    -- twice and kept a topic they have since fixed looking weak.
     topic_accuracy as (
       select topic,
              (count(*) filter (where correct) + 1.0) / (count(*) + 2.0) as accuracy
-        from attempts
-       where user_id = $1 and level = $2
+        from (select distinct on (question_id) question_id, topic, correct
+                from attempts
+               where user_id = $1 and level = $2
+               order by question_id, id desc) latest
        group by topic
     )
     select q.*
@@ -265,6 +276,11 @@ _PICK_SQL = """
        -- miss is revisited through its topic's weight, not by re-serving it.
        and not exists (select 1 from attempts a
                         where a.user_id = $1 and a.question_id = q.id)
+       -- Questions already handed out this round but not yet answered. The
+       -- Monday push draws five in a row with nothing recorded in between, so
+       -- without this every call sees identical history and the same top-ranked
+       -- topic, and the student is sent the same question up to five times.
+       and not (q.id = any($4::int[]))
      -- Lowest score wins. The weights are spaced so each term outvotes
      -- everything under it (4 > 1 + 1, 1 > any accuracy, which is always < 1),
      -- so this reads as one number but ranks strictly by priority: spread the
@@ -282,14 +298,17 @@ _PICK_SQL = """
      limit 1
 """
 
-#: The most recent SET_SIZE answers, however they fall. Same `history` collapse
-#: as _PICK_SQL so the set number it reports cannot disagree with current_set's.
+#: How the set that just closed went. Collapsed on each question's FIRST attempt
+#: for the same reason as _PICK_SQL: a /review answer must not re-date an old
+#: question into the window and evict one of the five that genuinely belong to
+#: the set. The score is therefore how the student did on those five the first
+#: time they met them, which is what "your set score" means.
 _LAST_SET_SQL = """
     with history as (
       select distinct on (question_id) question_id, id, correct
         from attempts
        where user_id = $1 and level = $2
-       order by question_id, id desc
+       order by question_id, id asc
     ),
     recent as (
       select correct,
@@ -337,15 +356,20 @@ async def current_set(uid: int, level: str) -> dict | None:
     # caller already has to handle separately to say so plainly.
     if total == 0 or answered >= total:
         return None
+    # The last set at a level is short whenever the bank is not a multiple of
+    # five - 103 clinical questions is twenty fives and then a three - so `size`
+    # is the real size of *this* set, not the constant. Reporting five made the
+    # card read "question 3 of 5" for a set holding three questions.
+    done_sets = answered // SET_SIZE
     return {
-        "number": answered // SET_SIZE + 1,
+        "number": done_sets + 1,
         "answered_in_set": answered % SET_SIZE,
-        "size": SET_SIZE,
+        "size": min(SET_SIZE, total - done_sets * SET_SIZE),
         "total_sets": (total + SET_SIZE - 1) // SET_SIZE,   # ceil, no float
     }
 
 
-async def pick_question(uid: int, level: str):
+async def pick_question(uid: int, level: str, exclude: Collection[int] = ()):
     """The next question for this student, or None once the level is exhausted.
 
     Always a question they have never attempted, ranked for variety first and
@@ -353,9 +377,15 @@ async def pick_question(uid: int, level: str):
     means two students at the same point do not get the same question, so this
     is deliberately *not* a shared benchmark: compare students with `stats` or
     the tournament, not by set number.
+
+    `exclude` is for a caller that builds several questions before any of them
+    is answered - the Monday push does exactly that. Ranking reads `attempts`,
+    so five calls in a row would otherwise see identical history and hand back
+    the same question five times.
     """
     conn = _require_pool()
-    return await conn.fetchrow(_PICK_SQL, uid, level, SET_SIZE)
+    return await conn.fetchrow(_PICK_SQL, uid, level, SET_SIZE,
+                               [int(qid) for qid in exclude])
 
 
 async def last_set_score(uid: int, level: str) -> dict | None:

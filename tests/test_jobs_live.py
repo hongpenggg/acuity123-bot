@@ -131,14 +131,43 @@ async def test_weekly_push_gives_each_subscriber_five_at_their_own_level():
     assert 3 not in bot.per_user, "a non-subscriber must not be pushed to"
 
     assert result == {"sent": 2 * jobs.SET_PER_PUSH, "reached": 2,
-                      "subscribers": 2}
+                      "subscribers": 2, "finished": 0}
 
     # The level each student is on is the bank they are served from.
     assert all("P" in body for body in bot.msgs(1)[1:])
     assert all("C" in body for body in bot.msgs(2)[1:])
 
 
-async def test_weekly_push_skips_a_subscriber_who_has_finished_their_level():
+async def test_the_weekly_push_never_repeats_a_question_within_one_set():
+    """Nothing is answered during a push, so every pick_question call sees the
+    same history. Without an exclude list the top-ranked topic's question came
+    back up to five times under a "5 questions" heading."""
+    from bot import db, jobs
+
+    # Two topics, four questions each: a narrow pool, which is where the bug bit.
+    await _add_questions("preclin", ["P1", "P2"], per_topic=4)
+    await _subscriber(1, "preclin", weekly=True)
+    # Give them history so the ranking has a clear favourite.
+    first = await db.pool.fetch(
+        "select * from questions where topic = 'P1' order by id limit 2")
+    for row in first:
+        await db.record_attempt(1, row, 1, False, "practice", row["id"])
+
+    bot = FakeBot()
+    await jobs.weekly_quiz(bot)
+
+    served = await db.pool.fetch(
+        "select question_id, count(*) as n from attempts where user_id = 1 "
+        "and mode = 'weekly' group by question_id having count(*) > 1")
+    cards = [b for b in bot.msgs(1)[1:]]
+    assert len(cards) == jobs.SET_PER_PUSH
+    assert len(set(cards)) == jobs.SET_PER_PUSH, "the same question was sent twice"
+    assert served == []
+
+
+async def test_a_subscriber_who_has_finished_is_told_and_unsubscribed():
+    """Silence left them subscribed and waiting every Monday for something that
+    was never coming."""
     from bot import db, jobs
 
     await _add_questions("preclin", ["P1"], per_topic=3)
@@ -149,8 +178,11 @@ async def test_weekly_push_skips_a_subscriber_who_has_finished_their_level():
     bot = FakeBot()
     result = await jobs.weekly_quiz(bot)
 
-    assert bot.per_user == {}
-    assert result == {"sent": 0, "reached": 0, "subscribers": 1}
+    assert result == {"sent": 0, "reached": 0, "subscribers": 1, "finished": 1}
+    assert "every Pre-Clinical question answered" in bot.msgs(1)[0]
+    still_on = await db.pool.fetchval(
+        "select weekly_sub from users where telegram_id = 1")
+    assert still_on is False
 
 
 async def test_weekly_push_does_not_repeat_a_question_the_student_has_seen():

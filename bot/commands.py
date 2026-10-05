@@ -57,7 +57,7 @@ ADMIN = [
     BotCommand(command="admin_tournament_start", description="Start a tournament"),
     BotCommand(command="admin_tournament_end", description="Close it and announce winners"),
     BotCommand(command="admin_weekly_now", description="Send the Monday sets now"),
-    BotCommand(command="admin_notes_now", description="Send the monthly sheets now"),
+    BotCommand(command="admin_notes_now", description="Send the fortnightly sheets now"),
 ]
 
 

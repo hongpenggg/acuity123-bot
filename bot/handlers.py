@@ -28,7 +28,8 @@ _EXPLAIN_COOLDOWN = 10.0
 # with stale timestamps.
 _recent_explain: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 
-MODES = ("practice", "weekly")
+# 'review' answers are recorded but never scored - see schema.sql and on_answer.
+MODES = ("practice", "weekly", "review")
 
 TAGLINE = (
     "Your high-yield, one-stop ophthalmology hub for medical students and "
@@ -141,9 +142,14 @@ def _resources_tier_kb(level: str | None, tier: str,
     pages = max(1, -(-len(notes) // _PAGE))
     page = max(0, min(page, pages - 1))
     window = notes[page * _PAGE:(page + 1) * _PAGE]
+    # The level rides along. Without it a student who opens the browser, then
+    # switches stream, then taps a still-visible button gets whichever sheet
+    # happens to carry that code at the new level - silently, and it is then
+    # marked delivered so /notes skips it.
     buttons = [
-        InlineKeyboardButton(text=note.label,
-                             callback_data=f"res:get:{note.tier}:{note.code}")
+        InlineKeyboardButton(
+            text=note.label,
+            callback_data=f"res:get:{note.level}:{note.tier}:{note.code}")
         for note in window
     ]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
@@ -334,8 +340,9 @@ async def _report_set_if_finished(message, uid: int, level: str,
                 "switch level.")
     else:
         left = total - answered
+        nxt = min(db.SET_SIZE, left)
         tail = (f"{left} question{'s' if left != 1 else ''} left at this level. "
-                "Send /quizme for the next five.")
+                f"Send /quizme for the next {nxt}.")
 
     await message.answer(f"{head}\n{tail}", parse_mode="HTML")
 
@@ -483,8 +490,12 @@ async def review(m: Message, bot: Bot):
 
     Deliberately separate from /quizme: `pick_question` only ever serves
     unattempted questions, so without this a missed question never comes back.
-    Re-answering cannot inflate anything - set progress counts *distinct*
-    questions, and a tournament point is deduplicated per question in SQL.
+
+    Served under its own `review` mode, which is what stops it scoring. A wrong
+    answer in /quizme shows the student the correct option, so a re-answer that
+    awarded a tournament point would let anyone reach full marks without knowing
+    anything. Set progress is safe for a different reason: it counts *distinct*
+    questions, so a re-answer cannot advance it.
     """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
@@ -507,7 +518,7 @@ async def review(m: Message, bot: Bot):
         head += f" {more} more after these."
     await m.answer(head, parse_mode="HTML")
     for question in pile:
-        await send_question(bot, uid, question, "practice")
+        await send_question(bot, uid, question, "review")
 
 
 # ---------------------------------------------------------------- subscriptions
@@ -655,13 +666,19 @@ async def resources_cb(c: CallbackQuery, bot: Bot):
                     await message.edit_text(
                         f"{resources.TIERS.get(tier_code, 'Notes')} sheets, pick one:",
                         reply_markup=_resources_tier_kb(level, tier_code, page))
-        elif action == "get" and len(parts) > 3:
-            note = resources.get(level, parts[2], parts[3])
-            if note is None:
-                await ack(c, "That sheet has moved. Try /resources again.", True)
+        elif action == "get" and len(parts) > 4:
+            from_level, tier_code, code = parts[2], parts[3], parts[4]
+            if from_level != _level(level):
+                # They changed stream after this keyboard was drawn.
+                await ack(c, "You've switched stream since then. "
+                             "Send /resources for your current sheets.", True)
             else:
-                await ack(c)
-                await _deliver(bot, c.from_user.id, level, note)
+                note = resources.get(level, tier_code, code)
+                if note is None:
+                    await ack(c, "That sheet has moved. Try /resources again.", True)
+                else:
+                    await ack(c)
+                    await _deliver(bot, c.from_user.id, level, note)
         elif action == "noop":
             await ack(c)          # the page counter is a label, not a button
         else:
@@ -803,7 +820,6 @@ async def randomnotes(m: Message, command: CommandObject, bot: Bot):
     return None
 
 
-@router.message(Command("stats"))
 def _ranked(rows, key) -> list[tuple[str, int, int]]:
     """(name, correct, answered) grouped by `key`, weakest first."""
     out: dict[str, list[int]] = {}
@@ -854,7 +870,10 @@ async def stats_cmd(m: Message):
 
     rows = await db.stats(uid, level)
     correct = sum(row["correct"] for row in rows)
-    attempts = sum(row["answered"] for row in rows)
+    # db.stats counts attempt *rows*, so a /review re-answer would otherwise push
+    # this denominator past the size of the bank: "Correct 102 of 106" on a
+    # 103-question level.
+    attempts = min(sum(row["answered"] for row in rows), answered)
     total_sets = -(-total // db.SET_SIZE)
     streak = await db.practice_streak(uid)
     waiting = await db.wrong_count(uid, level)
@@ -865,7 +884,10 @@ async def stats_cmd(m: Message):
         f"({round(100 * answered / total)}%)",
         f"Correct <b>{correct}</b> of {attempts} "
         f"({round(100 * correct / attempts)}%)",
-        f"Sets finished <b>{answered // db.SET_SIZE}</b> of {total_sets}",
+        # A short final set never reaches the multiple, so a student who has
+        # answered all 103 clinical questions was told "20 of 21" forever.
+        f"Sets finished <b>{total_sets if answered >= total else answered // db.SET_SIZE}</b>"
+        f" of {total_sets}",
     ]
     if streak >= 2:
         lines.append(f"🔥 {streak} in a row right now")
@@ -932,6 +954,10 @@ async def leaderboard(m: Message):
             "🏆 No tournament running. When OphSoc starts one you are "
             "entered automatically.\n\n"
             "Meanwhile /quizme keeps your /stats moving.")
+    # Entry is automatic, so everyone sits on the board at zero the moment a
+    # tournament opens. Handing out medals for 0 pts made the race look over
+    # before it began, and buried the "nobody has scored yet" line below.
+    rows = [r for r in rows if r["points"] > 0]
     if not rows:
         return await m.answer("🏆 Nobody has scored yet. Set the pace with /quizme!")
 
@@ -941,7 +967,7 @@ async def leaderboard(m: Message):
         for r in rows
     )
     mine = await db.my_rank(m.from_user.id)
-    if mine is None:
+    if mine is None or not mine["points"]:
         tail = "\n\nYou have no points yet. Answer some /quizme sets!"
     else:
         tail = f"\n\nYou're #{mine['rk']} with {_pts(mine['points'])}."
@@ -987,7 +1013,10 @@ async def admin_tournament_end(m: Message, bot: Bot):
         return await m.answer("No tournament running.")
     await m.answer(f"Closing tournament {t['id']} and messaging the top 3...")
     rows = await jobs.finish_tournament(bot, t["id"])
-    await m.answer(f"Done. {len(rows)} participant(s) scored.")
+    scored = sum(1 for r in rows if r["points"] > 0)
+    await m.answer(
+        f"Done. {scored} of {len(rows)} entrant(s) scored. "
+        "Only those are messaged about an award.")
 
 
 @router.message(Command("admin_weekly_now"))

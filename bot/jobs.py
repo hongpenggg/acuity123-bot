@@ -46,33 +46,63 @@ async def weekly_quiz(bot) -> dict:
     subscribers = await db.subscribers("weekly_sub")
     sent = 0
     reached = 0
+    finished = 0
     for uid in subscribers:
         level = await db.get_level(uid) or DEFAULT_LEVEL
         current = await db.current_set(uid, level)
         if current is None:
-            continue          # finished this level, nothing left to push
+            # current_set says None both for a finished level and for one with no
+            # bank loaded. Silence either way left students subscribed and
+            # waiting every Monday for something that was never coming.
+            if await db.level_total(level):
+                await safe_send(
+                    bot, uid,
+                    "🏁 That is every "
+                    f"{LEVELS.get(level, level)} question answered, so there is "
+                    "no Monday set to send.\n\n"
+                    "/review the ones you missed, or /changestreams to move on. "
+                    "I'll stop sending these until then.")
+                await db.set_flag(uid, "weekly_sub", False)
+                finished += 1
+            else:
+                log.warning("no %s questions loaded; skipping user %s", level, uid)
+            await asyncio.sleep(FANOUT_PAUSE)
+            continue
+
+        # A full five every Monday, not "whatever is left of the set you are
+        # part-way through". A set is just a rolling block of five answers, so
+        # five new questions always advances the student by one set; only a level
+        # that is nearly exhausted sends fewer.
+        remaining, _ = await db.progress(uid, level)
+        count = min(SET_PER_PUSH, remaining)
         await safe_send(
             bot, uid,
-            f"📅 Your Monday quiz: set {current['number']} of "
-            f"{current['total_sets']}, {SET_PER_PUSH} questions.",
+            f"📅 Your Monday quiz: {count} question"
+            f"{'s' if count != 1 else ''}, picked for you. "
+            f"You're on set {current['number']} of {current['total_sets']}.",
         )
         await asyncio.sleep(FANOUT_PAUSE)
-        # Picked one at a time rather than as a batch: pick_question reads this
-        # student's history, so answering question 1 should influence what
-        # question 2 is, exactly as it does in /quizme.
+
+        # `exclude` is load-bearing. Nothing is answered during a push, so
+        # ranking sees identical history on every call: without it the same
+        # question came back up to five times under a "5 questions" heading.
         got = 0
-        for _ in range(SET_PER_PUSH):
-            question = await db.pick_question(uid, level)
+        taken: list[int] = []
+        for position in range(count):
+            question = await db.pick_question(uid, level, taken)
             if question is None:
                 break
-            if await send_question(bot, uid, question, "weekly"):
+            taken.append(question["id"])
+            lead = (f"📅 <b>Monday quiz</b> · question {position + 1} of {count}")
+            if await send_question(bot, uid, question, "weekly", lead=lead):
                 got += 1
             await asyncio.sleep(FANOUT_PAUSE)
         sent += got
         reached += bool(got)
-    log.info("weekly quiz: %s question(s) to %s of %s subscriber(s)",
-             sent, reached, len(subscribers))
-    return {"sent": sent, "reached": reached, "subscribers": len(subscribers)}
+    log.info("weekly quiz: %s question(s) to %s of %s subscriber(s), "
+             "%s finished their level", sent, reached, len(subscribers), finished)
+    return {"sent": sent, "reached": reached,
+            "subscribers": len(subscribers), "finished": finished}
 
 
 async def fortnightly_notes(bot) -> int:
@@ -157,6 +187,7 @@ async def announce_tournament(bot) -> int:
             f"Runs until {ends}. Every question you get right in /quizme is a "
             "point, and each question counts once.\n\n"
             "/leaderboard to see where you stand, /stats for your weak topics.",
+            parse_mode="HTML",
         ):
             sent += 1
         await asyncio.sleep(FANOUT_PAUSE)
@@ -175,24 +206,35 @@ async def finish_tournament(bot, tid: int) -> list:
     rows = await db.standings(tid)
     await db.end_tournament(tid)
 
-    for row in rows[:3]:
+    # Entry is automatic, so `rows` is everyone who ever pressed /start, most of
+    # them on zero. Telling someone they placed third with 0 points and should
+    # claim an award is worse than telling them nothing.
+    winners = [row for row in rows if row["points"] > 0][:3]
+    for row in winners:
+        points = f"{row['points']} point" + ("" if row["points"] == 1 else "s")
         await safe_send(
             bot, row["user_id"],
             f"🏆 The tournament's over and you finished #{row['rk']} with "
-            f"{row['points']} points! 🎉\n\n"
+            f"{points}! 🎉\n\n"
             "Message the LKC OphSoc EXCO (@lkceye) to claim your award.",
         )
         await asyncio.sleep(FANOUT_PAUSE)
 
+    scorers = [r for r in rows if r["points"] > 0]
     table = "\n".join(
         f"{r['rk']}. @{r['username'] or '(no username)'} (id {r['user_id']}): {r['points']} pts"
-        for r in rows[:10]
-    ) or "no participants"
+        for r in scorers[:10]
+    ) or "nobody scored"
     for admin in sorted(ADMIN_IDS):
-        await safe_send(bot, admin, f"🏁 Tournament {tid} closed. Final standings:\n\n{table}")
+        await safe_send(
+            bot, admin,
+            f"🏁 Tournament {tid} closed.\n"
+            f"{len(scorers)} of {len(rows)} entrant(s) scored; "
+            f"{len(winners)} award message(s) sent.\n\n{table}")
         await asyncio.sleep(FANOUT_PAUSE)
 
-    log.info("tournament %s closed with %s participant(s)", tid, len(rows))
+    log.info("tournament %s closed: %s entrant(s), %s scored",
+             tid, len(rows), len(scorers))
     return rows
 
 

@@ -76,16 +76,23 @@ def question_kb(qid: int, count: int, mode: str) -> InlineKeyboardMarkup:
 
 
 def card_header(mode: str) -> str | None:
+    """The banner above a card, when the caller has not supplied its own lead.
+
+    `jobs.weekly_quiz` passes a lead carrying the position in the set, so it
+    would be a second header on the same card; the banner is for a weekly card
+    sent without one.
+    """
     return WEEKLY_HEADER if mode == "weekly" else None
 
 
 async def send_question(bot: Bot, uid: int, question, mode: str,
                         lead: str | None = None) -> bool:
-    """Send one question card. `lead` is prepended, for the set heading."""
+    """Send one question card. `lead` replaces the mode's default banner."""
     if question is None:
         return await safe_send(bot, uid, "No questions loaded yet. Check back soon!")
     try:
-        body, count = render(question, header=card_header(mode))
+        body, count = render(question,
+                             header=None if lead else card_header(mode))
     except ValueError:
         # Malformed row (wrong number of options). Report it instead of crashing.
         log.exception("question %s is malformed", question.get("id"))
