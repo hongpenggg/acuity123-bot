@@ -1,138 +1,221 @@
 # LKC OphSoc Tele Bot
 
-Telegram revision bot for the LKC Ophthalmology Society — adaptive practice
-questions, weekly pushes, cheat-sheet notes and a two-week tournament
-leaderboard, for students at three levels: **Pre-Clinical**, **Clinical** and
-**Post-MBBS**.
+[![CI](https://github.com/hongpenggg/acuity123-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/hongpenggg/acuity123-bot/actions/workflows/ci.yml)
+[![python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![aiogram](https://img.shields.io/badge/aiogram-3-2CA5E0.svg)](https://docs.aiogram.dev/)
+[![postgresql](https://img.shields.io/badge/postgresql-14%2B-336791.svg)](https://www.postgresql.org/)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
-LKC Ophthalmology Society · Made by **Zhong Han** (Vice-Chairperson, LKC OphSoc 26/27)
-and the **Acuity Team** — Zhong Han, Rahul, Hongpeng, Jeromy.
+A Telegram revision bot built for the **LKC Ophthalmology Society**. Students
+answer adaptive practice questions, get a weekly question and fortnightly notes
+pushed to them, and compete on a two-week tournament leaderboard.
+
+**LKC Ophthalmology Society** — made by **Zhong Han** (Vice-Chairperson, LKC OphSoc 26/27)
+and the **Acuity Team**: Zhong Han, Rahul, Hongpeng, Jeromy.
 
 > Educational revision only — not clinical advice.
+
+---
+
+## Contents
+
+- [What it does](#what-it-does)
+- [The question bank](#the-question-bank)
+- [Quickstart](#quickstart)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Architecture](#architecture)
+- [Development](#development)
+- [Deployment](#deployment)
+- [Content and privacy](#content-and-privacy)
+- [Contributing](#contributing)
 
 ## What it does
 
 | Area | Behaviour |
 |---|---|
-| `/practice` | Sends a question at the student's level, preferring ones they haven't seen |
-| Adaptive weighting | After 10 answers, topics are picked in proportion to the student's error rate, with a floor so nothing is starved |
-| `/level` | Switch Pre-Clinical / Clinical / Post-MBBS; questions *and* notes follow it |
-| `/subscribe` | A question every Monday, one topic per week |
+| `/practice` | A question at the student's level, preferring ones they haven't seen |
+| Adaptive weighting | After 10 answers, topics are chosen in proportion to the student's error rate, with a floor so a mastered topic still resurfaces |
+| `/level` | Pre-Clinical / Clinical / Post-MBBS — questions *and* notes follow it, changeable any time |
+| `/subscribe` | A question every Monday, one topic per week, rotating through all topics |
 | `/notes`, `/notes_sub` | Tier B cheat sheets on demand; Tier A sets pushed fortnightly |
-| Tournament | Toggled on by an admin for 2 weeks; correct `/practice` answers score **once per question**; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
-| Explanations | 💡 button; generated once per question and cached, so the LLM bill stays flat |
+| Tournament | An admin switches it on for 2 weeks; correct `/practice` answers score **once per question**; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
+| 💡 Explain | Serves the written explanation stored with the question — the LLM is only a fallback and is optional |
 
-Weakness detection is plain SQL (per-topic accuracy) — the LLM only writes
-explanations, so a slow or broken provider can never block practice.
+Weakness detection is plain SQL (per-topic accuracy), so a slow or missing LLM
+provider can never block practice.
 
-## Layout
+## The question bank
+
+`seeds/01_preclin_mcqs.sql` loads **120 single best answer questions** across
+six topics, every one of them with a written explanation:
+
+| Topic | Questions |
+|---|---|
+| Development and ocular histology | 21 |
+| Orbit and eye movements | 21 |
+| Optics and visual transduction | 20 |
+| Visual pathways and pupil reflexes | 20 |
+| Aqueous humour and glaucoma mechanisms | 16 |
+| Retinal and anterior segment pathology | 22 |
+
+There is **one seed file per audience level**, loaded in order:
+
+```
+seeds/01_preclin_mcqs.sql    120 questions   (loaded)
+seeds/02_clin_mcqs.sql       Clinical        (placeholder — loads nothing yet)
+seeds/03_postmbbs_mcqs.sql   Post-MBBS       (placeholder — loads nothing yet)
+```
+
+The Clinical and Post-MBBS files are valid, load cleanly and add nothing, so
+running all three against a fresh database is always safe. Adding a level later
+is: drop the `.docx` into `resources/`, add it to `LEVELS` in
+`tools/build_question_seed.py`, re-run the generator, load the file. The
+`questions.level` column and the bot's `/level` command already handle all three.
+
+Because every question carries an explanation, the bot serves them from the
+database and **never calls the LLM for this bank** — you can run the whole event
+with no API key and zero spend.
+
+The bank is generated from the `.docx` sources in `resources/`. Editing those
+documents does not change the database; regenerate the seeds instead
+(`tools/build_question_seed.py`). `tests/test_seed_data.py` verifies the loaded
+bank — 120 rows, the topic split above, and that every question renders — so a
+bad regeneration fails CI rather than shipping.
+
+## Quickstart
+
+```bash
+git clone https://github.com/hongpenggg/acuity123-bot.git && cd acuity123-bot
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env && chmod 600 .env      # set BOT_TOKEN, DATABASE_URL, ADMIN_IDS
+
+psql "$DATABASE_URL" -f schema.sql                  # tables
+for f in seeds/*.sql; do psql "$DATABASE_URL" -f "$f"; done   # the question banks
+
+python -m bot.main                          # Ctrl+C once it looks alive
+```
+
+Full walkthrough — VPS provisioning, Postgres, systemd, backups, tournament day
+— is in **[docs/SETUP.md](docs/SETUP.md)**.
+
+## Configuration
+
+Everything comes from the environment; nothing needs editing to deploy.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `BOT_TOKEN` | yes | From [@BotFather](https://t.me/BotFather) |
+| `DATABASE_URL` | yes | Local Postgres or Supabase pooler |
+| `ADMIN_IDS` | yes | Numeric Telegram IDs allowed to run `/admin_*`, comma-separated |
+| `LLM_BASE_URL` | no | OpenAI-compatible endpoint, defaults to OpenRouter |
+| `LLM_API_KEY` | no | **Leave blank for zero LLM spend** |
+| `LLM_MODEL` | no | Set together with the key to enable generation |
+| `BOT_TZ` | no | Display/schedule timezone, defaults to `Asia/Singapore` |
+| `MIN_ATTEMPTS_FOR_ADAPTIVE` | no | Answers before weighting kicks in, default `10` |
+| `WEIGHT_FLOOR` | no | Error-rate floor, default `0.15` |
+
+## Commands
+
+**Students** — `/start` `/help` `/practice` `/level` `/subscribe` `/unsubscribe`
+`/notes` `/notes_sub` `/notes_unsub` `/tournament` `/leaderboard`
+
+**Admins** (`ADMIN_IDS`) — `/admin_tournament_start` `/admin_tournament_end`
+`/admin_weekly_now` `/admin_notes_now`
+
+The `admin_*_now` commands fire the scheduled jobs on demand, so you never have
+to wait for a Monday to demonstrate a push.
+
+## Architecture
 
 ```
 bot/
   config.py    environment + level definitions
-  text.py      option letters, question rendering, name masking, message splitting
-  sender.py    outbound Telegram plumbing (retry, flood control, 4096-char splitting)
+  text.py      option letters, rendering, masking, message splitting   (pure)
+  sender.py    outbound Telegram: retry, flood control, 4096-char split
   db.py        every SQL statement
-  llm.py       explanation generation + cache
+  llm.py       explanation fallback (optional)
   handlers.py  commands and callbacks
-  jobs.py      the weekly / fortnightly / tournament-close cron entries
+  jobs.py      weekly / fortnightly / tournament-close cron entries
   main.py      wiring, error handler, graceful shutdown
-schema.sql                 full schema + placeholder seed
-migrations/001_*.sql       upgrade path for a database on the older schema
-scripts/check_sql.py       parse every statement with the real Postgres grammar
-tests/                     unit tests + a live-database suite
-deploy/studybot.service    systemd unit for the VPS
+schema.sql                 structure only, nothing seeded
+migrations/                upgrade path for an existing database
+seeds/                     the question bank
+scripts/check_sql.py       parse every statement with libpg_query
+tests/                     unit, handler and live-database suites
+deploy/studybot.service    systemd unit
 ```
 
-## Setup
+Three design choices worth knowing:
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env && chmod 600 .env     # fill in the values
-psql "$DATABASE_URL" -f schema.sql          # fresh database
-python -m bot.main                         # Ctrl+C when it looks alive
-```
-
-Already have the database from the earlier schema? Run
-`migrations/001_levels_and_tournament_answers.sql` instead of `schema.sql`.
-
-The database URL must be Supabase's **Session pooler** string (port 5432). The
-direct host is IPv6-only and will not resolve from an IPv4-only VPS. `db.init`
-sets `statement_cache_size=0` because a transaction pooler cannot keep prepared
-statements pinned across transactions.
-
-Register the command list with BotFather once, or just let `main.py` call
-`set_my_commands` on startup.
-
-## Commands
-
-Student-facing: `/start` `/help` `/practice` `/level` `/subscribe` `/unsubscribe`
-`/notes` `/notes_sub` `/notes_unsub` `/tournament` `/leaderboard`
-
-Admin-only (`ADMIN_IDS`): `/admin_tournament_start` `/admin_tournament_end`
-`/admin_weekly_now` `/admin_notes_now`
-
-The `admin_*_now` commands exist so you never have to wait for a Monday to
-demonstrate the push — useful on demo day.
+- **`sender.py` exists to break an import cycle.** `handlers` and `jobs` both
+  need to send messages, and importing each other would be circular.
+- **Every callback path answers its callback**, or the user's client spins
+  forever. There is a `dp.errors` handler as a backstop.
+- **Tournament points are deduplicated in SQL** (`tournament_answers`), because
+  `pick_question` eventually re-serves a cleared topic and would otherwise let
+  students farm the leaderboard.
 
 ## Development
 
 ```bash
 pip install -r requirements-dev.txt
 
-python -m pytest -q              # unit tests + handler flows, no database needed
-python scripts/check_sql.py      # parse every SQL statement with libpg_query
+python -m pytest -q              # unit + handler tests, no database needed
+python scripts/check_sql.py      # parse all SQL with the real Postgres grammar
+ruff check . --select F,E9,B,UP,SIM --ignore E501
 
-# Live database tests (real Postgres, real constraints):
+# Live database tests — real constraints, real data:
 docker compose up -d db
 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5433/studybot_test \
-    python -m pytest tests/test_db_live.py -v
+    python -m pytest tests/ -v
 ```
 
-`scripts/check_sql.py` catches typos and code/schema drift without a database;
-`tests/test_db_live.py` proves the constraints actually behave (double-tap
-idempotency, tournament scoring, standings surviving the close).
+CI runs all of the above against a real Postgres service on every push and pull
+request (`.github/workflows/ci.yml`).
 
-## Deploy
-
-Contabo VPS, Ubuntu LTS, systemd. Full walkthrough — user setup, SSH hardening,
-`ufw`, Fail2ban, Supabase, the deploy key — is in the team's build guide; the
-short version:
+**Regenerating a question bank.** If the `.docx` files in `resources/` change,
+regenerate the seeds rather than editing them by hand — the parser asserts the
+shape of every question and reports anything it can't account for:
 
 ```bash
-sudo mkdir -p /opt/studybot && sudo chown deploy:deploy /opt/studybot
-git clone <repo> /opt/studybot && cd /opt/studybot
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-nano .env && chmod 600 .env
+python tools/build_question_seed.py                 # all levels
+python tools/build_question_seed.py --check         # CI-style: fail if out of date
+python tools/build_question_seed.py --level clin    # one level
 
-sudo cp deploy/studybot.service /etc/systemd/system/studybot.service
-sudo systemctl daemon-reload && sudo systemctl enable --now studybot
-journalctl -u studybot -f
+# then reload that level (the seed guards against double-loading)
+psql "$DATABASE_URL" -c "delete from questions where level = 'preclin';"
+psql "$DATABASE_URL" -f seeds/01_preclin_mcqs.sql
 ```
 
-### Operating notes
+## Deployment
 
-- **One instance only.** Two processes polling the same token produce `Conflict`
-  errors. Don't run it locally while the VPS service is up.
-- **Backups.** Supabase's free tier has little point-in-time recovery. A weekly
-  `pg_dump` of `questions` and `notes` is enough — those are the real assets.
-- **Cost.** Explanations are generated once per question and cached in the DB.
-  Put a hard monthly spend cap on the LLM key anyway.
-- **Cron caveat.** `misfire_grace_time` is set to an hour: APScheduler's
-  1-second default silently drops a job whose scheduled minute passed while the
-  process was restarting, which is exactly how a weekly push goes missing.
-- **Timezone.** Schedules and displayed dates are `Asia/Singapore`; timestamps
-  are stored as `timestamptz` so this is presentation only.
+Contabo VPS, Ubuntu LTS, systemd, Postgres on the same box. Step-by-step in
+[docs/SETUP.md](docs/SETUP.md).
+
+**One instance only** — two processes polling the same token produce `Conflict`
+errors. Don't run the bot locally while the service is up.
 
 ## Content and privacy
 
-Questions and notes live in the database, not in this repo. The seed rows in
-`schema.sql` are placeholders — do **not** paste iRAT/tRAT, AIMBOSS, PassMedicine
-or school/senior material in until it has been rewritten, per the team's
-copyright plan.
+Question text lives in the database and in `seeds/`, not in the application
+code. Per the content plan: nothing from iRAT/tRAT, AIMBOSS, PassMedicine or
+school/senior material goes into this repository until it has been rewritten, and
+the "OphSoc QBank and Notes (ZH)" sheet is off limits.
 
-The bot stores Telegram IDs, usernames and answer history, which is personal
-data under Singapore's PDPA. Explanations send the question text to the LLM
-provider. Keep the RLS lockdown in `schema.sql` in place, and add a
-`/delete_me` command before this goes in front of anyone outside the society.
+The bot stores Telegram IDs, usernames and answer history, which is personal data
+under Singapore's PDPA. The RLS lockdown in `schema.sql` matters if you put this
+in front of Supabase's public API, and a `/delete_me` command should be added
+before this goes to anyone outside the society.
+
+## Contributing
+
+Open an issue or a PR. Branches are checked by CI — run `python -m pytest -q`
+and `python scripts/check_sql.py` before pushing.
+
+## License
+
+[MIT](LICENSE) © 2026 Hongpeng Wei

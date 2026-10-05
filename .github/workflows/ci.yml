@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # A real Postgres, so the constraint tests in tests/test_db_live.py actually
+    # run instead of skipping.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: studybot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/studybot_test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/studybot_test
+      BOT_TOKEN: "123:TEST"
+      ADMIN_IDS: "42"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Check every SQL statement parses and matches the schema
+        run: python scripts/check_sql.py
+
+      - name: Check the committed question seeds match their sources
+        run: python tools/build_question_seed.py --check
+
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check . --select F,E9,B,UP,SIM --ignore E501
+
+      - name: Tests (unit + handlers + live database)
+        run: python -m pytest -q

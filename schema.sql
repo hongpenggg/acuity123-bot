@@ -27,6 +27,7 @@ create table questions (
   id           serial primary key,
   level        text        not null check (level in ('preclin', 'clin', 'postmbbs')),
   topic        text        not null,          -- the shared "common tag" per topic
+  tag          text,                          -- optional finer label, e.g. 'Physiology | experimental prediction'
   text         text        not null,
   options      jsonb       not null check (jsonb_typeof(options) = 'array'),
   correct_idx  int         not null,
@@ -119,26 +120,18 @@ alter table notes             enable row level security;
 commit;
 
 -- ============================================================================
--- PLACEHOLDER seed data — delete it once the real bank is ready.
+-- Content is loaded separately, not from this file:
 --
--- Deliberately generic, non-clinical content: ZH has flagged that the iRAT/tRAT,
--- AIMBOSS, PassMedicine and school/senior material must be rewritten for
--- copyright before it goes anywhere near this repo, and that the "OphSoc QBank
--- and Notes (ZH)" sheet is off limits for now. Do not paste it in here.
+--   psql "$DATABASE_URL" -f schema.sql                        # structure only
+--   psql "$DATABASE_URL" -f seeds/01_preclin_mcqs.sql          # the 120-question bank
+--   psql "$DATABASE_URL" -f seeds/02_clin_mcqs.sql             # Clinical (empty for now)
+--   psql "$DATABASE_URL" -f seeds/03_postmbbs_mcqs.sql         # Post-MBBS (empty for now)
 --
--- These rows exist so /practice, /level and the tournament are testable today.
+-- Nothing is seeded here on purpose: a fresh database is legitimate (the bot
+-- reports "no questions available yet"), and question text lives in seeds/
+-- where it can be regenerated and reviewed.
+--
+-- Copyright note, from the content plan: nothing from iRAT/tRAT, AIMBOSS,
+-- PassMedicine or school/senior material goes into this repo until it has been
+-- rewritten, and the "OphSoc QBank and Notes (ZH)" sheet is off limits.
 -- ============================================================================
-insert into questions (level, topic, text, options, correct_idx) values
-  ('preclin', 'Sample', 'Placeholder question — replace me.',
-   '["Option one", "Option two", "Option three", "Option four"]', 0),
-  ('preclin', 'Sample', 'Second placeholder, with five options.',
-   '["One", "Two", "Three", "Four", "Five"]', 4),
-  ('clin',    'Sample', 'Clinical-level placeholder.',
-   '["Alpha", "Beta", "Gamma", "Delta"]', 2),
-  ('postmbbs','Sample', 'Post-MBBS placeholder.',
-   '["Yes", "No"]', 1);
-
-insert into notes (level, topic, tier, title, body) values
-  ('preclin',  'Sample', 'B', 'Placeholder Tier B note', 'Replace with real content.'),
-  ('clin',     'Sample', 'A', 'Placeholder Tier A note', 'Replace with real content.'),
-  ('postmbbs', 'Sample', 'A', 'Placeholder Tier A note', 'Replace with real content.');

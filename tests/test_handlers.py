@@ -102,6 +102,9 @@ class FakeDB:
     async def topics(self, level):
         return sorted({q["topic"] for q in self.questions.values() if q["level"] == level})
 
+    async def levels_with_questions(self):
+        return sorted({q["level"] for q in self.questions.values()})
+
     async def record_attempt(self, uid, question, idx, correct, mode, msg_id):
         if (uid, msg_id) in self.attempts:
             return False
@@ -318,6 +321,41 @@ async def test_explain_rate_limit(fake, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_explain_serves_the_written_explanation_without_an_llm(fake, monkeypatch):
+    """The preclinical bank ships with explanations, so the button must work with
+    no LLM configured — and must never touch the provider."""
+    add_question(fake, correct_idx=0)
+    fake.questions[1]["explanation"] = "Because the fissure failed to close."
+
+    def no_http(*args, **kwargs):
+        raise AssertionError("the LLM provider must not be contacted")
+
+    monkeypatch.setattr(handlers.llm.httpx, "AsyncClient", no_http)
+    handlers._recent_explain.clear()
+
+    await handlers.on_explain(FakeCallback("e:1", message=FakeMessage()), fake.bot)
+
+    assert any("fissure failed to close" in m["text"] for m in fake.bot.sent)
+    assert any("not clinical advice" in m["text"] for m in fake.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_explain_says_so_when_there_is_nothing_to_show(fake, monkeypatch):
+    """No stored explanation and no provider: a plain message, not an error."""
+    add_question(fake, correct_idx=0)
+
+    async def no_explanation(question):
+        return None
+
+    monkeypatch.setattr(handlers.llm, "explain", no_explanation)
+    handlers._recent_explain.clear()
+
+    await handlers.on_explain(FakeCallback("e:1", message=FakeMessage()), fake.bot)
+
+    assert fake.bot.sent[-1]["text"] == "No written explanation for this question yet."
+
+
+@pytest.mark.asyncio
 async def test_level_callback_updates_the_user(fake):
     c = FakeCallback("lv:clin")
 
@@ -405,3 +443,29 @@ async def test_finish_tournament_reads_standings_before_closing(monkeypatch):
     assert result == rows
     assert any(m["chat_id"] == 7 and "finished #1" in m["text"] for m in bot.sent)
     assert any(m["chat_id"] == 42 for m in bot.sent), "admins get the standings"
+
+
+@pytest.mark.asyncio
+async def test_student_on_an_unwritten_level_is_told_what_is_available(fake):
+    """The Clinical and Post-MBBS banks aren't loaded yet. A student who picks
+    one must not be left staring at silence."""
+    add_question(fake, level="preclin")
+    fake.users[1] = "clin"
+    msg = SimpleNamespace(from_user=SimpleNamespace(id=1, username="t"), answer=_recorder())
+
+    await handlers.practice(msg, fake.bot)
+
+    text = fake.bot.sent[-1]["text"]
+    assert "No Clinical questions yet" in text
+    assert "Pre-Clinical" in text
+    assert "/level" in text
+
+
+@pytest.mark.asyncio
+async def test_practice_with_an_empty_database_says_so(fake):
+    fake.users[1] = "preclin"
+    msg = SimpleNamespace(from_user=SimpleNamespace(id=1, username="t"), answer=_recorder())
+
+    await handlers.practice(msg, fake.bot)
+
+    assert fake.bot.sent[-1]["text"] == "No questions available yet — check back soon."

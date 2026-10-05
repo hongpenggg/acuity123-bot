@@ -9,8 +9,12 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-LLM_API_KEY = os.environ["LLM_API_KEY"]
-LLM_MODEL = os.environ["LLM_MODEL"]
+# Optional. Every question in the preclinical bank ships with a written
+# explanation, so the bot runs perfectly with the LLM switched off — no key, no
+# spend. Set both to enable generation for questions that have none.
+LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
+LLM_ENABLED = bool(LLM_API_KEY and LLM_MODEL)
 
 # Display / scheduling timezone. The DB stores timestamptz, so this only affects
 # how times are shown to users and when the cron jobs fire.
