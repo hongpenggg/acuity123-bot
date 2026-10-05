@@ -1,0 +1,27 @@
+[Unit]
+Description=LKC OphSoc Tele Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=deploy
+WorkingDirectory=/opt/studybot
+EnvironmentFile=/opt/studybot/.env
+ExecStart=/opt/studybot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+# Hardening: the bot only ever needs to talk outbound, so deny everything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/studybot
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target
