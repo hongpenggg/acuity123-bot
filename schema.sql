@@ -69,7 +69,9 @@ create table tournaments (
 );
 create index tournaments_active_idx on tournaments (active, ends_at);
 
--- Membership and score. A row appears only after the user sends /tournament.
+-- Membership and score. Rows appear automatically: everyone active is entered
+-- when a tournament opens (db.enrol_everyone), and anyone who sends /start while
+-- one is running is entered then (db.join_tournament). There is no opt-in.
 -- joined_at is the tie-break for equal scores (first to get there wins).
 create table tournament_points (
   tournament_id int         not null references tournaments (id) on delete cascade,

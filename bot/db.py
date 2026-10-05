@@ -8,11 +8,7 @@ Conventions:
 """
 from __future__ import annotations
 
-import random
-
 import asyncpg
-
-from .config import MIN_ATTEMPTS_FOR_ADAPTIVE, WEIGHT_FLOOR
 
 pool: asyncpg.Pool | None = None
 
@@ -137,103 +133,6 @@ async def get_question(qid: int):
     return await conn.fetchrow("select * from questions where id = $1", qid)
 
 
-async def _weighted_topic(uid: int, level: str, candidates: list[str]) -> str:
-    """Pick a topic, biased towards the user's weakest ones once they have
-    answered enough to make a per-topic accuracy meaningful."""
-    conn = _require_pool()
-    rows = await conn.fetch(
-        """select topic, count(*) as n, sum(correct::int) as c
-             from attempts
-            where user_id = $1 and level = $2
-            group by topic""",
-        uid, level,
-    )
-    stats = {r["topic"]: (r["n"], r["c"] or 0) for r in rows}
-    answered = sum(n for n, _ in stats.values())
-    if answered < MIN_ATTEMPTS_FOR_ADAPTIVE:
-        return random.choice(candidates)
-
-    def weight(topic: str) -> float:
-        n, correct = stats.get(topic, (0, 0))
-        # Laplace-smoothed error rate: unseen topics sit mid-range rather than
-        # being starved or dominating.
-        return (1.0 - (correct + 1) / (n + 2)) + WEIGHT_FLOOR
-
-    return random.choices(candidates, weights=[weight(t) for t in candidates], k=1)[0]
-
-
-#: A question is "fresh" for a user until they answer it correctly. Wrong answers
-#: deliberately do not remove it — getting it again is the point.
-_FRESH_SQL = """select q.* from questions q
-                 where q.level = $2 and q.topic = $3
-                   and not exists (select 1 from attempts a
-                                    where a.user_id = $1
-                                      and a.question_id = q.id
-                                      and a.correct)
-                 order by random()
-                 limit 1"""
-
-#: Everything in the topic has been answered correctly. Hand back the one they
-#: have attempted fewest times, so repeats at least spread out.
-_LEAST_REPEATED_SQL = """select q.* from questions q
-                          where q.level = $2 and q.topic = $3
-                          order by (select count(*) from attempts a
-                                     where a.user_id = $1 and a.question_id = q.id),
-                                   random()
-                          limit 1"""
-
-
-async def _topics_with_fresh(uid: int, level: str) -> list[str]:
-    """Topics at this level where the user still has something left to get right."""
-    conn = _require_pool()
-    rows = await conn.fetch(
-        """select distinct q.topic from questions q
-            where q.level = $2
-              and not exists (select 1 from attempts a
-                               where a.user_id = $1
-                                 and a.question_id = q.id
-                                 and a.correct)
-            order by q.topic""",
-        uid, level,
-    )
-    return [r["topic"] for r in rows]
-
-
-async def pick_question(uid: int, level: str, topic: str | None = None):
-    """One question at the user's level, avoiding repeats.
-
-    A question is *finished* once the user answers it correctly; finished questions
-    are held back so a student works through the bank instead of seeing the same
-    one repeatedly. Wrong answers stay in the pool on purpose.
-
-    The topic for unfixed-topic practice is chosen from the topics that still have
-    something fresh, not from every topic — otherwise a cleared topic could be
-    selected and the student would be handed a repeat while other topics still had
-    unseen questions. Once *everything* at the level has been answered correctly
-    the filter is dropped and the least-repeated question is served, so the bot
-    never dead-ends. Callers check `progress` first to say so plainly.
-    """
-    conn = _require_pool()
-
-    if topic is not None:
-        row = await conn.fetchrow(_FRESH_SQL, uid, level, topic)
-        return row if row is not None else await conn.fetchrow(
-            _LEAST_REPEATED_SQL, uid, level, topic)
-
-    fresh_topics = await _topics_with_fresh(uid, level)
-    if fresh_topics:
-        chosen = await _weighted_topic(uid, level, fresh_topics)
-        row = await conn.fetchrow(_FRESH_SQL, uid, level, chosen)
-        if row is not None:
-            return row
-
-    all_topics = await topics(level)
-    if not all_topics:
-        return None
-    chosen = await _weighted_topic(uid, level, all_topics)
-    return await conn.fetchrow(_LEAST_REPEATED_SQL, uid, level, chosen)
-
-
 async def progress(uid: int, level: str) -> tuple[int, int]:
     """``(still to get right, total)`` at this level, in one round trip.
 
@@ -272,7 +171,7 @@ async def record_attempt(uid: int, question, idx: int, correct: bool,
 
 
 async def practice_streak(uid: int) -> int:
-    """How many /practice answers in a row the user has got right, counting back
+    """How many /quizme answers in a row the user has got right, counting back
     from the latest. Capped by the limit, which is far beyond what we display."""
     conn = _require_pool()
     rows = await conn.fetch(
@@ -297,6 +196,137 @@ async def save_explanation(qid: int, text: str) -> None:
     await conn.execute(
         "update questions set explanation = $2 where id = $1 and explanation is null",
         qid, text,
+    )
+
+
+#: Quiz sets are consecutive blocks of this many questions, in id order. Because
+#: the blocks are fixed, every student's set 1 is the same five questions: the
+#: scores are comparable, which is the point of a benchmark set.
+SET_SIZE = 5
+
+_SET_BOARD_SQL = """
+    with numbered as (
+      select id, (row_number() over (order by id) - 1) / $3::int as set_no
+        from questions
+       where level = $2
+    )
+    select numbered.set_no,
+           count(*) as size,
+           count(*) filter (where exists (select 1 from attempts a
+                            where a.user_id = $1 and a.question_id = numbered.id))
+             as answered,
+           count(*) filter (where exists (select 1 from attempts a
+                            where a.user_id = $1 and a.question_id = numbered.id
+                              and a.correct))
+             as correct
+      from numbered
+     group by numbered.set_no
+     order by numbered.set_no
+"""
+
+_SET_QUESTIONS_SQL = """
+    with numbered as (
+      select *, (row_number() over (order by id) - 1) / $3::int as set_no
+        from questions
+       where level = $2
+    )
+    select numbered.*,
+           exists (select 1 from attempts a
+                    where a.user_id = $1 and a.question_id = numbered.id) as seen
+      from numbered
+     where numbered.set_no = $4
+     order by numbered.id
+"""
+
+
+async def set_board(uid: int, level: str):
+    """Per-set progress at this level, one row per set, in order."""
+    conn = _require_pool()
+    return await conn.fetch(_SET_BOARD_SQL, uid, level, SET_SIZE)
+
+
+async def quiz_set(uid: int, level: str) -> dict | None:
+    """The student's current set of five, or None once the level is finished.
+
+    A set is finished when all five of its questions have been attempted. The
+    caller serves `remaining[0]`, which is the first question of the set this
+    student has not answered yet, so a student who stops mid-set resumes it.
+    """
+    board = await set_board(uid, level)
+    if not board:
+        return None
+    current = next((row for row in board if row["answered"] < row["size"]), None)
+    if current is None:
+        return None
+
+    conn = _require_pool()
+    rows = await conn.fetch(_SET_QUESTIONS_SQL, uid, level, SET_SIZE,
+                            current["set_no"])
+    return {
+        "set_no": current["set_no"],
+        "number": current["set_no"] + 1,
+        "size": current["size"],
+        "answered": current["answered"],
+        "correct": current["correct"],
+        "total_sets": len(board),
+        "questions": rows,
+        "remaining": [row for row in rows if not row["seen"]],
+    }
+
+
+async def set_no_for(level: str, qid: int) -> int:
+    """Which set a question belongs to. Derived from id order, so it holds even if
+    the id sequence has gaps."""
+    conn = _require_pool()
+    return await conn.fetchval(
+        """select ((select count(*) from questions
+                     where level = $1 and id <= $2) - 1) / $3::int""",
+        level, qid, SET_SIZE,
+    )
+
+
+async def set_score(uid: int, level: str, set_no: int):
+    """How one set went: ``(size, answered, correct, total_sets, total_questions)``."""
+    conn = _require_pool()
+    return await conn.fetchrow(
+        """with numbered as (
+             select id, (row_number() over (order by id) - 1) / $3::int as set_no
+               from questions
+              where level = $2)
+           select
+             (select count(*) from numbered) as total_questions,
+             (select count(distinct set_no) from numbered) as total_sets,
+             count(*) as size,
+             count(*) filter (where exists (select 1 from attempts a
+                              where a.user_id = $1 and a.question_id = numbered.id))
+               as answered,
+             count(*) filter (where exists (select 1 from attempts a
+                              where a.user_id = $1 and a.question_id = numbered.id
+                                and a.correct))
+               as correct
+             from numbered
+            where numbered.set_no = $4""",
+        uid, level, SET_SIZE, set_no,
+    )
+
+
+async def stats(uid: int, level: str):
+    """Marker A: every answer at this level, split by topic and by tag.
+
+    Returns rows of ``(topic, tag, answered, correct)``. The tag comes from the
+    question because `attempts` does not carry it.
+    """
+    conn = _require_pool()
+    return await conn.fetch(
+        """select a.topic,
+                  coalesce(q.tag, '') as tag,
+                  count(*) as answered,
+                  count(*) filter (where a.correct) as correct
+             from attempts a
+             join questions q on q.id = a.question_id
+            where a.user_id = $1 and a.level = $2
+            group by a.topic, coalesce(q.tag, '')""",
+        uid, level,
     )
 
 
@@ -356,6 +386,52 @@ async def join_tournament(uid: int) -> bool:
     return True
 
 
+async def all_users() -> list[int]:
+    """Everyone who has ever sent /start and is still reachable."""
+    conn = _require_pool()
+    rows = await conn.fetch(
+        "select telegram_id from users where active order by telegram_id")
+    return [r["telegram_id"] for r in rows]
+
+
+async def enrol_everyone(tid: int) -> int:
+    """Put every active user into a tournament in one statement.
+
+    Entry is automatic by design: a student who has used /start should not have to
+    remember to opt in to a competition they are already answering questions for.
+    Returns how many were actually added.
+    """
+    conn = _require_pool()
+    rows = await conn.fetch(
+        """insert into tournament_points (tournament_id, user_id)
+           select $1, telegram_id from users where active
+           on conflict (tournament_id, user_id) do nothing
+           returning user_id""",
+        tid,
+    )
+    return len(rows)
+
+
+async def tournament_mark(uid: int):
+    """Marker B: this student's tournament-window score, and the board size.
+
+    Deliberately narrow: it reports points and rank, never how many questions
+    anyone answered, so a student's activity is not visible to other students.
+    """
+    conn = _require_pool()
+    t = await active_tournament()
+    if not t:
+        return None
+    return await conn.fetchrow(
+        """select
+             coalesce((select points from tournament_points
+                        where tournament_id = $2 and user_id = $1), 0) as points,
+             (select count(*) from tournament_points
+               where tournament_id = $2) as entrants""",
+        uid, t["id"],
+    )
+
+
 async def leave_tournament(uid: int) -> bool:
     conn = _require_pool()
     t = await active_tournament()
@@ -371,9 +447,9 @@ async def leave_tournament(uid: int) -> bool:
 async def award_point(uid: int, question_id: int) -> bool:
     """+1 point, at most once per question per tournament.
 
-    `pick_question` prefers unseen questions but will eventually re-serve a topic
-    the user has cleared; without the tournament_answers uniqueness a user could
-    farm the leaderboard by re-answering questions they already know.
+    Belts and braces: the fixed sets mean a question comes round once anyway, but
+    without the tournament_answers uniqueness a student could still farm the board
+    by re-answering one they already know.
     Returns True only when this answer actually scored.
     """
     conn = _require_pool()

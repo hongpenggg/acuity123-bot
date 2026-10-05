@@ -25,12 +25,6 @@ TZ = os.getenv("BOT_TZ", "Asia/Singapore")
 REPO_SLUG = os.getenv("REPO_SLUG", "hongpenggg/acuity123-bot")
 REPO_REF = os.getenv("REPO_REF", "main")
 
-# Weakness detection: below this many answered questions the picker stays uniform.
-MIN_ATTEMPTS_FOR_ADAPTIVE = int(os.getenv("MIN_ATTEMPTS_FOR_ADAPTIVE", "10"))
-# Error-rate floor so a topic the user has mastered still resurfaces occasionally
-# ("while still being holistic and covering different topics").
-WEIGHT_FLOOR = float(os.getenv("WEIGHT_FLOOR", "0.15"))
-
 # The audience tier a student picks with /level. Must stay in step with the
 # CHECK constraints in schema.sql.
 LEVELS: dict[str, str] = {

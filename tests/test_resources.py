@@ -3,7 +3,27 @@
 The catalogue is built by scanning `resources/notes`, so these tests are what stop
 a commit that renames or drops a file from silently hiding a sheet from students.
 """
+import random
+
 from bot import resources
+
+
+def test_the_monthly_drop_reserves_six_focused_sheets():
+    """The reserved six are the monthly bundle; the rest are the random pool."""
+    assert len(resources.MONTHLY_CODES) == 6
+    assert {note.code for note in resources.MONTHLY} == set(resources.MONTHLY_CODES)
+    assert len(resources.MONTHLY) == 6
+    assert len(resources.RANDOM_POOL) == len(resources.TIER_B) - 6
+    assert not ({note.code for note in resources.MONTHLY}
+                & {note.code for note in resources.RANDOM_POOL})
+
+
+def test_random_focused_never_returns_a_reserved_sheet():
+    rng = random.Random(0)
+    drawn = {resources.random_focused(rng).code for _ in range(300)}
+
+    assert drawn == {note.code for note in resources.RANDOM_POOL}
+    assert not (drawn & set(resources.MONTHLY_CODES))
 
 EXPECTED_TOPICS = {
     "Development and ocular histology",

@@ -104,37 +104,6 @@ async def test_set_flag_rejects_unknown_column(pool):
 # -------------------------------------------------------------- questions
 
 
-async def test_pick_question_respects_level(pool):
-    from bot import db
-
-    await db.upsert_user(1, None)
-    await add_question(db, level="preclin", topic="A")
-    await add_question(db, level="clin", topic="B")
-
-    seen = {await db.pick_question(1, "preclin") for _ in range(5)}
-    assert {q["level"] for q in seen} == {"preclin"}
-    assert {q["topic"] for q in seen} == {"A"}
-
-
-async def test_pick_question_returns_none_for_an_empty_level(pool):
-    from bot import db
-
-    await db.upsert_user(1, None)
-    assert await db.pick_question(1, "postmbbs") is None
-
-
-async def test_pick_question_prefers_unseen_questions(pool):
-    from bot import db
-
-    await db.upsert_user(1, None)
-    first = await add_question(db, topic="A")
-    await add_question(db, topic="A")
-    await db.record_attempt(1, await db.get_question(first), 0, True, "practice", 111)
-
-    picks = {(await db.pick_question(1, "preclin", topic="A"))["id"] for _ in range(10)}
-    assert first not in picks
-
-
 async def test_schema_rejects_a_correct_idx_outside_the_options(pool):
     import asyncpg
 

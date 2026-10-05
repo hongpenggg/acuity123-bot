@@ -170,23 +170,23 @@ async def test_known_question_is_intact(bank):
     assert options[1].startswith("Failure of the embryonic optic fissure")
 
 
-async def test_practice_returns_a_preclinical_question_only(bank):
+async def test_a_preclinical_set_is_served_from_the_real_bank(bank):
+    """The sets are built from the loaded bank, at the student's level only."""
     await bank.upsert_user(1, None)
-    question = await bank.pick_question(1, "preclin")
-    assert question is not None
-    assert question["level"] == "preclin"
+    current = await bank.quiz_set(1, "preclin")
+
+    assert current is not None
+    assert current["number"] == 1
+    assert current["size"] == bank.SET_SIZE
+    assert {q["level"] for q in current["questions"]} == {"preclin"}
 
     # No clinical or post-MBBS content exists yet, and the bot must cope.
-    assert await bank.pick_question(1, "clin") is None
-    assert await bank.pick_question(1, "postmbbs") is None
+    assert await bank.quiz_set(1, "clin") is None
+    assert await bank.quiz_set(1, "postmbbs") is None
 
 
-async def test_weekly_rotation_covers_every_topic(bank):
-    topics = await bank.topics("preclin")
-    assert topics == sorted(EXPECTED_TOPICS)
-    for topic in topics:
-        question = await bank.pick_question(1, "preclin", topic=topic)
-        assert question is not None and question["topic"] == topic
+async def test_the_bank_covers_all_six_topics(bank):
+    assert await bank.topics("preclin") == sorted(EXPECTED_TOPICS)
 
 
 async def test_seed_refuses_to_load_twice(bank):

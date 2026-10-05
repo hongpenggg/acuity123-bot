@@ -32,33 +32,39 @@ MODES = ("practice", "weekly")
 
 FEATURES = (
     "WHAT THIS BOT DOES\n"
-    "1. Practice: adaptive single-best-answer questions, weighted to the topics\n"
-    "   you are weakest at. Every answer comes with a written explanation.\n"
-    "2. Compete: a two-week tournament, a question every Monday, and a top-3\n"
-    "   leaderboard.\n"
+    "1. Practice: sets of five questions. The same five for everyone, so your\n"
+    "   scores are comparable, and you get a score at the end of each set.\n"
+    "2. Compete: a two-week tournament, a set every Monday, and a top-3 board.\n"
     "3. What is inside:\n"
     "   3a. Quiz: a 120-question Pre-Clinical bank across 6 topics, with Clinical\n"
     "       and Post-MBBS banks on the way.\n"
-    "   3b. Notes: overview sheets, one per topic, plus focused sheets you can\n"
-    "       pull up whenever you like."
+    "   3b. Notes: overview sheets, one per topic, plus focused sheets on single\n"
+    "       points. /stats shows how you are doing."
 )
 
 HELP = (
-    "📝 /practice for a question\n"
-    "📚 /resources for the revision sheets\n"
+    "📝 /quizme for a set of five questions\n"
+    "📊 /stats for your scores and weak topics\n"
+    "📘 /topicalnotes for an overview sheet by topic\n"
+    "📄 /randomnotes for a focused sheet, at random\n"
+    "📚 /resources to browse every sheet\n"
     "🎓 /changestreams to switch level\n"
-    "📅 /subscribe for a question every Monday\n"
-    "🗒 /notes for sheets by topic\n"
-    "🏆 /tournament to join the tournament\n"
-    "🥇 /leaderboard to see who's leading\n\n"
-    "/unsubscribe stops the Monday question. /notes_sub sends you the overview "
-    "sheets every two weeks (/notes_unsub to stop)."
+    "📅 /weeklyquiz for a set every Monday\n"
+    "🗓 /monthlynotes for the monthly sheet drop\n"
+    "🏆 /tournament for the competition status\n"
+    "🥇 /leaderboard for the top 3\n\n"
+    "/stopweekly and /stopmonthly stop those two."
 )
 
 RESOURCES_INTRO = (
     "📚 Revision sheets\n"
     "Overview sheets cover a whole topic; focused sheets go deep on one point.\n"
     "Pick one and it arrives here as a PDF."
+)
+
+OVERVIEW_INTRO = (
+    "📘 Overview sheets: one broad sheet per topic. Pick one and it arrives as "
+    "a PDF."
 )
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -125,6 +131,11 @@ async def start(m: Message, bot: Bot):
     level = await db.get_level(uid)
     name = getattr(m.from_user, "first_name", None)
     hello = f"👋 <b>Hi {esc(name)}!</b>" if name else "👋 <b>Hi!</b>"
+    # Automatic entry to a running tournament: a student who has started the bot
+    # should not have to remember to opt in to a competition they are already
+    # answering questions for. Costs one cheap query, and does nothing when no
+    # tournament is running.
+    await db.join_tournament(uid)
     # Give this chat its full menu. Telegram keeps the command list per chat, so
     # this is also what refreshes a client still showing only /start.
     await commands.sync_chat(bot, m.chat.id, is_admin=uid in ADMIN_IDS)
@@ -182,8 +193,13 @@ async def set_level(c: CallbackQuery):
 # -------------------------------------------------------------------- practice
 
 
-@router.message(Command("practice"))
+@router.message(Command("quizme", "practice"))
 async def practice(m: Message, bot: Bot):
+    """Serve the next question of the student's current set of five.
+
+    `/practice` stays registered as an alias: it is what the copy, the docs and any
+    message already in a student's chat refer to.
+    """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = _level(await db.get_level(uid))
@@ -205,6 +221,38 @@ async def next_question(c: CallbackQuery, bot: Bot):
     finally:
         if not answered:
             await ack(c)
+
+
+async def _report_set_if_finished(message, uid: int, level: str, qid: int) -> None:
+    """If that answer completed a set of five, say how the set went.
+
+    A set is complete once all five of its questions have been attempted, so this
+    fires exactly once per set and never for a partial one. Only practice sets are
+    scored this way: the Monday set is a separate flow that does not count toward
+    the tournament.
+    """
+    try:
+        set_no = await db.set_no_for(level, qid)
+        score = await db.set_score(uid, level, set_no)
+    except Exception:
+        log.debug("set score lookup failed", exc_info=True)
+        return
+    if score is None or score["answered"] < score["size"]:
+        return
+
+    done = set_no + 1
+    left = score["total_sets"] - done
+    if left <= 0:
+        tail = ("That is every set in the bank. 🎉 /stats has the full breakdown, "
+                "and /resources has the sheets.")
+    else:
+        tail = (f"{left} set{'s' if left != 1 else ''} to go. "
+                "Send /quizme for the next five.")
+
+    await message.answer(
+        f"📊 <b>Set {done} of {score['total_sets']}</b> done · "
+        f"score <b>{score['correct']}/{score['size']}</b>\n{tail}",
+        parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("a:"))
@@ -267,6 +315,11 @@ async def on_answer(c: CallbackQuery):
             f"{body}\n\n{verdict(correct, question['correct_idx'], streak)}",
             InlineKeyboardMarkup(inline_keyboard=[buttons]),
         )
+        if mode == "practice":
+            # Scored straight off the attempts table, so the set boundaries are the
+            # same fixed blocks of five for everyone.
+            await _report_set_if_finished(message, c.from_user.id,
+                                          question["level"], question["id"])
     except Exception:
         log.exception("on_answer failed")
     finally:
@@ -338,19 +391,28 @@ async def on_explain(c: CallbackQuery, bot: Bot):
 # ---------------------------------------------------------------- subscriptions
 
 
-@router.message(Command("subscribe"))
-async def subscribe(m: Message):
+@router.message(Command("weeklyquiz", "subscribe"))
+async def weeklyquiz(m: Message):
+    """The Monday set of five.
+
+    `/subscribe` stays as an alias so an older message in a student's chat still
+    does what it says.
+    """
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "weekly_sub", True)
-    await m.answer("📅 You're subscribed! A new question lands every Monday at 9am.")
+    await m.answer(
+        "📅 You're in. Every Monday at 9am you'll get your current set of five.\n\n"
+        "Only questions you answer through /quizme score for the tournament, so the "
+        "Monday set is pure practice. /stopweekly to stop."
+    )
 
 
-@router.message(Command("unsubscribe"))
-async def unsubscribe(m: Message):
+@router.message(Command("stopweekly", "unsubscribe"))
+async def stopweekly(m: Message):
     # upsert first, otherwise the flag write hits no rows and the confirmation lies.
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "weekly_sub", False)
-    await m.answer("Done, no more Monday questions. /subscribe if you change your mind.")
+    await m.answer("Done, no more Monday sets. /weeklyquiz if you change your mind.")
 
 
 def _find_note(text: str) -> resources.Note | None:
@@ -456,22 +518,120 @@ async def notes(m: Message, command: CommandObject, bot: Bot):
     return await m.answer(RESOURCES_INTRO, reply_markup=_resources_home_kb())
 
 
-@router.message(Command("notes_sub"))
-async def notes_sub(m: Message):
+@router.message(Command("monthlynotes", "notes_sub"))
+async def monthlynotes(m: Message):
+    """The monthly drop: six overview sheets plus the six reserved focused ones."""
     await db.upsert_user(m.from_user.id, m.from_user.username)
-    level = _level(await db.get_level(m.from_user.id))
     await db.set_flag(m.from_user.id, "notes_sub", True)
     await m.answer(
-        f"📘 Done! You'll get the high-yield {LEVELS[level]} cheat sheets every two "
-        "weeks. /notes_unsub to stop."
+        f"📚 You're in. On the 1st of each month you'll get all "
+        f"{len(resources.TIER_A)} overview sheets plus {len(resources.MONTHLY)} "
+        "focused ones.\n\nWant one now? /topicalnotes or /randomnotes."
+        "\n/stopmonthly to stop."
     )
 
 
-@router.message(Command("notes_unsub"))
-async def notes_unsub(m: Message):
+@router.message(Command("stopmonthly", "notes_unsub"))
+async def monthlynotes_off(m: Message):
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "notes_sub", False)
-    await m.answer("Done, no more fortnightly cheat sheets.")
+    await m.answer("Done, no more monthly sheets. /monthlynotes to start again.")
+
+
+@router.message(Command("topicalnotes"))
+async def topicalnotes(m: Message, command: CommandObject, bot: Bot):
+    """Pick an overview sheet: one broad sheet per topic."""
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    if command.args:
+        note = _find_note(command.args)
+        if note is None or note.tier != "a":
+            return await m.answer(
+                "No overview sheet matches that. Send /topicalnotes to see them.")
+        return await send_note(bot, uid, note)
+    if not resources.TIER_A:
+        return await m.answer("No overview sheets on disk yet.")
+    await m.answer(OVERVIEW_INTRO, reply_markup=_resources_tier_kb("a"))
+
+
+@router.message(Command("randomnotes"))
+async def randomnotes(m: Message, command: CommandObject, bot: Bot):
+    """One focused sheet at random, from the ones the monthly drop holds back.
+
+    The reserved six are excluded so the monthly bundle is not made up of sheets
+    students have already been handed at random.
+    """
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    if command.args:
+        note = _find_note(command.args)
+        if note is None or note.tier != "b":
+            return await m.answer(
+                "No focused sheet matches that. Send /randomnotes for a random one.")
+        return await send_note(bot, uid, note)
+    note = resources.random_focused()
+    if note is None:
+        return await m.answer("No focused sheets on disk yet.")
+    await send_note(bot, uid, note)
+
+
+@router.message(Command("stats"))
+async def stats_cmd(m: Message):
+    """Marker A: how this student is doing, overall and broken down.
+
+    Split by topic and by question type (`questions.tag`, e.g. "Physiology |
+    optical compensation"), because "you are weak on optics" is far less useful
+    than knowing which kind of optics question keeps catching them out.
+    """
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    level = _level(await db.get_level(uid))
+
+    board = await db.set_board(uid, level)
+    if not board:
+        return await m.answer(
+            f"🚧 No {LEVELS[level]} questions yet, so there is nothing to report on.")
+
+    total = sum(row["size"] for row in board)
+    answered = sum(row["answered"] for row in board)
+    correct = sum(row["correct"] for row in board)
+    finished = sum(1 for row in board if row["answered"] >= row["size"])
+
+    if answered == 0:
+        return await m.answer(
+            "📊 Nothing answered yet. Send /quizme to start your first set of five.")
+
+    rows = await db.stats(uid, level)
+    lines = [
+        f"📊 <b>Your {LEVELS[level]} progress</b>",
+        f"Answered: {answered} of {total} ({round(100 * answered / total)}%)",
+        f"Correct: {correct} of {answered} ({round(100 * correct / answered)}%)",
+        f"Sets finished: {finished} of {len(board)}",
+    ]
+
+    def _group(key) -> dict[str, list[int]]:
+        out: dict[str, list[int]] = {}
+        for row in rows:
+            name = key(row) or "(not labelled)"
+            bucket = out.setdefault(name, [0, 0])
+            bucket[0] += row["answered"]
+            bucket[1] += row["correct"]
+        return out
+
+    for heading, key in (("By topic", lambda r: r["topic"]),
+                         ("By question type", lambda r: r["tag"])):
+        grouped = _group(key)
+        if not grouped:
+            continue
+        # Weakest first: that is the list a student should actually act on.
+        ranked = sorted(grouped.items(), key=lambda kv: (kv[1][1] / kv[1][0], kv[0]))
+        lines.append(f"\n<b>{heading}</b>")
+        for name, (n, c) in ranked:
+            lines.append(f"{name}: {c}/{n}")
+        if len(ranked) > 1:
+            lines.append(f"Weakest here: {ranked[0][0]}")
+
+    await m.answer("\n".join(lines), parse_mode="HTML")
 
 
 # ------------------------------------------------------------------- tournament
@@ -479,19 +639,26 @@ async def notes_unsub(m: Message):
 
 @router.message(Command("tournament"))
 async def tournament(m: Message):
+    """Status only. Entry is automatic, so there is nothing to join.
+
+    Kept as a command because "when does the tournament end and where am I" is a
+    question students will ask regardless.
+    """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     t = await db.active_tournament()
     if not t:
-        return await m.answer("No tournament on right now. We'll announce the next one 👀")
-    if await db.is_joined(uid):
-        await db.leave_tournament(uid)
-        return await m.answer("You've left the tournament. Changed your mind? /tournament")
-    await db.join_tournament(uid)
+        return await m.answer(
+            "No tournament running. When OphSoc starts one you are entered "
+            "automatically and we'll announce it here 👀")
+    mark = await db.tournament_mark(uid)
     await m.answer(
-        f"🏆 You're in! The tournament ends {_local(t['ends_at'])}.\n\n"
-        "Every question you get right in /practice is worth 1 point (each question "
-        "only counts once). Top 3 win a prize from LKC OphSoc 🎁"
+        f"🏆 <b>Tournament live</b>, ends {_local(t['ends_at'])}.\n"
+        f"You're in it with {_pts(mark['points'])} out of {mark['entrants']} "
+        "entered.\n\n"
+        "Only questions you answer through /quizme score, and each one counts once. "
+        "/leaderboard for the top 3.",
+        parse_mode="HTML",
     )
 
 
@@ -501,7 +668,7 @@ async def leaderboard(m: Message):
     if rows is None:
         return await m.answer("No tournament on right now.")
     if not rows:
-        return await m.answer("🏆 Nobody's joined yet. Be the first: /tournament")
+        return await m.answer("🏆 Nobody has scored yet. Set the pace with /quizme!")
 
     top = "\n".join(
         f"{MEDALS.get(r['rk'], str(r['rk']) + '.')} @{mask(r['username'], r['user_id'])}, "
@@ -510,7 +677,7 @@ async def leaderboard(m: Message):
     )
     mine = await db.my_rank(m.from_user.id)
     if mine is None:
-        tail = "\n\nYou're not in yet. Join with /tournament"
+        tail = "\n\nYou have no points yet. Answer some /quizme sets!"
     else:
         tail = f"\n\nYou're #{mine['rk']} with {_pts(mine['points'])}."
     await m.answer(f"🏆 Leaderboard\n\n{top}{tail}")
@@ -527,13 +694,23 @@ def _is_admin(m: Message) -> bool:
 
 
 @router.message(Command("admin_tournament_start"))
-async def admin_tournament_start(m: Message):
+async def admin_tournament_start(m: Message, bot: Bot):
+    """Start a tournament and put everybody in it.
+
+    Entry is automatic rather than opt-in, so this also announces the competition:
+    otherwise students would be scoring in a tournament nobody told them about.
+    """
     if not _is_admin(m):
         return
     if await db.active_tournament():
         return await m.answer("There's already a tournament running.")
-    tid = await db.start_tournament(14)
-    await m.answer(f"🏆 Tournament {tid} is live for 2 weeks. Students join with /tournament.")
+    tid = await db.start_tournament(jobs.TOURNAMENT_DAYS)
+    entrants = await db.enrol_everyone(tid)
+    await m.answer(
+        f"🏆 Tournament {tid} is live for {jobs.TOURNAMENT_DAYS} days. "
+        f"{entrants} student(s) entered automatically. Announcing it now...")
+    sent = await jobs.announce_tournament(bot)
+    await m.answer(f"Announced to {sent} student(s).")
 
 
 @router.message(Command("admin_tournament_end"))
@@ -553,15 +730,15 @@ async def admin_weekly_now(m: Message, bot: Bot):
     """Manual trigger, so you never have to wait for Monday to demo the push."""
     if not _is_admin(m):
         return
-    await m.answer("Sending this week's question...")
-    sent = await jobs.weekly_question(bot)
-    await m.answer(f"Sent to {sent} subscriber(s).")
+    await m.answer("Sending this week's sets...")
+    sent = await jobs.weekly_quiz(bot)
+    await m.answer(f"Sent {sent} question(s).")
 
 
 @router.message(Command("admin_notes_now"))
 async def admin_notes_now(m: Message, bot: Bot):
     if not _is_admin(m):
         return
-    await m.answer("Sending the cheat sheets...")
-    sent = await jobs.fortnightly_notes(bot)
-    await m.answer(f"Sent {sent} message(s).")
+    await m.answer("Sending the monthly sheets...")
+    sent = await jobs.monthly_notes(bot)
+    await m.answer(f"Sent {sent} document(s).")
