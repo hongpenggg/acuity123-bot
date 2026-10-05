@@ -20,6 +20,11 @@ LLM_ENABLED = bool(LLM_API_KEY and LLM_MODEL)
 # how times are shown to users and when the cron jobs fire.
 TZ = os.getenv("BOT_TZ", "Asia/Singapore")
 
+# Where the repo is, for the GitHub links we hand out when a note PDF cannot be
+# sent as a file (bot/resources.py). Point these at your fork.
+REPO_SLUG = os.getenv("REPO_SLUG", "hongpenggg/acuity123-bot")
+REPO_REF = os.getenv("REPO_REF", "main")
+
 # Weakness detection: below this many answered questions the picker stays uniform.
 MIN_ATTEMPTS_FOR_ADAPTIVE = int(os.getenv("MIN_ATTEMPTS_FOR_ADAPTIVE", "10"))
 # Error-rate floor so a topic the user has mastered still resurfaces occasionally
@@ -40,10 +45,14 @@ LEVEL_EMOJI: dict[str, str] = {
     "postmbbs": "🎓",
 }
 
-# Shown in italics at the foot of /start and /help.
+# Split so the society can edit either line without touching the other.
+ACUITY_CREDIT = "Built by the Acuity Team: Zhong Han, Hongpeng, Rahul, Jeromy"
+SOCIETY_CREDIT = "for the LKC Ophthalmology Society (@lkceye)"
+
 CREDIT = (
-    "Made by Zhong Han (Vice-Chairperson, LKC OphSoc 26/27) and the Acuity Team: "
-    "Zhong Han, Rahul, Hongpeng and Jeromy."
+    "👁 Acuity, the LKC OphSoc revision bot\n"
+    f"{ACUITY_CREDIT}\n"
+    f"{SOCIETY_CREDIT}"
 )
 
 DISCLAIMER = "For revision only, not clinical advice."

@@ -39,11 +39,11 @@ async def test_returns_none_when_there_is_no_explanation_and_no_provider(no_netw
 
 def test_prompt_covers_every_option_including_five_option_questions():
     prompt = llm.build_prompt(question(n_options=5, correct_idx=4))
-    assert "E. option 4" in prompt
-    assert "Correct: E" in prompt
+    assert "5. option 4" in prompt
+    assert "Correct: 5" in prompt
 
 
 def test_prompt_marks_the_right_answer():
     prompt = llm.build_prompt(question(n_options=4, correct_idx=2))
-    assert "Correct: C" in prompt
-    assert "C. option 2" in prompt
+    assert "Correct: 3" in prompt
+    assert "3. option 2" in prompt

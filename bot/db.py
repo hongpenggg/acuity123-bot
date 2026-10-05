@@ -162,23 +162,97 @@ async def _weighted_topic(uid: int, level: str, candidates: list[str]) -> str:
     return random.choices(candidates, weights=[weight(t) for t in candidates], k=1)[0]
 
 
-async def pick_question(uid: int, level: str, topic: str | None = None):
-    """One question at the user's level, preferring ones they have not seen."""
+#: A question is "fresh" for a user until they answer it correctly. Wrong answers
+#: deliberately do not remove it — getting it again is the point.
+_FRESH_SQL = """select q.* from questions q
+                 where q.level = $2 and q.topic = $3
+                   and not exists (select 1 from attempts a
+                                    where a.user_id = $1
+                                      and a.question_id = q.id
+                                      and a.correct)
+                 order by random()
+                 limit 1"""
+
+#: Everything in the topic has been answered correctly. Hand back the one they
+#: have attempted fewest times, so repeats at least spread out.
+_LEAST_REPEATED_SQL = """select q.* from questions q
+                          where q.level = $2 and q.topic = $3
+                          order by (select count(*) from attempts a
+                                     where a.user_id = $1 and a.question_id = q.id),
+                                   random()
+                          limit 1"""
+
+
+async def _topics_with_fresh(uid: int, level: str) -> list[str]:
+    """Topics at this level where the user still has something left to get right."""
     conn = _require_pool()
-    if topic is None:
-        candidates = await topics(level)
-        if not candidates:
-            return None
-        topic = await _weighted_topic(uid, level, candidates)
-    return await conn.fetchrow(
-        """select q.* from questions q
-            where q.level = $2 and q.topic = $3
-            order by exists (select 1 from attempts a
-                              where a.user_id = $1 and a.question_id = q.id),
-                     random()
-            limit 1""",
-        uid, level, topic,
+    rows = await conn.fetch(
+        """select distinct q.topic from questions q
+            where q.level = $2
+              and not exists (select 1 from attempts a
+                               where a.user_id = $1
+                                 and a.question_id = q.id
+                                 and a.correct)
+            order by q.topic""",
+        uid, level,
     )
+    return [r["topic"] for r in rows]
+
+
+async def pick_question(uid: int, level: str, topic: str | None = None):
+    """One question at the user's level, avoiding repeats.
+
+    A question is *finished* once the user answers it correctly; finished questions
+    are held back so a student works through the bank instead of seeing the same
+    one repeatedly. Wrong answers stay in the pool on purpose.
+
+    The topic for unfixed-topic practice is chosen from the topics that still have
+    something fresh, not from every topic — otherwise a cleared topic could be
+    selected and the student would be handed a repeat while other topics still had
+    unseen questions. Once *everything* at the level has been answered correctly
+    the filter is dropped and the least-repeated question is served, so the bot
+    never dead-ends. Callers check `progress` first to say so plainly.
+    """
+    conn = _require_pool()
+
+    if topic is not None:
+        row = await conn.fetchrow(_FRESH_SQL, uid, level, topic)
+        return row if row is not None else await conn.fetchrow(
+            _LEAST_REPEATED_SQL, uid, level, topic)
+
+    fresh_topics = await _topics_with_fresh(uid, level)
+    if fresh_topics:
+        chosen = await _weighted_topic(uid, level, fresh_topics)
+        row = await conn.fetchrow(_FRESH_SQL, uid, level, chosen)
+        if row is not None:
+            return row
+
+    all_topics = await topics(level)
+    if not all_topics:
+        return None
+    chosen = await _weighted_topic(uid, level, all_topics)
+    return await conn.fetchrow(_LEAST_REPEATED_SQL, uid, level, chosen)
+
+
+async def progress(uid: int, level: str) -> tuple[int, int]:
+    """``(still to get right, total)`` at this level, in one round trip.
+
+    ``total == 0`` means no bank is loaded for the level; ``fresh == 0`` with
+    ``total > 0`` means the student has answered everything correctly.
+    """
+    conn = _require_pool()
+    row = await conn.fetchrow(
+        """select
+             (select count(*) from questions where level = $2) as total,
+             (select count(*) from questions q
+               where q.level = $2
+                 and not exists (select 1 from attempts a
+                                  where a.user_id = $1
+                                    and a.question_id = q.id
+                                    and a.correct)) as fresh""",
+        uid, level,
+    )
+    return (row["fresh"], row["total"])
 
 
 async def record_attempt(uid: int, question, idx: int, correct: bool,

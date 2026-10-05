@@ -21,13 +21,20 @@ class FakeBot:
     def __init__(self):
         self.sent = []
         self.commands = None
+        self.command_scopes = []
 
     async def send_message(self, chat_id, text, **kw):
         self.sent.append({"chat_id": chat_id, "text": text, **kw})
         return SimpleNamespace(message_id=100 + len(self.sent))
 
-    async def set_my_commands(self, commands):
+    async def send_document(self, chat_id, document, caption=None, **kw):
+        self.sent.append({"chat_id": chat_id, "document": document,
+                          "caption": caption, **kw})
+        return SimpleNamespace(message_id=100 + len(self.sent))
+
+    async def set_my_commands(self, commands, scope=None):
         self.commands = commands
+        self.command_scopes.append((commands, scope))
 
 
 class FakeMessage:
@@ -106,11 +113,27 @@ class FakeDB:
     async def get_question(self, qid):
         return self.questions.get(qid)
 
+    def _correct_ids(self, uid):
+        """Question ids this user has already answered correctly."""
+        return {rec["qid"] for (u, _), rec in self.attempts.items()
+                if u == uid and rec["correct"]}
+
     async def pick_question(self, uid, level, topic=None):
-        for q in self.questions.values():
-            if q["level"] == level:
-                return q
-        return None
+        """Mirrors bot.db: hold back questions already answered correctly."""
+        pool = [q for q in self.questions.values() if q["level"] == level]
+        if topic is not None:
+            pool = [q for q in pool if q["topic"] == topic]
+        if not pool:
+            return None
+        done = self._correct_ids(uid)
+        fresh = [q for q in pool if q["id"] not in done]
+        return (fresh or pool)[0]
+
+    async def progress(self, uid, level):
+        """Mirrors bot.db.progress: (still to get right, total) at this level."""
+        done = self._correct_ids(uid)
+        at_level = [q for q in self.questions.values() if q["level"] == level]
+        return (len([q for q in at_level if q["id"] not in done]), len(at_level))
 
     async def topics(self, level):
         return sorted({q["topic"] for q in self.questions.values() if q["level"] == level})
@@ -124,7 +147,8 @@ class FakeDB:
     async def record_attempt(self, uid, question, idx, correct, mode, msg_id):
         if (uid, msg_id) in self.attempts:
             return False
-        self.attempts[(uid, msg_id)] = idx
+        self.attempts[(uid, msg_id)] = {"idx": idx, "correct": correct,
+                                        "qid": question["id"]}
         return True
 
     # -- tournaments
@@ -221,7 +245,7 @@ async def test_correct_answer_is_scored_and_revealed(fake):
     assert not any(a["alert"] for a in c.answers)
     edit = message.edits[-1]
     assert edit["parse_mode"] == "HTML"
-    assert "✅ <b>B.</b> option 1" in edit["text"], "the right option is ticked in place"
+    assert "✅ <b>2.</b> option 1" in edit["text"], "the right option is ticked in place"
     assert edit["text"].rstrip().splitlines()[-1].startswith("✅ <b>")
     assert "❌" not in edit["text"]
     assert fake.points == {(1, 1): True}
@@ -239,7 +263,7 @@ async def test_five_option_question_no_longer_crashes(fake):
 
     await handlers.on_answer(c)
 
-    assert "✅ <b>E.</b> option 4" in message.edits[-1]["text"]
+    assert "✅ <b>5.</b> option 4" in message.edits[-1]["text"]
 
 
 @pytest.mark.asyncio
@@ -251,9 +275,9 @@ async def test_wrong_answer_shows_the_right_option(fake):
     await handlers.on_answer(c)
 
     text = message.edits[-1]["text"]
-    assert "❌ <b>A.</b> option 0" in text, "the wrong pick is crossed"
-    assert "✅ <b>C.</b> option 2" in text
-    assert "The answer is <b>C</b>." in text
+    assert "❌ <b>1.</b> option 0" in text, "the wrong pick is crossed"
+    assert "✅ <b>3.</b> option 2" in text
+    assert "The answer is <b>3</b>." in text
     # The verdict points at the letter; the option text appears once, not twice.
     assert text.count("option 2") == 1
     assert fake.points == {}
@@ -307,7 +331,7 @@ async def test_edit_failure_still_delivers_the_verdict(fake):
     await handlers.on_answer(c)
 
     assert message.replies, "must fall back to a fresh message"
-    assert "✅ <b>A.</b> option 0" in message.replies[-1]["text"]
+    assert "✅ <b>1.</b> option 0" in message.replies[-1]["text"]
     assert message.replies[-1]["parse_mode"] == "HTML"
 
 
@@ -554,7 +578,7 @@ async def test_student_on_an_unwritten_level_is_told_what_is_available(fake):
     text = fake.bot.sent[-1]["text"]
     assert "No Clinical questions yet" in text
     assert "Pre-Clinical" in text
-    assert "/level" in text
+    assert "/changestreams" in text
 
 
 @pytest.mark.asyncio
@@ -571,10 +595,11 @@ async def test_practice_with_an_empty_database_says_so(fake):
 async def test_start_greets_by_name_and_escapes_it(fake):
     msg = SimpleNamespace(
         from_user=SimpleNamespace(id=1, username="t", first_name="<Zay>"),
+        chat=SimpleNamespace(id=1),
         answer=_recorder(),
     )
 
-    await handlers.start(msg)
+    await handlers.start(msg, fake.bot)
 
     text = msg.answer.messages[-1]
     assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b>")
@@ -602,3 +627,151 @@ def test_no_em_dashes_in_anything_students_see():
                     and id(node) not in docstrings and "\u2014" in node.value):
                 offenders.append(f"{path.name}:{node.lineno}")
     assert offenders == []
+
+
+# --------------------------------------------------------------------- menu
+
+
+def _chat_message(uid=1, username="tester"):
+    return SimpleNamespace(from_user=SimpleNamespace(id=uid, username=username),
+                           chat=SimpleNamespace(id=uid),
+                           answer=_recorder())
+
+
+@pytest.mark.asyncio
+async def test_start_gives_that_chat_the_full_menu(fake):
+    """The complaint was that the menu sat on /start. Telegram keeps commands per
+    scope, so /start must set a chat-scoped list - that is what fills it in."""
+    msg = _chat_message()
+
+    await handlers.start(msg, fake.bot)
+
+    assert fake.bot.command_scopes, "no command menu was set for the chat"
+    commands_sent, scope = fake.bot.command_scopes[-1]
+    names = [c.command for c in commands_sent]
+    assert "practice" in names
+    assert "resources" in names
+    assert "changestreams" in names
+    assert scope is not None, "a default-scope call would not change this chat"
+    assert "admin_tournament_start" not in names, "students must not see admin commands"
+
+
+@pytest.mark.asyncio
+async def test_start_states_the_functions_and_the_level(fake):
+    msg = _chat_message()
+    fake.users[1] = "preclin"
+
+    await handlers.start(msg, fake.bot)
+
+    text = msg.answer.messages[-1]
+    assert "Acuity Team" in text
+    assert "lkceye" in text
+    assert "WHAT THIS BOT DOES" in text
+    assert "3a." in text and "3b." in text
+    assert "Pre-Clinical" in text
+    assert "/changestreams" in text
+
+
+# ----------------------------------------------------------------- resources
+
+
+@pytest.mark.asyncio
+async def test_resources_intro_never_says_tier_names(fake):
+    msg = _chat_message()
+
+    await handlers.resources_cmd(msg, SimpleNamespace(args=None), fake.bot)
+
+    text = msg.answer.messages[-1]
+    assert "Revision sheets" in text
+    assert "Tier A" not in text and "Tier B" not in text
+
+
+@pytest.mark.asyncio
+async def test_resources_by_code_sends_the_pdf_itself(fake):
+    """Students should get the document, not a description of it."""
+    msg = _chat_message()
+
+    await handlers.resources_cmd(msg, SimpleNamespace(args="B14"), fake.bot)
+
+    sent = fake.bot.sent[-1]
+    assert "document" in sent, "expected a document upload"
+    assert "Saccades" in sent["caption"]
+    assert "Tier" not in sent["caption"]
+
+
+@pytest.mark.asyncio
+async def test_tapping_a_sheet_sends_it(fake):
+    c = FakeCallback("res:get:b:B14", message=FakeMessage())
+
+    await handlers.resources_cb(c, fake.bot)
+
+    assert c.answers, "the client spinner must always be closed"
+    assert any("document" in m for m in fake.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_unknown_sheet_code_is_handled(fake):
+    msg = _chat_message()
+
+    await handlers.resources_cmd(msg, SimpleNamespace(args="zzz"), fake.bot)
+
+    assert "No sheet matches" in msg.answer.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_notes_falls_back_to_the_sheets_when_the_table_is_empty(fake):
+    """The notes table is empty; /notes must not dead-end."""
+    msg = _chat_message()
+
+    await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+
+    assert "Revision sheets" in msg.answer.messages[-1]
+
+
+# ------------------------------------------------------------- no repeats
+
+
+@pytest.mark.asyncio
+async def test_a_question_already_answered_correctly_is_not_served_again(fake):
+    """Once correct, a question is held back so the same one does not come round
+    again while there are fresh ones left."""
+    first = add_question(fake, qid=1, correct_idx=0)
+    second = add_question(fake, qid=2, correct_idx=1)
+    first["text"] = "The first question."
+    second["text"] = "The second question."
+    fake.users[1] = "preclin"
+    await real_db.record_attempt(1, first, 0, True, "practice", msg_id=99)
+
+    await handlers.practice(_chat_message(), fake.bot)
+
+    bodies = [m["text"] for m in fake.bot.sent if "question." in m.get("text", "")]
+    assert bodies, fake.bot.sent
+    assert "The second question." in bodies[-1]
+    assert "The first question." not in bodies[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_question_answered_wrongly_can_come_back(fake):
+    """Only correct answers retire a question; retrying a wrong one is the point."""
+    only = add_question(fake, qid=1, correct_idx=0)
+    only["text"] = "The only question."
+    fake.users[1] = "preclin"
+    await real_db.record_attempt(1, only, 3, False, "practice", msg_id=99)
+
+    await handlers.practice(_chat_message(), fake.bot)
+
+    texts = [m["text"] for m in fake.bot.sent]
+    assert any("The only question." in t for t in texts), texts
+    assert not any("answered all" in t for t in texts), "not finished yet"
+
+
+@pytest.mark.asyncio
+async def test_clearing_everything_is_announced(fake):
+    only = add_question(fake, qid=1, correct_idx=0)
+    fake.users[1] = "preclin"
+    await real_db.record_attempt(1, only, 0, True, "practice", msg_id=99)
+
+    await handlers.practice(_chat_message(), fake.bot)
+
+    texts = [m["text"] for m in fake.bot.sent]
+    assert any("answered all 1" in t or "answered correctly" in t for t in texts), texts

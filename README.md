@@ -7,12 +7,12 @@
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
-A Telegram revision bot built for the **LKC Ophthalmology Society**. Students
-answer adaptive practice questions, get a weekly question and fortnightly notes
-pushed to them, and compete on a two-week tournament leaderboard.
+A Telegram revision bot for the **LKC Ophthalmology Society** (`@lkceye`).
+Students answer adaptive quiz questions, pull the society's revision sheets
+straight out of the chat as PDFs, get a question and notes pushed to them, and
+compete on a tournament leaderboard.
 
-**LKC Ophthalmology Society** — made by **Zhong Han** (Vice-Chairperson, LKC OphSoc 26/27)
-and the **Acuity Team**: Zhong Han, Rahul, Hongpeng, Jeromy.
+Built by the **Acuity Team** — Zhong Han, Hongpeng, Rahul, Jeromy.
 
 > Educational revision only — not clinical advice.
 
@@ -21,6 +21,7 @@ and the **Acuity Team**: Zhong Han, Rahul, Hongpeng, Jeromy.
 ## Contents
 
 - [What it does](#what-it-does)
+- [Revision notes](#revision-notes)
 - [The question bank](#the-question-bank)
 - [Quickstart](#quickstart)
 - [Configuration](#configuration)
@@ -35,16 +36,42 @@ and the **Acuity Team**: Zhong Han, Rahul, Hongpeng, Jeromy.
 
 | Area | Behaviour |
 |---|---|
-| `/practice` | A question at the student's level, preferring ones they haven't seen |
+| `/practice` | A question at the student's tier, options numbered 1–5, each with a written explanation |
+| No repeats | A question answered **correctly** is retired for that student, so they work through the bank. Wrong answers come back until they land, and when a tier is cleared the bot says so instead of repeating silently |
 | Adaptive weighting | After 10 answers, topics are chosen in proportion to the student's error rate, with a floor so a mastered topic still resurfaces |
-| `/level` | Pre-Clinical / Clinical / Post-MBBS — questions *and* notes follow it, changeable any time |
+| `/resources` | The revision sheets, sent as **real PDF files** in the chat — browsable, or by code (`/resources b14`) |
+| `/changestreams` | Pre-Clinical / Clinical / Post-MBBS — questions *and* notes follow it, changeable any time |
 | `/subscribe` | A question every Monday, one topic per week, rotating through all topics |
-| `/notes`, `/notes_sub` | Tier B cheat sheets on demand; Tier A sets pushed fortnightly |
-| Tournament | An admin switches it on for 2 weeks; correct `/practice` answers score **once per question**; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
+| `/notes`, `/notes_sub` | Notes on demand by topic; the overview sheets pushed fortnightly |
+| Tournament | An admin switches it on for 2 weeks; correct answers score **once per question**; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
 | 💡 Explain | Serves the written explanation stored with the question — the LLM is only a fallback and is optional |
+| Menu | Telegram keeps a command list per chat. The default shows only `/start`; sending `/start` sets that chat's full menu, which is what makes `/practice` and the rest appear |
 
 Weakness detection is plain SQL (per-topic accuracy), so a slow or missing LLM
 provider can never block practice.
+
+## Revision notes
+
+The sheets live in the repo as PDFs and are delivered **from the deployed working
+copy**, so Telegram receives the actual document and nothing needs hosting. If a
+sheet is missing locally, or is too large for the Bot API to upload, the bot falls
+back to the GitHub link rather than failing.
+
+```
+resources/
+  questions/          the .docx MCQ sources
+  notes/tier_a/       one broad sheet per topic       01–06   ("Overview" to students)
+  notes/tier_b/       deeper sheets on single points  B01–B20 ("Focused" to students)
+```
+
+The catalogue is built by **scanning the directory**, not hard-coded — adding a
+sheet is: drop the PDF in, commit it. No code change, no database row.
+`tests/test_resources.py` asserts the catalogue matches what is on disk, and that
+the six overview sheets cover exactly the six topics the question bank is built
+around, so a rename on either side fails CI.
+
+To students these are "Overview" and "Focused" sheets, never "Tier A" and
+"Tier B" — that is internal shorthand for the content team.
 
 ## The question bank
 
@@ -69,20 +96,26 @@ seeds/03_postmbbs_mcqs.sql   Post-MBBS       (placeholder — loads nothing yet)
 ```
 
 The Clinical and Post-MBBS files are valid, load cleanly and add nothing, so
-running all three against a fresh database is always safe. Adding a level later
-is: drop the `.docx` into `resources/`, add it to `LEVELS` in
+running all three against a fresh database is always safe. Adding a tier later
+is: drop the `.docx` into `resources/questions/`, add it to `LEVELS` in
 `tools/build_question_seed.py`, re-run the generator, load the file. The
-`questions.level` column and the bot's `/level` command already handle all three.
+`questions.level` column and the bot's `/changestreams` command already handle
+all three. [docs/HANDOVER.md](docs/HANDOVER.md) is the step-by-step version of
+that, written for whoever picks it up next.
 
 Because every question carries an explanation, the bot serves them from the
 database and **never calls the LLM for this bank** — you can run the whole event
 with no API key and zero spend.
 
-The bank is generated from the `.docx` sources in `resources/`. Editing those
+The bank is generated from the `.docx` sources in `resources/questions/`. Editing those
 documents does not change the database; regenerate the seeds instead
 (`tools/build_question_seed.py`). `tests/test_seed_data.py` verifies the loaded
 bank — 120 rows, the topic split above, and that every question renders — so a
 bad regeneration fails CI rather than shipping.
+
+Options are rendered **1–5**, not A–E, matching how the society writes its
+questions. One function (`bot/text.py:letter`) feeds both the rendered list and
+the answer buttons, so the two can never disagree.
 
 ## Quickstart
 
@@ -121,7 +154,9 @@ Everything comes from the environment; nothing needs editing to deploy.
 ## Commands
 
 **Students** — `/start` `/help` `/practice` `/level` `/subscribe` `/unsubscribe`
-`/notes` `/notes_sub` `/notes_unsub` `/tournament` `/leaderboard`
+`/resources` `/notes` `/notes_sub` `/notes_unsub` `/tournament` `/leaderboard`
+
+`/level` still works as an alias for `/changestreams`.
 
 **Admins** (`ADMIN_IDS`) — `/admin_tournament_start` `/admin_tournament_end`
 `/admin_weekly_now` `/admin_notes_now`
@@ -134,8 +169,10 @@ to wait for a Monday to demonstrate a push.
 ```
 bot/
   config.py    environment + level definitions
-  text.py      option letters, rendering, masking, message splitting   (pure)
-  sender.py    outbound Telegram: retry, flood control, 4096-char split
+  commands.py  the command menu, and how it changes once someone has started
+  text.py      option numbering, rendering, masking, message splitting   (pure)
+  resources.py the note catalogue, built by scanning resources/notes
+  sender.py    outbound Telegram: retry, flood control, document upload, 4096-char split
   db.py        every SQL statement
   llm.py       explanation fallback (optional)
   handlers.py  commands and callbacks
@@ -144,6 +181,8 @@ bot/
 schema.sql                 structure only, nothing seeded
 migrations/                upgrade path for an existing database
 seeds/                     the question bank
+resources/                 the .docx sources and the note PDFs
+tools/                     regenerates the question seeds from the .docx files
 scripts/check_sql.py       parse every statement with libpg_query
 tests/                     unit, handler and live-database suites
 deploy/studybot.service    systemd unit
