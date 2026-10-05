@@ -737,8 +737,9 @@ async def subscribenotes(m: Message):
     left = (len(resources.unsent(level, "a", delivered["a"]))
             + len(resources.unsent(level, "b", delivered["b"])))
     if left:
-        body = (f"📬 You're in. On the 1st and the 15th you'll get up to "
-                f"{jobs.SHEETS_PER_DROP} cheat sheets for "
+        each = ("a cheat sheet" if jobs.SHEETS_PER_DROP == 1
+                else f"{jobs.SHEETS_PER_DROP} cheat sheets")
+        body = (f"📬 You're in. On the 1st and the 15th you'll get {each} for "
                 f"{LEVELS[_level(level)]}, picking up where you left off. "
                 f"{left} to go.\n\nWant one right now? /notes")
     else:
@@ -995,8 +996,12 @@ async def admin_weekly_now(m: Message, bot: Bot):
     if not _is_admin(m):
         return
     await m.answer("Sending this week's sets...")
-    sent = await jobs.weekly_quiz(bot)
-    await m.answer(f"Sent {sent} question(s).")
+    r = await jobs.weekly_quiz(bot)
+    # Spelled out because a bare total reads as one student's set: 3 subscribers
+    # times 5 questions is 15, which looked like a bug to the admin who saw it.
+    await m.answer(
+        f"Sent {r['sent']} question(s) in total: {jobs.SET_PER_PUSH} each to "
+        f"{r['reached']} of {r['subscribers']} subscriber(s).")
 
 
 @router.message(Command("admin_notes_now"))
@@ -1004,5 +1009,10 @@ async def admin_notes_now(m: Message, bot: Bot):
     if not _is_admin(m):
         return
     await m.answer("Sending the fortnightly sheets...")
-    sent = await jobs.fortnightly_notes(bot)
-    await m.answer(f"Sent {sent} document(s).")
+    r = await jobs.fortnightly_notes(bot)
+    body = (f"Sent {r['sent']} sheet(s) in total: {jobs.SHEETS_PER_DROP} each to "
+            f"{r['reached']} of {r['subscribers']} subscriber(s).")
+    if r["finished"]:
+        body += (f"\n{r['finished']} had already had every sheet at their level, "
+                 "so they were congratulated and unsubscribed.")
+    await m.answer(body)

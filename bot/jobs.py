@@ -17,29 +17,35 @@ log = logging.getLogger(__name__)
 FANOUT_PAUSE = 0.05  # seconds between sends, comfortably under Telegram's ~30/s
 TOURNAMENT_DAYS = 14
 
-# How many sheets one fortnightly drop hands over. The catalogue is 26 sheets at
-# preclinical and 80 at post-MBBS, so sending the lot in one burst would be a
-# wall of PDFs; six is the size of the bundle the old monthly drop sent, and at
-# this cadence it walks even the largest level inside a year. One constant, so
-# changing the pace is a one-line edit.
-SHEETS_PER_DROP = 6
+# How many sheets one fortnightly drop hands over. One: a drop is a nudge to read
+# something, not a dump of PDFs to scroll past. The old monthly drop sent twelve
+# at once and that is exactly what it looked like. A student who wants more does
+# not have to wait - /notes hands over the next one on demand, from the same
+# queue and the same delivery history.
+SHEETS_PER_DROP = 1
 
 # How many questions the Monday push sends. One set's worth.
 SET_PER_PUSH = 5
 
 
-async def weekly_quiz(bot) -> int:
+async def weekly_quiz(bot) -> dict:
     """A set of five for every subscriber, sent question by question.
 
-    The set is the student's current benchmark set, so everyone at the same point
-    in the course gets the same five questions, and a student who stopped halfway
-    through last week's set gets the rest of that one rather than a fresh set.
+    Each student gets five questions picked for *them* - spread across topics and
+    weighted toward the ones they keep getting wrong - and picked one at a time,
+    so answering the first influences the second. A student who stopped halfway
+    through last week continues from where they were, because a set is simply
+    their next five answers.
 
     Answers here do not score for the tournament: only /quizme does, which is
     what keeps the weekly push from quietly becoming a leaderboard farm.
+
+    Returns a summary rather than a bare total, because "15" on its own told one
+    admin the 5-question push was broken when it had simply reached three people.
     """
     subscribers = await db.subscribers("weekly_sub")
     sent = 0
+    reached = 0
     for uid in subscribers:
         level = await db.get_level(uid) or DEFAULT_LEVEL
         current = await db.current_set(uid, level)
@@ -54,15 +60,19 @@ async def weekly_quiz(bot) -> int:
         # Picked one at a time rather than as a batch: pick_question reads this
         # student's history, so answering question 1 should influence what
         # question 2 is, exactly as it does in /quizme.
+        got = 0
         for _ in range(SET_PER_PUSH):
             question = await db.pick_question(uid, level)
             if question is None:
                 break
             if await send_question(bot, uid, question, "weekly"):
-                sent += 1
+                got += 1
             await asyncio.sleep(FANOUT_PAUSE)
-    log.info("weekly quiz: %s question(s) to %s subscriber(s)", sent, len(subscribers))
-    return sent
+        sent += got
+        reached += bool(got)
+    log.info("weekly quiz: %s question(s) to %s of %s subscriber(s)",
+             sent, reached, len(subscribers))
+    return {"sent": sent, "reached": reached, "subscribers": len(subscribers)}
 
 
 async def fortnightly_notes(bot) -> int:
@@ -78,6 +88,8 @@ async def fortnightly_notes(bot) -> int:
     /resources still has every sheet.
     """
     sent = 0
+    reached = 0
+    finished = 0
     subscribers = await db.subscribers("notes_sub")
     for uid in subscribers:
         level = await db.get_level(uid) or DEFAULT_LEVEL
@@ -89,22 +101,28 @@ async def fortnightly_notes(bot) -> int:
             await safe_send(bot, uid, sheets_done(LEVELS.get(level, level)),
                             parse_mode="HTML")
             await db.set_flag(uid, "notes_sub", False)
+            finished += 1
             await asyncio.sleep(FANOUT_PAUSE)
             continue
 
         batch = queue[:SHEETS_PER_DROP]
         left = len(queue) - len(batch)
+        head = ("📬 Your fortnightly cheat sheet." if len(batch) == 1
+                else f"📬 Your fortnightly cheat sheets: {len(batch)} of them.")
         tail = (f" {left} to go after this." if left
-                else " That is the last of them.")
+                else " That is the last one.")
         await safe_send(
             bot, uid,
-            f"📬 Your fortnightly cheat sheets: {len(batch)} of them.{tail}\n"
-            "Send /stats any time to see how you are doing.",
+            f"{head}{tail}\n"
+            "Want the next one sooner? /notes hands it over any time.",
         )
         await asyncio.sleep(FANOUT_PAUSE)
 
-        # Recorded only for the sheets that actually went out, so a failed upload
-        # is retried on the next drop instead of being silently skipped forever.
+        # Recorded only for the sheets that actually reached the student. Note
+        # that `send_note` degrades a failed upload to a GitHub link and still
+        # returns True - they got the sheet, so it counts. False means they got
+        # nothing at all (they have blocked the bot), and then it is left in the
+        # queue to come round again rather than silently skipped forever.
         landed = []
         for note in batch:
             if await send_note(bot, uid, note):
@@ -113,10 +131,12 @@ async def fortnightly_notes(bot) -> int:
             await asyncio.sleep(FANOUT_PAUSE)
         if landed:
             await db.record_notes_sent(uid, level, landed)
+        reached += bool(landed)
 
-    log.info("fortnightly sheets: %s document(s) to %s subscriber(s)",
-             sent, len(subscribers))
-    return sent
+    log.info("fortnightly sheets: %s document(s) to %s of %s subscriber(s), "
+             "%s finished their level", sent, reached, len(subscribers), finished)
+    return {"sent": sent, "reached": reached,
+            "subscribers": len(subscribers), "finished": finished}
 
 
 async def announce_tournament(bot) -> int:
