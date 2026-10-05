@@ -3,8 +3,8 @@
 -- GENERATED FILE - do not edit by hand.
 --   Regenerate with:  python tools/build_question_seed.py --level preclin
 --   Source(s):
---   resources/Preclinical_Ophthalmology_20_MCQs.docx
---   resources/Preclinical_Ophthalmology_100_Additional_MCQs.docx
+--   resources/questions/Preclinical_Ophthalmology_20_MCQs.docx
+--   resources/questions/Preclinical_Ophthalmology_100_Additional_MCQs.docx
 --
 -- Load AFTER schema.sql, in file order:
 --   psql "$DATABASE_URL" -f schema.sql

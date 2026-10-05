@@ -114,6 +114,16 @@ async def test_topic_distribution_matches_the_source_document(bank):
     assert counts == EXPECTED_TOPICS
 
 
+async def test_overview_sheets_cover_the_same_topics_as_the_bank(bank):
+    """The six overview sheets and the six question topics are the same six
+    things. Renaming one without the other fails here, not in front of students."""
+    from bot import resources
+
+    rows = await bank.pool.fetch(
+        "select distinct topic from questions where level = 'preclin'")
+    assert {r["topic"] for r in rows} == set(resources.TIER_A_TOPICS)
+
+
 async def test_every_question_is_renderable(bank):
     """The whole bank goes through the handler's render path. 118 questions have
     five options, which the original `LETTERS = "ABCD"` implementation could not

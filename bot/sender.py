@@ -10,10 +10,12 @@ import logging
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup)
 
 from . import db
 from .config import LEVELS
+from .resources import MAX_UPLOAD_BYTES
 from .text import MAX_OPTIONS, TELEGRAM_LIMIT, WEEKLY_HEADER, chunks, letter, render
 
 log = logging.getLogger(__name__)
@@ -95,24 +97,67 @@ async def send_question(bot: Bot, uid: int, question, mode: str) -> bool:
 async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> bool:
     """A question at this level, or a clear explanation of why there isn't one.
 
-    The Clinical and Post-MBBS banks are still being written, so a student who
-    picks one of those levels must be told what is available rather than being
-    met with silence or a crash.
+    Three states a student can be in, and each deserves a sentence rather than
+    silence: their level has no bank yet, they have answered everything at their
+    level correctly, or there is a question to answer.
     """
-    question = await db.pick_question(uid, level)
-    if question is not None:
-        return await send_question(bot, uid, question, mode)
+    fresh, total = await db.progress(uid, level)
 
-    available = await db.levels_with_questions()
-    if not available:
+    if total == 0:
+        available = await db.levels_with_questions()
+        if not available:
+            return await send_question(bot, uid, None, mode)
+        names = " and ".join(LEVELS.get(name, name) for name in available)
+        return await safe_send(
+            bot, uid,
+            f"🚧 No {LEVELS.get(level, level)} questions yet, we're still writing them.\n\n"
+            f"For now you can practise {names}. Switch with /changestreams.",
+        )
+
+    question = await db.pick_question(uid, level)
+    if question is None:
         return await send_question(bot, uid, None, mode)
 
-    names = " and ".join(LEVELS.get(name, name) for name in available)
+    if fresh == 0:
+        # pick_question only reaches for repeats in this state, so say so once
+        # rather than silently serving the same questions again.
+        await safe_send(
+            bot, uid,
+            f"🏁 That's every {LEVELS.get(level, level)} question answered correctly "
+            f"({total} of them), nice. Here's one again to keep it sharp.\n"
+            "The revision sheets are in /resources.",
+        )
+    return await send_question(bot, uid, question, mode)
+
+
+async def send_note(bot: Bot, uid: int, note) -> bool:
+    """Send a revision sheet as a PDF, falling back to a GitHub link.
+
+    Telegram caps bot uploads at 50 MB, and the file may simply be missing from
+    the deployed working copy (committed after the last `git pull`). Either way the
+    student should end up with something usable, so this degrades to a link rather
+    than to nothing.
+    """
+    if note.path.exists() and note.size <= MAX_UPLOAD_BYTES:
+        try:
+            await bot.send_document(
+                uid, FSInputFile(note.path, filename=note.path.name),
+                caption=note.caption)
+            return True
+        except TelegramForbiddenError:
+            await db.deactivate(uid)
+            return False
+        except Exception:
+            log.warning("could not upload %s, falling back to a link",
+                        note.relpath, exc_info=True)
+    else:
+        log.warning("sheet %s not available locally (%s bytes)",
+                    note.relpath, note.size)
+
     return await safe_send(
         bot, uid,
-        f"🚧 No {LEVELS.get(level, level)} questions yet, we're still writing them.\n\n"
-        f"For now you can practise {names}. Switch with /level.",
-    )
+        f"{note.caption}\n\nCould not attach the file, so it is here on GitHub:\n"
+        f"{note.url}")
 
 
 async def ack(c: CallbackQuery, text: str | None = None, alert: bool = False) -> None:
@@ -195,6 +240,7 @@ __all__ = [
     "remaining_buttons",
     "question_kb",
     "safe_send",
+    "send_note",
     "send_question",
     "send_question_for_level",
 ]

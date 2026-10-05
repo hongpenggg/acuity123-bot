@@ -1,4 +1,4 @@
-"""Pure presentation helpers: option letters, question rendering, name masking.
+"""Pure presentation helpers: option numbering, question rendering, name masking.
 
 Kept free of aiogram and database imports so they can be unit-tested directly.
 Question cards are Telegram HTML, so every piece of stored text goes through
@@ -20,14 +20,16 @@ TELEGRAM_LIMIT = 4096
 
 
 def letter(index: int) -> str:
-    """0 -> 'A', 1 -> 'B' ... up to MAX_OPTIONS."""
+    """0 -> '1', 1 -> '2' ... up to MAX_OPTIONS.
+
+    Options are numbered rather than lettered, matching how the society writes
+    its questions. Everything downstream - the rendered list, the answer buttons
+    and the "answer was X" verdict - goes through here, so the button label and
+    the text can never disagree.
+    """
     if not 0 <= index < MAX_OPTIONS:
         raise ValueError(f"option index {index} out of range (0..{MAX_OPTIONS - 1})")
-    return chr(ord("A") + index)
-
-
-def letters(count: int) -> str:
-    return "".join(letter(i) for i in range(count))
+    return str(index + 1)
 
 
 def parse_options(raw: Any) -> list[str]:

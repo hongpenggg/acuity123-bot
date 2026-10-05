@@ -43,8 +43,8 @@ LEVELS: dict[str, tuple[str, list[Path]]] = {
     "preclin": (
         "01",
         [
-            ROOT / "resources" / "Preclinical_Ophthalmology_20_MCQs.docx",
-            ROOT / "resources" / "Preclinical_Ophthalmology_100_Additional_MCQs.docx",
+            ROOT / "resources" / "questions" / "Preclinical_Ophthalmology_20_MCQs.docx",
+            ROOT / "resources" / "questions" / "Preclinical_Ophthalmology_100_Additional_MCQs.docx",
         ],
     ),
     "clin": ("02", []),

@@ -6,7 +6,7 @@ import pytest
 import random
 
 from bot.text import (MAX_OPTIONS, WEEKLY_HEADER, chunks, explanation_block, letter,
-                      letters, mask, parse_options, render, verdict)
+                      mask, parse_options, render, verdict)
 
 
 def q(options, correct_idx=0, topic="Sample", text="Question?"):
@@ -14,10 +14,12 @@ def q(options, correct_idx=0, topic="Sample", text="Question?"):
             "options": json.dumps(options), "correct_idx": correct_idx}
 
 
-def test_letters_are_positional():
-    assert letter(0) == "A"
-    assert letter(5) == "F"
-    assert letters(4) == "ABCD"
+def test_options_are_numbered_from_one():
+    """Numbered, not lettered: the society writes its questions as 1..5, and the
+    answer buttons and the rendered card share this one function."""
+    assert letter(0) == "1"
+    assert letter(4) == "5"
+    assert letter(MAX_OPTIONS - 1) == str(MAX_OPTIONS)
 
 
 @pytest.mark.parametrize("index", [-1, MAX_OPTIONS, 99])
@@ -46,20 +48,20 @@ def test_render_escapes_stored_text_for_html():
 
 def test_answered_card_marks_the_options_in_place():
     body, _ = render(q(["w", "x", "y"], correct_idx=2), chosen=0)
-    assert "❌ <b>A.</b> w" in body
-    assert "<b>B.</b> x" in body and "❌ <b>B.</b>" not in body and "✅ <b>B.</b>" not in body
-    assert "✅ <b>C.</b> y" in body
+    assert "❌ <b>1.</b> w" in body
+    assert "<b>2.</b> x" in body and "❌ <b>2.</b>" not in body and "✅ <b>2.</b>" not in body
+    assert "✅ <b>3.</b> y" in body
 
     right, _ = render(q(["w", "x"], correct_idx=1), chosen=1)
-    assert "✅ <b>B.</b> x" in right and "❌" not in right
+    assert "✅ <b>2.</b> x" in right and "❌" not in right
 
 
 def test_long_options_get_breathing_room():
     short, _ = render(q(["III", "IV", "VI"]))
-    assert "\n\n<b>B.</b>" not in short
+    assert "\n\n<b>2.</b>" not in short
     long_opts = ["a fairly long option that wraps onto two lines on a phone"] * 3
     spaced, _ = render(q(long_opts))
-    assert "\n\n<b>B.</b>" in spaced
+    assert "\n\n<b>2.</b>" in spaced
 
 
 def test_weekly_header_sits_above_the_topic():
@@ -73,7 +75,7 @@ def test_verdict_lines():
     assert "🔥 4 in a row" in verdict(True, 0, streak=4, rng=rng)
     assert "🔥" not in verdict(True, 0, streak=2, rng=rng)
     wrong = verdict(False, 4, rng=rng)
-    assert wrong.startswith("❌ <b>") and wrong.endswith("The answer is <b>E</b>.")
+    assert wrong.startswith("❌ <b>") and wrong.endswith("The answer is <b>5</b>.")
 
 
 def test_explanation_block_is_escaped():

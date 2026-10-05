@@ -1,6 +1,7 @@
 """Command and callback handlers."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from datetime import datetime
@@ -11,10 +12,11 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from . import db, jobs, llm
+from . import commands, db, jobs, llm, resources
 from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVEL_EMOJI, LEVELS, TZ
 from .sender import (ack, card_header, deliver_verdict, drop_buttons, edit_in_place,
-                     remaining_buttons, safe_send, send_question_for_level)
+                     remaining_buttons, safe_send, send_note,
+                     send_question_for_level)
 from .text import (EXPLANATION_HEADING, TELEGRAM_LIMIT, esc, explanation_block, mask,
                    parse_options, render, verdict)
 
@@ -28,15 +30,35 @@ _recent_explain: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 
 MODES = ("practice", "weekly")
 
+FEATURES = (
+    "WHAT THIS BOT DOES\n"
+    "1. Practice: adaptive single-best-answer questions, weighted to the topics\n"
+    "   you are weakest at. Every answer comes with a written explanation.\n"
+    "2. Compete: a two-week tournament, a question every Monday, and a top-3\n"
+    "   leaderboard.\n"
+    "3. What is inside:\n"
+    "   3a. Quiz: a 120-question Pre-Clinical bank across 6 topics, with Clinical\n"
+    "       and Post-MBBS banks on the way.\n"
+    "   3b. Notes: overview sheets, one per topic, plus focused sheets you can\n"
+    "       pull up whenever you like."
+)
+
 HELP = (
     "📝 /practice for a question\n"
-    "📚 /level to switch level\n"
+    "📚 /resources for the revision sheets\n"
+    "🎓 /changestreams to switch level\n"
     "📅 /subscribe for a question every Monday\n"
-    "🗒 /notes for cheat sheets\n"
+    "🗒 /notes for sheets by topic\n"
     "🏆 /tournament to join the tournament\n"
     "🥇 /leaderboard to see who's leading\n\n"
-    "/unsubscribe stops the Monday question. /notes_sub sends you the high-yield "
-    "cheat sheets every two weeks (/notes_unsub to stop)."
+    "/unsubscribe stops the Monday question. /notes_sub sends you the overview "
+    "sheets every two weeks (/notes_unsub to stop)."
+)
+
+RESOURCES_INTRO = (
+    "📚 Revision sheets\n"
+    "Overview sheets cover a whole topic; focused sheets go deep on one point.\n"
+    "Pick one and it arrives here as a PDF."
 )
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -61,6 +83,31 @@ def _pts(n: int) -> str:
     return f"{n} pt" if n == 1 else f"{n} pts"
 
 
+def _resources_home_kb() -> InlineKeyboardMarkup:
+    rows = []
+    if resources.TIER_A:
+        rows.append([InlineKeyboardButton(
+            text=f"📘 Overview sheets: all {len(resources.TIER_A)} topics",
+            callback_data="res:tier:a")])
+    if resources.TIER_B:
+        rows.append([InlineKeyboardButton(
+            text=f"📄 Focused sheets: {len(resources.TIER_B)} deep-dives",
+            callback_data="res:tier:b")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _resources_tier_kb(tier: str) -> InlineKeyboardMarkup:
+    notes = resources.tier(tier)
+    buttons = [
+        InlineKeyboardButton(text=note.label,
+                             callback_data=f"res:get:{note.tier}:{note.code}")
+        for note in notes
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="res:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _local(when: datetime | None) -> str:
     """Render a timestamptz in the society's timezone rather than the DB server's."""
     if when is None:
@@ -72,31 +119,35 @@ def _local(when: datetime | None) -> str:
 
 
 @router.message(Command("start", "help"))
-async def start(m: Message):
+async def start(m: Message, bot: Bot):
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = await db.get_level(uid)
     name = getattr(m.from_user, "first_name", None)
     hello = f"👋 <b>Hi {esc(name)}!</b>" if name else "👋 <b>Hi!</b>"
+    # Give this chat its full menu. Telegram keeps the command list per chat, so
+    # this is also what refreshes a client still showing only /start.
+    await commands.sync_chat(bot, m.chat.id, is_admin=uid in ADMIN_IDS)
     await m.answer(
-        f"{hello} This is the LKC OphSoc revision bot.\n\n"
-        "Practise ophthalmology MCQs at your level. The more you answer, the more "
-        "it focuses on the topics you find tricky.\n\n"
+        f"{hello}\n\n"
+        f"{FEATURES}\n\n"
         f"{HELP}\n\n"
-        "<b>Pick your level below</b> 👇 You can change it any time.\n\n"
+        f"Your level: {LEVEL_EMOJI[_level(level)]} <b>{LEVELS[_level(level)]}</b>\n"
+        "<b>Pick your level below</b> 👇 or send /changestreams. Your questions "
+        "and sheets both follow it.\n\n"
         f"<i>{esc(CREDIT)}\n{esc(DISCLAIMER)}</i>",
         parse_mode="HTML",
         reply_markup=_level_kb(level),
     )
 
 
-@router.message(Command("level"))
+@router.message(Command("changestreams", "level"))
 async def level_cmd(m: Message):
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     current = await db.get_level(uid)
     await m.answer(
-        "📚 Pick your level. Your questions and cheat sheets follow it.",
+        "📚 Pick your level. Your questions and sheets both follow it.",
         reply_markup=_level_kb(current),
     )
 
@@ -302,32 +353,107 @@ async def unsubscribe(m: Message):
     await m.answer("Done, no more Monday questions. /subscribe if you change your mind.")
 
 
+def _find_note(text: str) -> resources.Note | None:
+    """A sheet by code ('b14'), or by any distinctive part of its topic name."""
+    note = resources.find(text)
+    if note is not None:
+        return note
+    needle = text.strip().lower()
+    if not needle:
+        return None
+    for candidate in resources.ALL:
+        if needle in candidate.topic.lower():
+            return candidate
+    return None
+
+
+@router.message(Command("resources"))
+async def resources_cmd(m: Message, command: CommandObject, bot: Bot):
+    """The revision sheets. Sends the actual PDF, not a description of it."""
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    if command.args:
+        note = _find_note(command.args)
+        if note is None:
+            return await m.answer("No sheet matches that. Send /resources to browse.")
+        return await send_note(bot, uid, note)
+    await m.answer(RESOURCES_INTRO, reply_markup=_resources_home_kb())
+
+
+@router.callback_query(F.data.startswith("res:"))
+async def resources_cb(c: CallbackQuery, bot: Bot):
+    """Browse the sheets: home -> one kind -> one PDF."""
+    answered = False
+    try:
+        parts = (c.data or "").split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        message = getattr(c, "message", None)
+
+        if action == "home":
+            await ack(c)
+            if message is not None:
+                with contextlib.suppress(Exception):
+                    await message.edit_text(RESOURCES_INTRO,
+                                            reply_markup=_resources_home_kb())
+        elif action == "tier":
+            await ack(c)
+            tier_code = parts[2] if len(parts) > 2 else "a"
+            if message is not None:
+                with contextlib.suppress(Exception):
+                    await message.edit_text(
+                        f"{resources.TIERS.get(tier_code, 'Notes')} sheets, pick one:",
+                        reply_markup=_resources_tier_kb(tier_code))
+        elif action == "get" and len(parts) > 3:
+            note = resources.get(parts[2], parts[3])
+            if note is None:
+                await ack(c, "That sheet has moved. Try /resources again.", True)
+            else:
+                await ack(c)
+                await send_note(bot, c.from_user.id, note)
+        else:
+            await ack(c, "Unknown option.", True)
+        answered = True
+    except Exception:
+        log.exception("resources callback failed")
+    finally:
+        if not answered:
+            await ack(c)
+
+
 @router.message(Command("notes"))
 async def notes(m: Message, command: CommandObject, bot: Bot):
+    """Sheets by topic: the database if it has any, otherwise the PDFs.
+
+    The notes table is empty today — the society's sheets live in resources/notes
+    as PDFs — so this must not dead-end on "nothing up yet".
+    """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = _level(await db.get_level(uid))
 
-    if not command.args:
-        topics = await db.note_topics(level, "B")
-        if not topics:
-            return await m.answer(
-                f"🗒 No {LEVELS[level]} cheat sheets up yet, they're on the way.\n\n"
-                "Want the high-yield ones sent to you every two weeks? /notes_sub"
-            )
+    if command.args:
+        wanted = command.args.strip()
+        rows = await db.get_notes(wanted, level, "B")
+        if rows:
+            for row in rows:
+                # safe_send splits anything over Telegram's 4096-char limit instead
+                # of slicing the tail off.
+                await safe_send(bot, uid, f"📝 {row['title']}\n\n{row['body']}")
+            return
+        note = _find_note(wanted)
+        if note is not None:
+            return await send_note(bot, uid, note)
+        return await m.answer("Couldn't find that topic. Send /resources to browse.")
+
+    topics = await db.note_topics(level, "B")
+    if topics:
         listing = "\n".join(f"• {t}" for t in topics)
         return await m.answer(
-            f"🗒 Cheat sheets for {LEVELS[level]}:\n{listing}\n\n"
+            f"🗒 Sheets for {LEVELS[level]}:\n{listing}\n\n"
             f"Send /notes with a topic name, like:\n/notes {topics[0]}"
         )
 
-    rows = await db.get_notes(command.args.strip(), level, "B")
-    if not rows:
-        return await m.answer("Couldn't find that topic. Send /notes to see the list.")
-    for row in rows:
-        # safe_send splits anything over Telegram's 4096-char limit instead of
-        # slicing the tail off.
-        await safe_send(bot, uid, f"📝 {row['title']}\n\n{row['body']}")
+    return await m.answer(RESOURCES_INTRO, reply_markup=_resources_home_kb())
 
 
 @router.message(Command("notes_sub"))

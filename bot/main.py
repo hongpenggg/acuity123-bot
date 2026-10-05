@@ -7,27 +7,13 @@ import logging
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand, CallbackQuery, ErrorEvent
+from aiogram.types import CallbackQuery, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from . import db, handlers, jobs
-from .config import BOT_TOKEN, DATABASE_URL, TZ
+from . import commands, db, handlers, jobs
+from .config import ADMIN_IDS, BOT_TOKEN, DATABASE_URL, TZ
 
 log = logging.getLogger(__name__)
-
-COMMANDS = [
-    BotCommand(command="practice", description="Adaptive practice question"),
-    BotCommand(command="level", description="Pre-Clinical / Clinical / Post-MBBS"),
-    BotCommand(command="subscribe", description="Weekly question"),
-    BotCommand(command="unsubscribe", description="Stop the weekly question"),
-    BotCommand(command="tournament", description="Join or leave the tournament"),
-    BotCommand(command="leaderboard", description="Top 3 and your rank"),
-    BotCommand(command="notes", description="Cheat sheets by topic"),
-    BotCommand(command="notes_sub", description="Fortnightly Tier A notes"),
-    BotCommand(command="notes_unsub", description="Stop the fortnightly notes"),
-    BotCommand(command="help", description="What this bot can do"),
-]
-
 
 async def on_error(event: ErrorEvent) -> None:
     """Last line of defence: log, and never leave a user's client spinning."""
@@ -56,7 +42,10 @@ async def main() -> None:
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_my_commands(COMMANDS)
+        # Minimal until someone starts the bot; /start then gives their chat the
+        # full menu (see bot/commands.py).
+        await commands.sync_default(bot)
+        await commands.sync_admins(bot, ADMIN_IDS)
         scheduler.start()
         log.info("polling started (tz=%s)", TZ)
         await dp.start_polling(

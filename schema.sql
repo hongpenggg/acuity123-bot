@@ -54,8 +54,8 @@ create table attempts (
   created_at   timestamptz not null default now(),
   unique (user_id, msg_id)
 );
--- Serves both the per-topic weakness aggregate and the "have they seen this
--- question" check in pick_question.
+-- Serves both the per-topic weakness aggregate and the "has this user already
+-- answered this question correctly" filter in pick_question.
 create index attempts_user_level_topic_idx  on attempts (user_id, level, topic);
 create index attempts_user_question_idx     on attempts (user_id, question_id);
 
