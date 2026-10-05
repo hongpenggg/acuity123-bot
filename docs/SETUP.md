@@ -52,6 +52,21 @@ Have these ready:
 
 ## Phase 1 — The VPS
 
+> **Shortcut.** `deploy/provision.sh` in this repo does all of Phase 1 and most of
+> Phase 2 unattended: swap, updates, timezone, the `deploy` user, SSH hardening
+> (validated with `sshd -t` before it restarts the daemon), ufw, Fail2ban,
+> PostgreSQL tuned for the RAM it finds, the repo in a virtualenv, and the systemd
+> unit enabled but not started. It is idempotent, so re-running it is the correct
+> response to a failure part-way through.
+>
+> ```bash
+> ssh root@YOUR.IP 'bash -s' < deploy/provision.sh
+> ```
+>
+> Then go to Phase 2.4 (the `.env` and the database load) — the script stops
+> before starting the service precisely so the bot never crash-loops on a missing
+> token. The manual steps below are what it does, and are worth reading once.
+
 ### 1.1 Order it
 
 1. Contabo → **Cloud VPS 10** (4 vCPU / 8 GB RAM / 75 GB NVMe). Around
@@ -769,3 +784,60 @@ Everything above still works; only Phase 2 changes.
 - **RLS.** The schema enables row-level security with no policies, so an API key
   can't read your tables. The bot is unaffected because it connects as the
   database owner, which bypasses RLS.
+
+---
+
+## Appendix — DigitalOcean instead of Contabo
+
+Phase 1 differs slightly; everything from Phase 2 onwards is identical.
+
+**At droplet creation**
+
+| Field | Value |
+|---|---|
+| Image | Ubuntu 24.04 LTS |
+| Region | Singapore (SGP1) |
+| Size | See the warning below |
+| Authentication | **SSH Key** — add your public key (see below) |
+| Advanced | Enable monitoring; optionally paste an initialisation script |
+
+**Which size.** The **$4/mo tier is 512 MB RAM**, and that is genuinely tight for
+Postgres *plus* a Python process *plus* the OS. It runs, but you want **1 GB
+($6/mo)** for comfort. `deploy/provision.sh` creates a 1 GB swapfile first thing,
+which is what makes the 512 MB tier survivable at all — without swap the OOM
+killer will take Postgres or the bot under load, and it will look like random
+crashes rather than a memory problem. If you already built the small droplet, you
+can resize CPU/RAM from *Resize → CPU and RAM only* (a reboot; disk size is the
+one-way part). Do it before the event, not during.
+
+**SSH keys.** Generate a pair, then paste the contents of the **`.pub`** file —
+one line starting `ssh-ed25519`, never the private key and never the file path:
+
+```bash
+ssh-keygen -t ed25519 -C "your-name-phone"      # in Termux: pkg install openssh first
+cat ~/.ssh/id_ed25519.pub                       # this is what DigitalOcean wants
+```
+
+Keys are applied **at creation**. Adding one to an existing droplet means editing
+`~/.ssh/authorized_keys` by hand, so get it right in the create form. You can add
+several keys — worth doing so you are not dependent on a single device.
+
+**Recovery console.** *Droplet → Access → Launch Droplet Console* gets you a root
+shell even when SSH is broken. That is your escape hatch from a bad
+`sshd_config`, and it is why the Contabo runbook's "keep your session open" dance
+matters less here. Use it if you ever lock yourself out.
+
+**Cloud firewall.** DigitalOcean firewalls are applied outside the droplet, so
+they survive you breaking `ufw`. Create one allowing inbound **22/tcp only**
+(and 80/443 if you ever add a webhook), apply it to the droplet, then let `ufw`
+do the same job inside. The bot only ever makes outbound connections.
+
+**Then run the provisioning script** and continue from Phase 2.4:
+
+```bash
+ssh root@YOUR.DROPLET.IP 'bash -s' < deploy/provision.sh
+```
+
+Two Contabo-specific steps you can skip: there is no emailed root password (your
+key works immediately), and there is no one-off setup fee.
+
