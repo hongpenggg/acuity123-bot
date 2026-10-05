@@ -69,9 +69,14 @@ fi
 # --------------------------------------------------------------- 2. packages
 log "Updating the OS and installing packages"
 export DEBIAN_FRONTEND=noninteractive
+# needrestart prompts interactively on Ubuntu 24.04 even with a noninteractive
+# frontend, and dpkg prompts about modified config files (cloud-init touches
+# sshd). Both would hang an unattended run, so answer them up front.
+export NEEDRESTART_MODE=a
+APT_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 apt-get update -qq
-apt-get upgrade -y -qq
-apt-get install -y -qq git python3-venv python3-pip fail2ban ufw \
+apt-get "${APT_OPTS[@]}" upgrade -y -qq
+apt-get install -y -qq "${APT_OPTS[@]}" git python3-venv python3-pip fail2ban ufw \
     unattended-upgrades curl ca-certificates >/dev/null
 ok "packages installed"
 
@@ -145,7 +150,7 @@ ok "unattended-upgrades configured"
 
 # --------------------------------------------------------------- 7. postgres
 log "Installing PostgreSQL"
-apt-get install -y -qq postgresql postgresql-contrib >/dev/null
+apt-get install -y -qq "${APT_OPTS[@]}" postgresql postgresql-contrib >/dev/null
 systemctl enable --now postgresql >/dev/null 2>&1 || true
 ok "postgresql $(systemctl is-active postgresql || true)"
 

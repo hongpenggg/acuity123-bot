@@ -11,6 +11,12 @@ Wants=network-online.target postgresql.service
 User=deploy
 WorkingDirectory=/opt/studybot
 EnvironmentFile=/opt/studybot/.env
+# Give the process a usable home. asyncpg (like anything using libpq) probes
+# ~/.postgresql/postgresql.key on every connect, and with ProtectHome=true that
+# stat raises EACCES instead of returning "not found", which asyncpg does not
+# catch - the bot crash-loops on startup. /opt/studybot is already writable via
+# ReadWritePaths, so a library that wants a cache dir has somewhere to put it.
+Environment=HOME=/opt/studybot
 ExecStart=/opt/studybot/.venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
@@ -19,7 +25,8 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+# ProtectHome is deliberately NOT set: see the HOME= note above. It is the one
+# hardening option that breaks this stack.
 ReadWritePaths=/opt/studybot
 ProtectKernelTunables=true
 ProtectControlGroups=true
