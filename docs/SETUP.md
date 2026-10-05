@@ -732,7 +732,10 @@ uncapped key is the classic way to wake up to a bill.
 | Everyone got the weekly question twice | Two bot instances, or the job ran twice after a manual `/admin_weekly_now` |
 | `relation "questions" does not exist` | `schema.sql` was never applied, or `DATABASE_URL` points at a different database |
 | Wrong date shown for tournament end | Server timezone. `timedatectl` should say Asia/Singapore |
-| Locked out of SSH | Contabo's VNC console in the control panel, then re-check `sshd_config` |
+| Bot crash-loops on startup: `PermissionError: [Errno 13] ... '/home/deploy/.postgresql/postgresql.key'` | `ProtectHome=true` in the unit. It makes `/home` inaccessible, so asyncpg's probe for its SSL key raises `EACCES` instead of returning "not found" — and asyncpg doesn't catch it. The shipped unit omits `ProtectHome` and sets `Environment=HOME=/opt/studybot` for exactly this reason. **Do not add `ProtectHome` back.** |
+| `systemctl is-active` says `active` but the bot is clearly dead | With `Restart=always`, a crash-looping unit reports `active` between restarts. Check `systemctl show -p NRestarts --value studybot` — a climbing number means it is dying and restarting. Use `journalctl -u studybot -p err`. |
+| `TelegramConflictError: terminated by other getUpdates request` | Two pollers on one token. Something else called `getUpdates` — a second instance, or a manual `curl` to the API from a terminal (which steals the bot's poll slot; aiogram recovers on its own within ~10s). |
+| Locked out of SSH | Contabo's VNC console in the control panel, or DigitalOcean's *Access → Launch Droplet Console*, then re-check `sshd_config` |
 
 ### 5.7 Event-day checklist
 
