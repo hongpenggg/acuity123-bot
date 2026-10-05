@@ -99,17 +99,19 @@ async def send_question(bot: Bot, uid: int, question, mode: str,
 
 
 async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> bool:
-    """The next question in this student's current set of five.
+    """The next question for this student, chosen for them.
 
-    Sets are fixed blocks of five in id order, so ``set 1`` is the same five
-    questions for every student: the scores are comparable, which is the point of
-    a benchmark. Because the block is fixed, a question is never repeated within a
-    run either. A student who stops halfway through a set resumes it.
+    A set is a rolling block of five answers; which question fills the next slot
+    is `db.pick_question`'s decision. It spreads topics across the set and leans
+    toward the topics this student keeps getting wrong, so a set is varied, two
+    students do not walk an identical path, and weak material comes back round.
+    Questions already attempted are never re-served here, which is what `/review`
+    is for.
 
     Three states deserve a sentence rather than silence: their level has no bank
-    yet, they have finished every set, or there is a question to answer.
+    yet, they have answered everything, or there is a question to serve.
     """
-    fresh, total = await db.progress(uid, level)
+    _, total = await db.progress(uid, level)
     if total == 0:
         available = await db.levels_with_questions()
         if not available:
@@ -121,27 +123,28 @@ async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> 
             f"For now you can practise {names}. Switch with /changestreams.",
         )
 
-    current = await db.quiz_set(uid, level)
+    current = await db.current_set(uid, level)
     if current is None:
         return await safe_send(
             bot, uid,
             f"🏁 You have answered every one of the {total} "
-            f"{LEVELS.get(level, level)} questions. Send /stats for your breakdown, "
-            "/resources for the sheets, or /changestreams to switch level.",
+            f"{LEVELS.get(level, level)} questions. /review the ones you missed, "
+            "/stats for your breakdown, or /changestreams to switch level.",
         )
 
-    remaining = current["remaining"]
-    if not remaining:
-        # Unreachable: a set with nothing remaining counts as complete, and
-        # quiz_set moves on. Guarded so an odd row cannot crash the handler.
-        log.error("set %s for %s has no remaining questions", current["set_no"], uid)
-        return await safe_send(bot, uid,
-                               "I could not find your next question. Try /quizme again.")
+    question = await db.pick_question(uid, level)
+    if question is None:
+        # current_set said there is room in the set, so there should be a question
+        # to fill it. Guarded rather than trusted: the two read the same tables but
+        # not in the same transaction.
+        log.error("no question available for %s at %s despite an open set", uid, level)
+        return await safe_send(
+            bot, uid, "I could not find your next question. Try /quizme again.")
 
-    position = current["answered"] + 1
+    position = current["answered_in_set"] + 1
     lead = (f"📋 <b>Set {current['number']} of {current['total_sets']}</b> · "
             f"question {position} of {current['size']}")
-    return await send_question(bot, uid, remaining[0], mode, lead=lead)
+    return await send_question(bot, uid, question, mode, lead=lead)
 
 
 async def send_note(bot: Bot, uid: int, note) -> bool:

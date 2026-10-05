@@ -39,14 +39,17 @@ LEVEL_EMOJI: dict[str, str] = {
     "postmbbs": "🎓",
 }
 
-# Split so the society can edit either line without touching the other.
-ACUITY_CREDIT = "Built by the Acuity Team: Zhong Han, Hongpeng, Rahul, Jeromy"
-SOCIETY_CREDIT = "for the LKC Ophthalmology Society (@lkceye)"
+# Split so the society can edit either line without touching the other. The
+# welcome renders CREDIT and DISCLAIMER as one italic block, with the society
+# line and the disclaimer joined on the last line.
+ACUITY_CREDIT = ("By the Acuity Team: Zhong Han (Vice-Pres, LKC OphSoc 26/27), "
+                 "Hongpeng, Rahul, Jeromy")
+SOCIETY_CREDIT = "For LKC OphSoc (@lkceye)."
 
 CREDIT = (
-    "👁 Acuity, the LKC OphSoc revision bot\n"
+    "👁 LKC OphSoc Bot\n"
     f"{ACUITY_CREDIT}\n"
     f"{SOCIETY_CREDIT}"
 )
 
-DISCLAIMER = "For revision only, not clinical advice."
+DISCLAIMER = "Revision only, not clinical advice."

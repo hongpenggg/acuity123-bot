@@ -55,7 +55,9 @@ create table attempts (
   unique (user_id, msg_id)
 );
 -- Serves both the per-topic weakness aggregate and the "has this user already
--- answered this question correctly" filter in pick_question.
+-- attempted this question" filter in pick_question. Note the filter is on any
+-- attempt, not only a correct one: a set is five questions the student has not
+-- seen, and a miss comes back as weight on its topic rather than as a repeat.
 create index attempts_user_level_topic_idx  on attempts (user_id, level, topic);
 create index attempts_user_question_idx     on attempts (user_id, question_id);
 
@@ -107,6 +109,29 @@ create table notes (
 -- cannot serve.
 create index notes_lookup_idx on notes (level, tier, lower(topic));
 
+-- ------------------------------------------------------ note_deliveries
+-- Which revision sheets a student has already been sent. The sheets are PDFs on
+-- disk (bot/resources.py scans resources/notes), so only the short code is
+-- stored here, and a code is unique only *within* a level — B01 exists at all
+-- three — which is why the key carries the level as well as the tier.
+--
+-- `tier` is lowercase 'a'/'b' to match the resources module and the folder
+-- names (tier_a/tier_b). The older `notes` table above spells the same idea
+-- 'A'/'B'; the two are not joined to each other, so the mismatch is harmless,
+-- but do not copy a tier from one into the other without folding the case.
+--
+-- The primary key doubles as the lookup index: (user_id, level) and
+-- (user_id, level, tier) are both prefixes of it, which is every read db.py
+-- makes, so there is no second index to maintain.
+create table note_deliveries (
+  user_id  bigint      not null references users (telegram_id) on delete cascade,
+  level    text        not null,
+  tier     text        not null check (tier in ('a', 'b')),
+  code     text        not null,
+  sent_at  timestamptz not null default now(),
+  primary key (user_id, level, tier, code)
+);
+
 -- --------------------------------------------------------------- lockdown
 -- Supabase publishes every table over its REST API. The bot connects as the
 -- `postgres` role over the pooler and bypasses RLS; enabling RLS with no policies
@@ -118,6 +143,7 @@ alter table tournaments       enable row level security;
 alter table tournament_points enable row level security;
 alter table tournament_answers enable row level security;
 alter table notes             enable row level security;
+alter table note_deliveries   enable row level security;
 
 commit;
 

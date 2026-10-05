@@ -429,8 +429,16 @@ Then send `/quizme` in Telegram to confirm end to end.
 ### 4.1 The credit block
 
 Shown on `/start` and `/help`. Edit `CREDIT` in `bot/config.py`, push, and pull
-on the server. Today it reads "LKC Ophthalmology Society / Made by Zhong Han … /
-and the Acuity Team". The disclaimer line is `DISCLAIMER` in the same file.
+on the server. Today it reads:
+
+```
+👁 LKC OphSoc Bot
+By the Acuity Team: Zhong Han (Vice-Pres, LKC OphSoc 26/27), Hongpeng, Rahul, Jeromy
+For LKC OphSoc (@lkceye). Revision only, not clinical advice.
+```
+
+The first line is literal in `CREDIT`, the second is `ACUITY_CREDIT`, and the
+third is `SOCIETY_CREDIT` followed by `DISCLAIMER` on the same line.
 
 Adding or changing text here needs a redeploy (Phase 5.1).
 
@@ -507,58 +515,66 @@ psql "$DATABASE_URL" -f seeds/01_preclin_mcqs.sql
 
 ### 4.4 Notes
 
-Notes are **not** seeded yet — the 20 PDFs in `resources/` are lecture material,
-not the cheat-sheet format. `/notes` will say "No Tier B notes for Pre-Clinical
-yet" until you load some.
+The sheets are **153 PDFs in the repo**, not database rows, and they are per
+level. Nothing needs seeding:
 
-Two kinds, per the plan:
+```
+resources/notes/preclin/tier_a/    6     tier_b/   20      01-06   / B01-B20
+resources/notes/clin/tier_a/       7     tier_b/   40      C01-C07 / B01-B40
+resources/notes/postmbbs/tier_a/  15     tier_b/   65      A01-A15 / B01-B65
+```
 
-| Kind | Meaning | Delivered |
+Two kinds. Students are never shown "Tier A/B" - they see what the sheet is:
+
+| Kind | Meaning | How a student gets it |
 |---|---|---|
-| **Overview** | One broad sheet per topic (`01`–`06`) | `/topicalnotes` on demand, and all six in the monthly drop |
-| **Focused** | Deeper on a single point (`B01`–`B20`) | `/randomnotes` on demand; six are reserved for the monthly drop |
+| **Overview** | One broad sheet per topic | `/notes` serves these first, one at a time; `/resources` browses them |
+| **Focused** | Deeper on a single point | `/notes` moves on to these once the overview sheets are done; the fortnightly drop works through them |
 
-Both are per-level. Add them like this:
+`/notes` is a **progression**, not a picker. It hands over the next sheet the
+student has not had, overview sheets first, then focused ones, then tells them
+they have finished the syllabus for their level. Deliveries are recorded in
+`note_deliveries`, so nothing is ever sent twice and a student can stop and
+resume. `/resources` is the browser for anyone who wants to jump straight to a
+sheet - it takes a code or a phrase (`/resources b14`, `/resources glaucoma`).
 
-```bash
-psql "$DATABASE_URL" <<'SQL'
-insert into notes (level, topic, tier, title, body) values
-  ('preclin', 'Orbit and eye movements', 'B',
-   'Cranial nerve palsies at a glance',
-   'CN III: ptosis, "down and out", mydriasis.
-CN IV: vertical diplopia, worse on downgaze and head tilt.
-CN VI: failure to abduct.'),
-  ('preclin', 'Development and ocular histology', 'A',
-   'Optic fissure closure',
-   'The fissure closes in week 7. Failure gives coloboma, typically inferior.');
-SQL
-```
+Adding a sheet is: drop the PDF in the right level folder named
+`CODE_Topic_With_Underscores.pdf`, commit, `git pull` on the server. The
+catalogue is built by scanning the directory, so there is no code change and no
+database row. A misnamed file fails CI rather than disappearing quietly.
 
-Long bodies are split automatically across Telegram messages, so a whole cheat
-sheet can be one row. To check what a level has:
-
-```bash
-psql "$DATABASE_URL" -c "select level, tier, topic, count(*) from notes group by 1,2,3 order by 1,2,3;"
-```
+> The `notes` table in `schema.sql` is a leftover from an earlier design where
+> sheets were database text, and nothing has ever written to it. It is the
+> natural home if the catalogue ever moves out of the repo - see
+> [HANDOVER.md §11](HANDOVER.md#11-the-content-pipeline-needs-to-stop-being-the-git-repo).
 
 ### 4.5 Sets of five
 
-Progress is measured in sets of five. The sets are **consecutive blocks of five
-questions in id order** (`db.SET_SIZE`), so set 1 is the same five questions for
-every student and the scores are comparable. Nothing about the sets is stored:
-`db.set_board` derives how far a student has got from the `attempts` table, which
-is why there is no session state to go stale and why a student who stops halfway
-through a set resumes it.
+Progress is measured in sets of five, where a set is simply a **rolling block of
+five answers** (`db.SET_SIZE`) rather than five fixed question ids. Nothing about
+a set is stored: it is derived from the `attempts` table, which is why there is no
+session state to go stale and why a student who stops halfway through resumes
+where they were.
 
-The numbers are all in `bot/db.py`: `set_board`, `quiz_set`, `set_no_for`,
-`set_score` (progress and scoring) and `stats` (marker A, the per-topic and
+Which five a student gets is `db.pick_question`'s decision, in one SQL statement.
+It ranks every question they have not attempted by, in order: a topic not already
+in the current partial set, then a question type not already in it, then the
+topics where their accuracy is worst, then random. An untouched topic scores
+exactly mid-way between weak and mastered, so new material still comes round.
+Two students therefore never walk the same path, and the scores are no longer
+directly comparable between students - that trade was made deliberately, in
+exchange for variety and for weak topics coming back.
+
+The numbers are all in `bot/db.py`: `answered_count`, `level_total`,
+`current_set`, `last_set_score` (progress and scoring), `wrong_questions` and
+`wrong_count` (the `/review` pile) and `stats` (marker A, the per-topic and
 per-question-type breakdown behind `/stats`).
 
 **Changing the set size** is one constant (`db.SET_SIZE`). It takes effect on the
 next answer: existing attempts simply fall into the new blocks, so nobody's
 progress is lost.
 
-### 4.6 Weekly quiz and monthly sheets
+### 4.6 Weekly quiz and fortnightly sheets
 
 `weekly_quiz` fires **Mondays 09:00** (server timezone, Asia/Singapore from Phase
 1.3) and sends each subscriber the rest of their current set, so a student who
@@ -571,8 +587,9 @@ plus the six reserved focused ones, as PDFs.
 
 Both can be fired on demand with `/admin_weekly_now` and `/admin_notes_now`.
 
-`/weeklyquiz` and `/stopweekly` control the Monday set; `/monthlynotes` and
-`/stopmonthly` control the sheets. To test without waiting for the schedule:
+`/weeklyquiz` controls the Monday set and `/subscribenotes` the sheets; both
+confirmations carry an inline Turn off button, and `/stopweekly` / `/stopmonthly`
+still work. To test without waiting for the schedule:
 
 ```
 /admin_weekly_now
@@ -582,15 +599,20 @@ Job settings live in `jobs.register`: `misfire_grace_time=3600` — APScheduler'
 1-second default would silently skip the push if the process happened to be
 restarting at 09:00.
 
-### 4.7 Monthly sheets
+### 4.7 Fortnightly sheets
 
-Fires on the **1st at 10:00**. Sends all six overview sheets plus the six focused
-sheets reserved for the drop (`resources.MONTHLY_CODES`), as PDFs.
-`/monthlynotes` and `/stopmonthly` control it; `/admin_notes_now` fires it on
-demand.
+Fires on the **1st and 15th at 10:00**. Each subscriber gets the next batch of
+focused sheets for their own level that they have not been sent yet, as PDFs, so
+the drop works through the catalogue instead of resending the same bundle.
+`/subscribenotes` turns it on and off; `/admin_notes_now` fires it on demand.
 
-`/randomnotes` deliberately draws from the *other* fourteen focused sheets, so a
-student cannot be handed the monthly bundle at random before it goes out.
+Two days a month is how "fortnightly" is implemented, deliberately: a cron month
+rollover is exact, whereas the ISO-week parity trick an earlier version used
+drifted at the turn of a year.
+
+Because deliveries are recorded per student, a subscriber who has already read a
+sheet through `/notes` will not be sent it again, and one who has had everything
+is told they have finished rather than being sent a repeat.
 
 ### 4.8 The tournament
 
@@ -660,8 +682,8 @@ Only IDs in `ADMIN_IDS` can run these; anyone else is ignored (and logged).
 |---|---|
 | `/admin_tournament_start` | Starts a 2-week tournament |
 | `/admin_tournament_end` | Announces winners and closes it early |
-| `/admin_weekly_now` | Sends this week's question immediately |
-| `/admin_notes_now` | Sends the Tier A notes immediately |
+| `/admin_weekly_now` | Sends this week's question set immediately |
+| `/admin_notes_now` | Fires the fortnightly sheet drop immediately |
 
 ### 4.11 Message content
 

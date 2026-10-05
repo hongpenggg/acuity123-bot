@@ -8,13 +8,24 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import db, resources
-from .config import ADMIN_IDS, DEFAULT_LEVEL, TZ
+from .config import ADMIN_IDS, DEFAULT_LEVEL, LEVELS, TZ
 from .sender import safe_send, send_note, send_question
+from .text import sheets_done
 
 log = logging.getLogger(__name__)
 
 FANOUT_PAUSE = 0.05  # seconds between sends, comfortably under Telegram's ~30/s
 TOURNAMENT_DAYS = 14
+
+# How many sheets one fortnightly drop hands over. The catalogue is 26 sheets at
+# preclinical and 80 at post-MBBS, so sending the lot in one burst would be a
+# wall of PDFs; six is the size of the bundle the old monthly drop sent, and at
+# this cadence it walks even the largest level inside a year. One constant, so
+# changing the pace is a one-line edit.
+SHEETS_PER_DROP = 6
+
+# How many questions the Monday push sends. One set's worth.
+SET_PER_PUSH = 5
 
 
 async def weekly_quiz(bot) -> int:
@@ -31,18 +42,22 @@ async def weekly_quiz(bot) -> int:
     sent = 0
     for uid in subscribers:
         level = await db.get_level(uid) or DEFAULT_LEVEL
-        current = await db.quiz_set(uid, level)
-        if current is None or not current["remaining"]:
-            continue
-        count = len(current["remaining"])
+        current = await db.current_set(uid, level)
+        if current is None:
+            continue          # finished this level, nothing left to push
         await safe_send(
             bot, uid,
-            f"📅 Your Monday quiz, set {current['number']} of "
-            f"{current['total_sets']}: {count} question"
-            f"{'s' if count != 1 else ''} to go.",
+            f"\U0001f4c5 Your Monday quiz: set {current['number']} of "
+            f"{current['total_sets']}, {SET_PER_PUSH} questions.",
         )
         await asyncio.sleep(FANOUT_PAUSE)
-        for question in current["remaining"]:
+        # Picked one at a time rather than as a batch: pick_question reads this
+        # student's history, so answering question 1 should influence what
+        # question 2 is, exactly as it does in /quizme.
+        for _ in range(SET_PER_PUSH):
+            question = await db.pick_question(uid, level)
+            if question is None:
+                break
             if await send_question(bot, uid, question, "weekly"):
                 sent += 1
             await asyncio.sleep(FANOUT_PAUSE)
@@ -50,32 +65,57 @@ async def weekly_quiz(bot) -> int:
     return sent
 
 
-async def monthly_notes(bot) -> int:
-    """The monthly drop: every overview sheet plus the reserved focused ones.
+async def fortnightly_notes(bot) -> int:
+    """The fortnightly sheet drop: the next few sheets this student has not had.
 
-    Sent as the PDFs themselves. The six focused sheets here are exactly the ones
-    `/randomnotes` withholds, so the bundle is not made up of sheets students have
-    already been handed at random.
+    Walks the student's own level, overview sheets first and then focused ones -
+    the same order `/notes` uses, and sharing the same `note_deliveries` history,
+    so a sheet a student already pulled by hand is never pushed at them again.
+
+    A subscriber who has had everything is congratulated **and unsubscribed**,
+    because the alternative is pinging them every fortnight with nothing to send.
+    They can start again with /subscribenotes once there is more content, and
+    /resources still has every sheet.
     """
-    sheets = list(resources.TIER_A) + list(resources.MONTHLY)
-    if not sheets:
-        log.warning("no sheets on disk, skipping the monthly drop")
-        return 0
-
     sent = 0
-    for uid in await db.subscribers("notes_sub"):
+    subscribers = await db.subscribers("notes_sub")
+    for uid in subscribers:
+        level = await db.get_level(uid) or DEFAULT_LEVEL
+        delivered = await db.notes_delivered(uid, level)
+        queue = (resources.unsent(level, "a", delivered["a"])
+                 + resources.unsent(level, "b", delivered["b"]))
+
+        if not queue:
+            await safe_send(bot, uid, sheets_done(LEVELS.get(level, level)),
+                            parse_mode="HTML")
+            await db.set_flag(uid, "notes_sub", False)
+            await asyncio.sleep(FANOUT_PAUSE)
+            continue
+
+        batch = queue[:SHEETS_PER_DROP]
+        left = len(queue) - len(batch)
+        tail = (f" {left} to go after this." if left
+                else " That is the last of them.")
         await safe_send(
             bot, uid,
-            f"📚 Your monthly sheets are here: {len(resources.TIER_A)} overview "
-            f"sheets plus {len(resources.MONTHLY)} focused ones. "
+            f"📬 Your fortnightly cheat sheets: {len(batch)} of them.{tail}\n"
             "Send /stats any time to see how you are doing.",
         )
         await asyncio.sleep(FANOUT_PAUSE)
-        for note in sheets:
+
+        # Recorded only for the sheets that actually went out, so a failed upload
+        # is retried on the next drop instead of being silently skipped forever.
+        landed = []
+        for note in batch:
             if await send_note(bot, uid, note):
+                landed.append((note.tier, note.code))
                 sent += 1
             await asyncio.sleep(FANOUT_PAUSE)
-    log.info("monthly sheets: %s document(s)", sent)
+        if landed:
+            await db.record_notes_sent(uid, level, landed)
+
+    log.info("fortnightly sheets: %s document(s) to %s subscriber(s)",
+             sent, len(subscribers))
     return sent
 
 
@@ -151,7 +191,9 @@ def register(scheduler: AsyncIOScheduler, bot) -> None:
     common = dict(coalesce=True, max_instances=1, misfire_grace_time=3600)
     scheduler.add_job(weekly_quiz, "cron", day_of_week="mon", hour=9,
                       args=[bot], **common)
-    # Monthly on the 1st. A cron month rollover is exact, unlike the ISO-week
-    # parity trick the fortnightly schedule used to use.
-    scheduler.add_job(monthly_notes, "cron", day=1, hour=10, args=[bot], **common)
+    # Fortnightly, as the 1st and the 15th. Two fixed days a month is exact,
+    # unlike the ISO-week parity trick an earlier fortnightly schedule used,
+    # which drifted at the turn of a year.
+    scheduler.add_job(fortnightly_notes, "cron", day="1,15", hour=10,
+                      args=[bot], **common)
     scheduler.add_job(close_tournaments, "cron", minute="*/30", args=[bot], **common)

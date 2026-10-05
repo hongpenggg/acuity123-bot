@@ -38,8 +38,8 @@ async def pool(dsn):
     from bot.db import init, close
 
     admin = await asyncpg.connect(dsn)
-    for table in ("tournament_answers", "tournament_points", "attempts",
-                  "tournaments", "notes", "questions", "users"):
+    for table in ("note_deliveries", "tournament_answers", "tournament_points",
+                  "attempts", "tournaments", "notes", "questions", "users"):
         await admin.execute(f"drop table if exists {table} cascade")
     await admin.execute(SCHEMA)
     await admin.close()
@@ -53,8 +53,8 @@ async def pool(dsn):
 async def clean(pool):
     from bot import db
 
-    for table in ("tournament_answers", "tournament_points", "attempts",
-                  "tournaments", "notes", "questions", "users"):
+    for table in ("note_deliveries", "tournament_answers", "tournament_points",
+                  "attempts", "tournaments", "notes", "questions", "users"):
         await db.pool.execute(f"truncate {table} cascade")
     yield
 
@@ -285,3 +285,104 @@ async def test_save_explanation_is_single_writer(pool):
     await db.save_explanation(qid, "first")
     await db.save_explanation(qid, "second")
     assert (await db.get_question(qid))["explanation"] == "first"
+
+
+# ------------------------------------------------------- note deliveries
+
+
+async def test_recording_the_same_sheet_twice_is_a_no_op(pool):
+    """A student can land on /notes twice before the first reply arrives, and the
+    monthly drop can overlap a manual send, so the insert has to absorb both."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B14")])
+    await db.record_notes_sent(1, "preclin", [("a", "01")])
+    # The same pair twice inside one call, which reads as if it should trip the
+    # key: `on conflict do nothing` absorbs it, and this is the assertion that
+    # says so rather than leaving the next reader to wonder.
+    await db.record_notes_sent(1, "preclin", [("b", "B14"), ("b", "B14")])
+
+    assert await db.sent_note_codes(1, "preclin", "a") == {"01"}
+    assert await db.sent_note_codes(1, "preclin", "b") == {"B14"}
+    assert await db.pool.fetchval("select count(*) from note_deliveries") == 2
+
+
+async def test_recording_nothing_is_allowed(pool):
+    """The monthly drop builds its list from the catalogue, and a level with no
+    reserved sheets yields an empty one."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [])
+    assert await db.notes_delivered(1, "preclin") == {"a": set(), "b": set()}
+
+
+async def test_notes_delivered_returns_both_kinds_in_one_query(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin",
+                               [("a", "01"), ("a", "02"), ("b", "B07")])
+
+    assert await db.notes_delivered(1, "preclin") == {
+        "a": {"01", "02"}, "b": {"B07"}}
+    # Both keys are always present, so a handler can index straight in.
+    assert await db.notes_delivered(1, "clin") == {"a": set(), "b": set()}
+
+
+async def test_deliveries_are_scoped_by_student_level_and_kind(pool):
+    """A code is only unique within a level: B01 exists at all three, so the row
+    the clinical student got must not hide the preclinical sheet."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.upsert_user(2, None)
+    await db.record_notes_sent(1, "preclin", [("b", "B01")])
+    await db.record_notes_sent(1, "clin", [("b", "B01")])
+    await db.record_notes_sent(2, "preclin", [("a", "01")])
+
+    assert await db.sent_note_codes(1, "preclin", "b") == {"B01"}
+    assert await db.sent_note_codes(1, "preclin", "a") == set()
+    assert await db.sent_note_codes(1, "clin", "b") == {"B01"}
+    assert await db.sent_note_codes(2, "preclin", "a") == {"01"}
+    assert await db.sent_note_codes(2, "clin", "b") == set()
+
+
+async def test_reset_notes_clears_one_level_and_counts_what_it_cleared(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B01")])
+    await db.record_notes_sent(1, "clin", [("a", "C01")])
+
+    assert await db.reset_notes(1, "preclin") == 2
+    assert await db.notes_delivered(1, "preclin") == {"a": set(), "b": set()}
+    assert await db.notes_delivered(1, "clin") == {"a": {"C01"}, "b": set()}
+    # Nothing left to clear, and asking again is not an error.
+    assert await db.reset_notes(1, "preclin") == 0
+
+
+async def test_a_deleted_user_takes_their_deliveries_with_them(pool):
+    """PDPA: deleting the user row has to leave nothing behind, which is what the
+    cascade on the foreign key is for."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B01")])
+
+    await db.pool.execute("delete from users where telegram_id = 1")
+    assert await db.pool.fetchval("select count(*) from note_deliveries") == 0
+
+
+async def test_the_tier_check_rejects_anything_but_a_or_b(pool):
+    """The `notes` table spells the same idea 'A'/'B'. Copying a tier across
+    without folding the case has to fail here rather than quietly recording a
+    delivery nothing will ever match."""
+    import asyncpg
+
+    from bot import db
+
+    await db.upsert_user(1, None)
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await db.record_notes_sent(1, "preclin", [("A", "01")])

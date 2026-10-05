@@ -29,7 +29,12 @@ SQL_START = re.compile(
     r"^(select|insert|update|delete|with|alter|create|drop|begin|commit|grant|set)\b",
     re.IGNORECASE,
 )
-# $1 placeholders are only legal inside PREPARE, so swap them for NULL before parsing.
+# $1 placeholders are only legal inside PREPARE, so swap them for NULL before
+# parsing. Only ever applied to the query strings lifted out of db.py: a .sql
+# file has no bind parameters, and substituting there would corrupt any
+# dollar-quoted literal that happens to start with a digit - the clinical bank
+# has an explanation opening "400 mg in 48 kg ...", which $q$400 turns into
+# $qNULL and an unterminated quote.
 PLACEHOLDER = re.compile(r"\$\d+")
 
 
@@ -103,8 +108,10 @@ def main() -> int:
         for i, statement in enumerate(statements_from(path), start=1):
             if not statement.strip():
                 continue
+            sql = (statement if path.suffix == ".sql"
+                   else PLACEHOLDER.sub("NULL", statement))
             try:
-                trees = parse_sql(PLACEHOLDER.sub("NULL", statement))
+                trees = parse_sql(sql)
             except Exception as exc:  # noqa: BLE001
                 failures += 1
                 print(f"FAIL  {path.name} statement {i}: {exc}")

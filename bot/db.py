@@ -199,115 +199,233 @@ async def save_explanation(qid: int, text: str) -> None:
     )
 
 
-#: Quiz sets are consecutive blocks of this many questions, in id order. Because
-#: the blocks are fixed, every student's set 1 is the same five questions: the
-#: scores are comparable, which is the point of a benchmark set.
+#: A set is a rolling block of this many answers. There is no stored membership:
+#: a set is simply the student's Nth group of five answers at a level. That is
+#: what lets `pick_question` choose freely across topics — the old fixed blocks
+#: of five in id order gave every student the same set 1, which made the scores
+#: comparable but meant nothing ever revisited a topic a student was failing.
 SET_SIZE = 5
 
-_SET_BOARD_SQL = """
-    with numbered as (
-      select id, (row_number() over (order by id) - 1) / $3::int as set_no
-        from questions
-       where level = $2
-    )
-    select numbered.set_no,
-           count(*) as size,
-           count(*) filter (where exists (select 1 from attempts a
-                            where a.user_id = $1 and a.question_id = numbered.id))
-             as answered,
-           count(*) filter (where exists (select 1 from attempts a
-                            where a.user_id = $1 and a.question_id = numbered.id
-                              and a.correct))
-             as correct
-      from numbered
-     group by numbered.set_no
-     order by numbered.set_no
+#: How far through a level a student is, and how big the level is, in one round
+#: trip. Counts distinct *questions*, not attempt rows: the same question can be
+#: served twice before either card is answered (a weekly push and a /quizme),
+#: and a set must not shrink because a student answered both.
+_SET_COUNTS_SQL = """
+    select (select count(*) from questions where level = $2) as total,
+           (select count(distinct question_id) from attempts
+             where user_id = $1 and level = $2) as answered
 """
 
-_SET_QUESTIONS_SQL = """
-    with numbered as (
-      select *, (row_number() over (order by id) - 1) / $3::int as set_no
-        from questions
-       where level = $2
+#: The next question to serve. One statement, because the ranking needs the
+#: student's whole answer history at this level and a round trip per topic would
+#: be 18 of them on the post-MBBS bank.
+#:
+#: `history` collapses to one row per question (latest answer wins) so the
+#: numbering here agrees with `answered_count`; `recent` turns it into a
+#: recency rank; `partial_set` is the tail of that — the answers already in the
+#: set being built, which is the only sense in which a set has members.
+_PICK_SQL = """
+    with history as (
+      select distinct on (question_id) question_id, id
+        from attempts
+       where user_id = $1 and level = $2
+       order by question_id, id desc
+    ),
+    recent as (
+      select question_id,
+             row_number() over (order by id desc) as recency,
+             count(*)     over ()                 as answered
+        from history
+    ),
+    partial_set as (
+      select q.topic, q.tag
+        from recent r
+        join questions q on q.id = r.question_id
+       where r.recency <= r.answered % $3::int
+    ),
+    -- Laplace-smoothed accuracy, (correct + 1) / (answered + 2). The smoothing
+    -- is what keeps one unlucky answer from branding a topic the student's
+    -- weakest, and it puts an untouched topic on exactly 0.5, which is why the
+    -- coalesce below is mid-range and not 0.0: a topic nobody has tried should
+    -- rank ahead of one the student has mastered but behind one they are
+    -- failing, so a student still meets new material.
+    topic_accuracy as (
+      select topic,
+             (count(*) filter (where correct) + 1.0) / (count(*) + 2.0) as accuracy
+        from attempts
+       where user_id = $1 and level = $2
+       group by topic
     )
-    select numbered.*,
-           exists (select 1 from attempts a
-                    where a.user_id = $1 and a.question_id = numbered.id) as seen
-      from numbered
-     where numbered.set_no = $4
-     order by numbered.id
+    select q.*
+      from questions q
+      left join topic_accuracy ta on ta.topic = q.topic
+     where q.level = $2
+       -- Never repeat a question. Unlike the old selector this counts any
+       -- attempt, not just a correct one: a set is five *new* questions, so a
+       -- miss is revisited through its topic's weight, not by re-serving it.
+       and not exists (select 1 from attempts a
+                        where a.user_id = $1 and a.question_id = q.id)
+     -- Lowest score wins. The weights are spaced so each term outvotes
+     -- everything under it (4 > 1 + 1, 1 > any accuracy, which is always < 1),
+     -- so this reads as one number but ranks strictly by priority: spread the
+     -- set across topics first, then across tags, then lean on weak topics.
+     order by case when exists (select 1 from partial_set p
+                                 where p.topic = q.topic)
+                   then 4.0 else 0.0 end
+            + case when q.tag is not null
+                    and exists (select 1 from partial_set p where p.tag = q.tag)
+                   then 1.0 else 0.0 end
+            + coalesce(ta.accuracy, 0.5),
+     -- Last, so two students with the same history do not walk an identical
+     -- path through the bank.
+              random()
+     limit 1
+"""
+
+#: The most recent SET_SIZE answers, however they fall. Same `history` collapse
+#: as _PICK_SQL so the set number it reports cannot disagree with current_set's.
+_LAST_SET_SQL = """
+    with history as (
+      select distinct on (question_id) question_id, id, correct
+        from attempts
+       where user_id = $1 and level = $2
+       order by question_id, id desc
+    ),
+    recent as (
+      select correct,
+             row_number() over (order by id desc) as recency,
+             count(*)     over ()                 as answered
+        from history
+    )
+    select coalesce(max(answered), 0)      as answered,
+           count(*) filter (where correct) as correct
+      from recent
+     where recency <= $3::int
 """
 
 
-async def set_board(uid: int, level: str):
-    """Per-set progress at this level, one row per set, in order."""
+async def answered_count(uid: int, level: str) -> int:
+    """How many distinct questions this student has attempted at this level."""
     conn = _require_pool()
-    return await conn.fetch(_SET_BOARD_SQL, uid, level, SET_SIZE)
+    return await conn.fetchval(
+        """select count(distinct question_id) from attempts
+            where user_id = $1 and level = $2""",
+        uid, level,
+    )
 
 
-async def quiz_set(uid: int, level: str) -> dict | None:
-    """The student's current set of five, or None once the level is finished.
+async def level_total(level: str) -> int:
+    """How many questions exist at this level."""
+    conn = _require_pool()
+    return await conn.fetchval(
+        "select count(*) from questions where level = $1", level)
 
-    A set is finished when all five of its questions have been attempted. The
-    caller serves `remaining[0]`, which is the first question of the set this
-    student has not answered yet, so a student who stops mid-set resumes it.
+
+async def current_set(uid: int, level: str) -> dict | None:
+    """Where this student is in their rolling set of five, or None when the level
+    is finished.
+
+    There is nothing stored to resume: the set is derived from how many questions
+    have been answered, so stopping mid-set and coming back next week lands on
+    the same set with the same count, and a bank that grows under a student only
+    moves `total_sets`.
     """
-    board = await set_board(uid, level)
-    if not board:
-        return None
-    current = next((row for row in board if row["answered"] < row["size"]), None)
-    if current is None:
-        return None
-
     conn = _require_pool()
-    rows = await conn.fetch(_SET_QUESTIONS_SQL, uid, level, SET_SIZE,
-                            current["set_no"])
+    row = await conn.fetchrow(_SET_COUNTS_SQL, uid, level)
+    answered, total = row["answered"], row["total"]
+    # An empty bank reports None too: there is nothing to answer, which the
+    # caller already has to handle separately to say so plainly.
+    if total == 0 or answered >= total:
+        return None
     return {
-        "set_no": current["set_no"],
-        "number": current["set_no"] + 1,
-        "size": current["size"],
-        "answered": current["answered"],
-        "correct": current["correct"],
-        "total_sets": len(board),
-        "questions": rows,
-        "remaining": [row for row in rows if not row["seen"]],
+        "number": answered // SET_SIZE + 1,
+        "answered_in_set": answered % SET_SIZE,
+        "size": SET_SIZE,
+        "total_sets": (total + SET_SIZE - 1) // SET_SIZE,   # ceil, no float
     }
 
 
-async def set_no_for(level: str, qid: int) -> int:
-    """Which set a question belongs to. Derived from id order, so it holds even if
-    the id sequence has gaps."""
+async def pick_question(uid: int, level: str):
+    """The next question for this student, or None once the level is exhausted.
+
+    Always a question they have never attempted, ranked for variety first and
+    weakness second — see _PICK_SQL for the weights. The randomised tiebreak
+    means two students at the same point do not get the same question, so this
+    is deliberately *not* a shared benchmark: compare students with `stats` or
+    the tournament, not by set number.
+    """
     conn = _require_pool()
-    return await conn.fetchval(
-        """select ((select count(*) from questions
-                     where level = $1 and id <= $2) - 1) / $3::int""",
-        level, qid, SET_SIZE,
-    )
+    return await conn.fetchrow(_PICK_SQL, uid, level, SET_SIZE)
 
 
-async def set_score(uid: int, level: str, set_no: int):
-    """How one set went: ``(size, answered, correct, total_sets, total_questions)``."""
+async def last_set_score(uid: int, level: str) -> dict | None:
+    """How the set that just closed went, or None before the first five answers.
+
+    Call it when `current_set` has wrapped to ``answered_in_set == 0``, which is
+    the only moment the most recent five answers are exactly one set. Mid-set it
+    still answers, but with a window that straddles two sets, so the caller
+    decides when to report rather than this deciding for it.
+    """
     conn = _require_pool()
-    return await conn.fetchrow(
-        """with numbered as (
-             select id, (row_number() over (order by id) - 1) / $3::int as set_no
-               from questions
-              where level = $2)
-           select
-             (select count(*) from numbered) as total_questions,
-             (select count(distinct set_no) from numbered) as total_sets,
-             count(*) as size,
-             count(*) filter (where exists (select 1 from attempts a
-                              where a.user_id = $1 and a.question_id = numbered.id))
-               as answered,
-             count(*) filter (where exists (select 1 from attempts a
-                              where a.user_id = $1 and a.question_id = numbered.id
-                                and a.correct))
-               as correct
-             from numbered
-            where numbered.set_no = $4""",
-        uid, level, SET_SIZE, set_no,
+    row = await conn.fetchrow(_LAST_SET_SQL, uid, level, SET_SIZE)
+    answered = row["answered"]
+    if answered < SET_SIZE:
+        return None
+    return {"number": answered // SET_SIZE, "size": SET_SIZE,
+            "correct": row["correct"]}
+
+
+#: The review pile: questions whose *latest* answer at this level was wrong.
+#:
+#: "Latest answer wrong" rather than "never answered correctly" (which is how
+#: `progress` defines unfinished) because a revision tool should track what the
+#: student knows now. A question they once got right and have since forgotten
+#: belongs back in the pile, and a question they missed and later nailed does
+#: not. The two definitions therefore disagree on a right-then-wrong question,
+#: deliberately: `progress` calls it done, /review calls it due.
+#:
+#: `distinct on` picks each question's newest attempt, and the ordering is that
+#: attempt's id, so the pile is stable across calls — unlike `pick_question`,
+#: which randomises on purpose.
+_WRONG_SQL = """
+    with latest as (
+      select distinct on (question_id) question_id, id, correct
+        from attempts
+       where user_id = $1 and level = $2
+       order by question_id, id desc
     )
+    select q.*
+      from latest
+      join questions q on q.id = latest.question_id
+     where not latest.correct
+     order by latest.id desc
+     limit $3::int
+"""
+
+_WRONG_COUNT_SQL = """
+    with latest as (
+      select distinct on (question_id) question_id, correct
+        from attempts
+       where user_id = $1 and level = $2
+       order by question_id, id desc
+    )
+    select count(*) from latest where not correct
+"""
+
+
+async def wrong_questions(uid: int, level: str, limit: int = SET_SIZE):
+    """Questions this student got wrong and has not since got right, newest miss
+    first, capped at `limit`. Full question rows, so the caller renders them with
+    the ordinary question card. Empty list when there is nothing to review."""
+    conn = _require_pool()
+    return await conn.fetch(_WRONG_SQL, uid, level, limit)
+
+
+async def wrong_count(uid: int, level: str) -> int:
+    """How many questions are waiting in the review pile, without fetching them,
+    so a handler can offer or decline /review in one round trip."""
+    conn = _require_pool()
+    return await conn.fetchval(_WRONG_COUNT_SQL, uid, level)
 
 
 async def stats(uid: int, level: str):
@@ -538,3 +656,84 @@ async def all_notes(level: str, tier: str):
             order by topic, id""",
         level, tier,
     )
+
+
+# --------------------------------------------------------------- note delivery
+# What a student has already been handed. The sheets themselves are files on
+# disk (bot/resources.py scans resources/notes), so only the code is stored,
+# and a code is unique only *within* a level, which is why every row carries the
+# level and the kind. `resources.unsent` takes these codes and does the rest.
+
+
+async def record_notes_sent(uid: int, level: str,
+                            sheets: list[tuple[str, str]]) -> None:
+    """Remember that these sheets went out. `sheets` is [(tier, code), ...].
+
+    One insert, not a loop: the monthly drop sends up to 21 sheets to every
+    subscriber, and a round trip each would multiply the fan-out. `on conflict
+    do nothing` covers both ways a pair can repeat, a row already in the table
+    and the same pair twice inside `sheets` (speculative insertion sees the
+    earlier row from its own command) — a test pins the second case, because it
+    is the one that reads as if it should fail.
+
+    The casts are load-bearing: a bare $1 in the select list gives Postgres
+    nothing to infer the type from, so it settles on text and the insert then
+    fails against the bigint key.
+    """
+    if not sheets:
+        return
+    conn = _require_pool()
+    await conn.execute(
+        """insert into note_deliveries (user_id, level, tier, code)
+           select $1::bigint, $2::text, tier, code
+             from unnest($3::text[], $4::text[]) as sent (tier, code)
+           on conflict do nothing""",
+        uid, level, [tier for tier, _ in sheets], [code for _, code in sheets],
+    )
+
+
+async def sent_note_codes(uid: int, level: str, tier: str) -> set[str]:
+    """Codes of one kind already sent to this student at this level."""
+    conn = _require_pool()
+    rows = await conn.fetch(
+        """select code from note_deliveries
+            where user_id = $1 and level = $2 and tier = $3""",
+        uid, level, tier,
+    )
+    return {row["code"] for row in rows}
+
+
+async def notes_delivered(uid: int, level: str) -> dict[str, set[str]]:
+    """Both kinds at once: ``{"a": {...}, "b": {...}}``.
+
+    One query, because deciding what to send next means knowing whether tier A
+    is finished *and* what of tier B has gone — two round trips for one
+    decision. Both keys are always present, so a caller can index straight in.
+    """
+    conn = _require_pool()
+    rows = await conn.fetch(
+        """select tier, code from note_deliveries
+            where user_id = $1 and level = $2""",
+        uid, level,
+    )
+    delivered: dict[str, set[str]] = {"a": set(), "b": set()}
+    for row in rows:
+        delivered.setdefault(row["tier"], set()).add(row["code"])
+    return delivered
+
+
+async def reset_notes(uid: int, level: str) -> int:
+    """Forget one level's delivery history, returning how many rows went.
+
+    Scoped to a level on purpose: a student who has finished the preclinical
+    sheets and wants another pass should not lose the clinical history they
+    built up while their level was switched.
+    """
+    conn = _require_pool()
+    rows = await conn.fetch(
+        """delete from note_deliveries
+            where user_id = $1 and level = $2
+            returning code""",
+        uid, level,
+    )
+    return len(rows)

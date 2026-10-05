@@ -96,6 +96,8 @@ class FakeDB:
         self.notes = []
         self.calls = []
         self.streak = 0
+        self.delivered = {}        # (uid, level) -> {(tier, code), ...}
+        self.seq = 0
 
     # -- users
     async def upsert_user(self, uid, username):
@@ -129,46 +131,79 @@ class FakeDB:
         return sorted((q for q in self.questions.values() if q["level"] == level),
                       key=lambda q: q["id"])
 
-    async def set_board(self, uid, level):
-        """Mirrors bot.db: consecutive blocks of five, in id order."""
-        questions = self._level_questions(level)
-        attempted = self._attempted_ids(uid)
-        correct = self._correct_ids(uid)
-        board = []
-        for index in range(0, len(questions), SET_SIZE):
-            chunk = questions[index:index + SET_SIZE]
-            board.append({
-                "set_no": index // SET_SIZE,
-                "size": len(chunk),
-                "answered": sum(1 for q in chunk if q["id"] in attempted),
-                "correct": sum(1 for q in chunk if q["id"] in correct),
-            })
-        return board
+    def _ordered_attempts(self, uid, level):
+        """Attempt records for this user at this level, oldest first."""
+        by_id = {q["id"]: q for q in self.questions.values()}
+        recs = [rec for (u, _), rec in self.attempts.items()
+                if u == uid and by_id.get(rec["qid"], {}).get("level") == level]
+        return sorted(recs, key=lambda r: r["seq"])
 
-    async def quiz_set(self, uid, level):
-        board = await self.set_board(uid, level)
-        current = next((b for b in board if b["answered"] < b["size"]), None)
-        if current is None:
+    async def answered_count(self, uid, level):
+        seen = {rec["qid"] for rec in self._ordered_attempts(uid, level)}
+        return len(seen)
+
+    async def level_total(self, level):
+        return len(self._level_questions(level))
+
+    async def current_set(self, uid, level):
+        total = len(self._level_questions(level))
+        answered = await self.answered_count(uid, level)
+        if total and answered >= total:
             return None
-        questions = self._level_questions(level)
-        chunk = questions[current["set_no"] * SET_SIZE:
-                          (current["set_no"] + 1) * SET_SIZE]
+        return {"number": answered // SET_SIZE + 1,
+                "answered_in_set": answered % SET_SIZE,
+                "size": SET_SIZE,
+                "total_sets": -(-total // SET_SIZE) if total else 0}
+
+    async def pick_question(self, uid, level):
+        """Stands in for the adaptive picker: anything unattempted, preferring a
+        topic not already in the current partial set, as the real one does."""
         attempted = self._attempted_ids(uid)
-        return {**current, "number": current["set_no"] + 1,
-                "total_sets": len(board),
-                "questions": chunk,
-                "remaining": [q for q in chunk if q["id"] not in attempted]}
-
-    async def set_no_for(self, level, qid):
-        ids = [q["id"] for q in self._level_questions(level)]
-        return ids.index(qid) // SET_SIZE if qid in ids else 0
-
-    async def set_score(self, uid, level, set_no):
-        board = await self.set_board(uid, level)
-        if not 0 <= set_no < len(board):
+        pool = [q for q in self._level_questions(level) if q["id"] not in attempted]
+        if not pool:
             return None
-        return {**board[set_no], "total_sets": len(board),
-                "total_questions": len(self._level_questions(level))}
+        answered = await self.answered_count(uid, level)
+        in_set = self._ordered_attempts(uid, level)[answered - answered % SET_SIZE:]
+        by_id = {q["id"]: q for q in self.questions.values()}
+        seen_topics = {by_id[r["qid"]]["topic"] for r in in_set if r["qid"] in by_id}
+        fresh = [q for q in pool if q.get("topic") not in seen_topics]
+        return (fresh or pool)[0]
+
+    async def last_set_score(self, uid, level):
+        recs = self._ordered_attempts(uid, level)
+        if len(recs) < SET_SIZE:
+            return None
+        window = recs[-SET_SIZE:]
+        return {"number": len(recs) // SET_SIZE,
+                "size": SET_SIZE,
+                "correct": sum(1 for r in window if r["correct"])}
+
+    async def wrong_questions(self, uid, level, limit=SET_SIZE):
+        by_id = {q["id"]: q for q in self.questions.values()}
+        latest = {}
+        for rec in self._ordered_attempts(uid, level):
+            latest[rec["qid"]] = rec["correct"]
+        missed = [qid for qid, ok in latest.items() if not ok]
+        return [by_id[qid] for qid in reversed(missed) if qid in by_id][:limit]
+
+    async def wrong_count(self, uid, level):
+        return len(await self.wrong_questions(uid, level, limit=10_000))
+
+    # -- note deliveries
+    async def record_notes_sent(self, uid, level, sheets):
+        for tier, code in sheets:
+            self.delivered.setdefault((uid, level), set()).add((tier, code))
+
+    async def notes_delivered(self, uid, level):
+        rows = self.delivered.get((uid, level), set())
+        return {"a": {c for t, c in rows if t == "a"},
+                "b": {c for t, c in rows if t == "b"}}
+
+    async def sent_note_codes(self, uid, level, tier):
+        return (await self.notes_delivered(uid, level))[tier]
+
+    async def reset_notes(self, uid, level):
+        return len(self.delivered.pop((uid, level), ()))
 
     async def stats(self, uid, level):
         by_id = {q["id"]: q for q in self.questions.values()}
@@ -202,8 +237,11 @@ class FakeDB:
     async def record_attempt(self, uid, question, idx, correct, mode, msg_id):
         if (uid, msg_id) in self.attempts:
             return False
+        # `seq` stands in for created_at: the new set model is "the Nth block of
+        # five answers", so the order attempts arrived in is what matters.
+        self.seq += 1
         self.attempts[(uid, msg_id)] = {"idx": idx, "correct": correct,
-                                        "qid": question["id"]}
+                                        "qid": question["id"], "seq": self.seq}
         return True
 
     # -- tournaments
@@ -597,9 +635,13 @@ async def test_start_enters_a_running_tournament_automatically(fake):
 def _recorder():
     async def _answer(text, **kw):
         _answer.messages.append(text)
+        # Keyboards matter now that the sheet pickers are built per level, so the
+        # kwargs are kept alongside the text rather than dropped.
+        _answer.kwargs.append(kw)
         return SimpleNamespace(message_id=1)
 
     _answer.messages = []
+    _answer.kwargs = []
     return _answer
 
 
@@ -688,7 +730,7 @@ async def test_start_greets_by_name_and_escapes_it(fake):
     await handlers.start(msg, fake.bot)
 
     text = msg.answer.messages[-1]
-    assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b>")
+    assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b> This is the <b>LKC OphSoc Bot</b>.")
     assert "/quizme" in text and "Acuity Team" in text
 
 
@@ -751,11 +793,72 @@ async def test_start_states_the_functions_and_the_level(fake):
 
     text = msg.answer.messages[-1]
     assert "Acuity Team" in text
+    assert "Zhong Han (Vice-Pres, LKC OphSoc 26/27)" in text
     assert "lkceye" in text
-    assert "WHAT THIS BOT DOES" in text
-    assert "3a." in text and "3b." in text
+    assert "Revision only, not clinical advice." in text
+    assert "<b>Functions</b>" in text
+    for item in ("<b>1. 🧠", "<b>2. 🗒", "<b>3. 📬"):
+        assert item in text, item
+    assert "Annual Eye Trivia Tournament" in text
     assert "Pre-Clinical" in text
     assert "/changestreams" in text
+    # The sets really are adaptive now (db.pick_question weights by per-topic
+    # accuracy), so the copy is allowed to claim it. This assertion used to run
+    # the other way, back when sets were a fixed block of five in id order.
+    assert "Adaptive" in text
+    assert "/review" in text
+
+
+@pytest.mark.asyncio
+async def test_welcome_only_names_commands_that_exist(fake):
+    """Every /command printed in the welcome has to be registered.
+
+    A draft of this copy advertised /subscribeqn, /subscribenotes, /unsub_qns
+    and /unsub_notes, none of which existed - a student tapping one would have
+    got silence. The welcome now uses the canonical names from commands.PUBLIC,
+    and this walks the router rather than a hand-kept list, so a renamed handler
+    fails here too.
+    """
+    import re
+
+    from aiogram.filters import Command
+
+    registered = set()
+    for handler in handlers.router.message.handlers:
+        for flt in handler.filters or ():
+            callback = getattr(flt, "callback", None)
+            if isinstance(callback, Command):
+                registered |= {str(c) for c in callback.commands}
+
+    msg = _chat_message()
+    await handlers.start(msg, fake.bot)
+    # (?<!<) so the closing "</b>" of an HTML tag is not read as a command.
+    mentioned = set(re.findall(r"(?<!<)/([a-z_]+)", msg.answer.messages[-1]))
+
+    assert mentioned, "the welcome should name some commands"
+    assert mentioned <= registered, f"not registered: {sorted(mentioned - registered)}"
+
+    # And they must be the canonical names, so the welcome and Telegram's own
+    # command menu read as one vocabulary rather than two sets of synonyms.
+    from bot import commands as cmds
+    menu = {c.command for c in cmds.PUBLIC}
+    assert mentioned <= menu, f"not in the menu: {sorted(mentioned - menu)}"
+
+
+@pytest.mark.asyncio
+async def test_help_adds_the_full_command_list(fake):
+    """The welcome names the headline commands; /help still lists everything, so
+    /stats and the sheet browsers stay reachable."""
+    from aiogram.filters import CommandObject
+
+    msg = _chat_message()
+    await handlers.start(msg, fake.bot,
+                         CommandObject(prefix="/", command="help", args=None))
+
+    text = msg.answer.messages[-1]
+    assert "All commands" in text
+    for cmd in ("/stats", "/topicalnotes", "/randomnotes", "/resources"):
+        assert cmd in text, cmd
 
 
 # ----------------------------------------------------------------- resources
@@ -805,13 +908,83 @@ async def test_unknown_sheet_code_is_handled(fake):
 
 
 @pytest.mark.asyncio
-async def test_notes_falls_back_to_the_sheets_when_the_table_is_empty(fake):
-    """The notes table is empty; /notes must not dead-end."""
-    msg = _chat_message()
+async def test_notes_walks_overview_then_focused_then_congratulates(fake):
+    """/notes is a progression: every overview sheet, then every focused one,
+    then the syllabus-complete message, and never the same sheet twice."""
+    from bot import resources
 
+    fake.users[1] = "preclin"
+    overview = [n.path.name for n in resources.overview("preclin")]
+    focused = [n.path.name for n in resources.focused("preclin")]
+
+    handed = []
+    for _ in range(len(overview) + len(focused)):
+        msg = _chat_message()
+        await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+        handed.append([m for m in fake.bot.sent if "document" in m][-1]
+                      ["document"].path.name)
+
+    assert handed == overview + focused, "wrong order, or a sheet repeated"
+    assert len(set(handed)) == len(handed)
+
+    # One more and there is nothing left to send.
+    msg = _chat_message()
+    before = len([m for m in fake.bot.sent if "document" in m])
     await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
 
-    assert "Revision sheets" in msg.answer.messages[-1]
+    assert len([m for m in fake.bot.sent if "document" in m]) == before
+    assert "completed the notes" in msg.answer.messages[-1]
+    assert "Pre-Clinical syllabus" in msg.answer.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_sheet_pulled_by_hand_is_not_pushed_again(fake):
+    """/resources, /notes and the fortnightly drop share one delivery history, so
+    browsing to a sheet takes it out of the queue."""
+    from bot import resources
+
+    fake.users[1] = "preclin"
+    first = resources.overview("preclin")[0]
+
+    msg = _chat_message()
+    await handlers.resources_cmd(msg, SimpleNamespace(args=first.code), fake.bot)
+    msg = _chat_message()
+    await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+
+    served = [m for m in fake.bot.sent if "document" in m][-1]
+    assert served["document"].path.name != first.path.name
+
+
+@pytest.mark.asyncio
+async def test_review_does_not_re_announce_a_finished_set(fake):
+    """A /review answer re-answers a question that already counted, so it must not
+    close a set again.
+
+    answered_count counts *distinct* questions, so it does not move on a
+    re-answer. Before this was guarded, a student sitting exactly on a set
+    boundary was congratulated with "Set N done" after every review answer.
+    """
+    for qid in range(1, SET_SIZE + 1):
+        add_question(fake, qid=qid, correct_idx=0)
+
+    # Answer a full set, the last one wrongly so it lands in the review pile.
+    messages = []
+    for qid in range(1, SET_SIZE + 1):
+        message = FakeMessage(message_id=qid)
+        messages.append(message)
+        wrong = qid == SET_SIZE
+        await handlers.on_answer(
+            FakeCallback(f"a:{qid}:{1 if wrong else 0}:practice", message=message))
+
+    reports = [r for msg in messages for r in msg.replies if "Set" in r["text"]]
+    assert len(reports) == 1, f"the set should close exactly once, got {len(reports)}"
+
+    # Now re-answer the missed one, as /review does, on a fresh message id.
+    again = FakeMessage(message_id=99)
+    await handlers.on_answer(FakeCallback("a:5:0:practice", message=again))
+
+    assert not [r for r in again.replies if "Set" in r["text"]], (
+        "a review answer must not announce the set again")
 
 
 # ------------------------------------------------------------- sets of five
@@ -957,18 +1130,103 @@ async def test_randomnotes_never_sends_a_reserved_sheet(fake):
         sent = [m for m in fake.bot.sent if "document" in m]
         seen.add(sent[-1]["document"].path.name)
 
-    reserved = {note.path.name for note in resources.MONTHLY}
+    # The fake user's level is preclin, which is the only level with a curated
+    # monthly reserve today.
     assert seen, "a sheet should have been sent"
-    assert not (seen & reserved), seen & reserved
+    # Nothing is reserved any more: deliveries are tracked, so the guarantee is
+    # simply that /randomnotes never hands over the same sheet twice.
+    assert len(seen) == len(resources.focused("preclin")), (
+        "every focused sheet should come round exactly once")
 
 
 @pytest.mark.asyncio
-async def test_monthly_subscription_reports_what_it_sends(fake):
+@pytest.mark.parametrize("level,prefix", [("preclin", "B"), ("clin", "B"),
+                                          ("postmbbs", "B")])
+async def test_randomnotes_serves_the_students_own_level(fake, level, prefix):
+    """Codes repeat across levels, so the only proof a sheet came from the right
+    place is its path. A clinical student must never be handed a preclinical
+    sheet."""
+    from bot import resources
+
+    fake.users[1] = level
     msg = _chat_message()
 
-    await handlers.monthlynotes(msg)
+    await handlers.randomnotes(msg, SimpleNamespace(args=None), fake.bot)
+
+    sent = [m for m in fake.bot.sent if "document" in m][-1]
+    path = sent["document"].path.as_posix()
+    assert f"/notes/{level}/tier_b/" in path, path
+    assert path.rsplit("/", 1)[-1].startswith(prefix)
+    assert sent["document"].path.name in {
+        n.path.name for n in resources.focused(level)}
+
+
+@pytest.mark.asyncio
+async def test_topicalnotes_lists_the_students_own_level(fake):
+    """The overview picker is built from the student's level, so the clinical
+    student sees C01-C07 and the post-MBBS student A01-A15."""
+    from bot import resources
+
+    for level, expected in (("preclin", "01"), ("clin", "C01"),
+                            ("postmbbs", "A01")):
+        fake.users[1] = level
+        msg = _chat_message()
+
+        await handlers.topicalnotes(msg, SimpleNamespace(args=None), fake.bot)
+
+        keyboard = msg.answer.kwargs[-1]["reply_markup"].inline_keyboard
+        labels = [b.text for row in keyboard for b in row]
+        assert any(label.startswith(expected) for label in labels), (level, labels)
+        # and nothing from another level leaked in
+        own = {n.label for n in resources.overview(level)}
+        assert {lab for lab in labels if lab != "⬅ Back"} <= own
+
+
+@pytest.mark.asyncio
+async def test_a_code_resolves_to_the_students_own_level(fake):
+    """B01 exists at all three levels. Whichever one the student is on is the one
+    they must get."""
+    paths = {}
+    for level in ("preclin", "clin", "postmbbs"):
+        fake.users[1] = level
+        msg = _chat_message()
+        await handlers.resources_cmd(msg, SimpleNamespace(args="B01"), fake.bot)
+        sent = [m for m in fake.bot.sent if "document" in m][-1]
+        paths[level] = sent["document"].path.as_posix()
+
+    for level, path in paths.items():
+        assert f"/notes/{level}/tier_b/" in path, path
+    assert len(set(paths.values())) == 3, "the same file was served three times"
+
+
+@pytest.mark.asyncio
+async def test_notes_subscription_reports_what_is_left_for_this_student(fake):
+    from bot import resources
+
+    fake.users[1] = "preclin"
+    msg = _chat_message()
+
+    await handlers.subscribenotes(msg)
 
     text = msg.answer.messages[-1]
-    assert "overview sheets" in text
-    assert "focused ones" in text
+    assert "1st and the 15th" in text
+    assert str(len(resources.all_for("preclin"))) in text, "should count what is left"
     assert ("set_flag", 1, "notes_sub", True) in fake.calls
+    # The confirmation carries its own off switch, since the stop command is not
+    # in the menu.
+    keyboard = msg.answer.kwargs[-1]["reply_markup"].inline_keyboard
+    assert any(b.callback_data == "sub:off:notes"
+               for row in keyboard for b in row)
+
+
+@pytest.mark.asyncio
+async def test_the_off_button_turns_a_subscription_off(fake):
+    c = SimpleNamespace(data="sub:off:notes",
+                        from_user=SimpleNamespace(id=1, username="t"),
+                        message=SimpleNamespace(answer=_recorder(),
+                                                reply_markup=None),
+                        answer=_recorder(), bot=fake.bot)
+
+    await handlers.sub_off(c)
+
+    assert ("set_flag", 1, "notes_sub", False) in fake.calls

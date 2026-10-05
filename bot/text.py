@@ -106,6 +106,25 @@ def explanation_block(text: str) -> str:
     return f"{EXPLANATION_HEADING}\n{esc(text.strip())}"
 
 
+SHEETS_DONE_HEADING = "🎉 <b>You've completed the notes.</b>"
+
+
+def sheets_done(level_label: str) -> str:
+    """What a student sees once they have been sent every sheet at their level.
+
+    Reached from two places - /notes when the queue is empty, and the fortnightly
+    drop when a subscriber has had everything - so the wording lives here rather
+    than being written twice.
+    """
+    return (
+        f"{SHEETS_DONE_HEADING}\n"
+        f"Good job for completing the Eye {esc(level_label)} syllabus! 👁\n\n"
+        "Keep the questions going with /quizme, or /review the ones you got "
+        "wrong.\n"
+        "Want to read the sheets again? /resources has all of them."
+    )
+
+
 def mask(username: str | None, uid: int) -> str:
     """Spec: show the Telegram username with its last two characters hidden."""
     if not username:

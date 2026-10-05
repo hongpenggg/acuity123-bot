@@ -2,18 +2,27 @@
 
 Everything here is written for whoever picks this up next. No prior context needed.
 
-**Status at handover.** The bot is live for the **Pre-Clinical** bank (120
-questions). The **Clinical** and **Post-MBBS** question banks are the main thing
-still to be done, and the step-by-step for those is
-[§2](#2-adding-a-question-bank). Everything else is either working or listed as
-not-built in [§7](#7-not-built-yet).
+**Status at handover.** All three banks are loaded — **Pre-Clinical** 120
+questions, **Clinical** 103, **Post-MBBS** 170, so 393 in total, every one with a
+written explanation and none of them needing the LLM.
+[§2](#2-adding-a-question-bank) is the step-by-step for regenerating a bank or
+adding a fourth level. Everything else is either working or listed as still open
+in [§7](#7-what-was-built-and-what-is-still-open).
+
+> **One caveat, and it is the easiest thing here to forget.** The clinical
+> documents hold 120 cases but only **103** are loaded. Seventeen are built
+> around an embedded photograph and the bot sends text-only question cards, so
+> the generator holds them back. Four of the seventeen look answerable as written
+> and are a quick win; thirteen need the image uploaded or the stem rewritten.
+> Full list and both routes:
+> [§2.6](#26-the-seventeen-clinical-cases-that-are-held-back).
 
 ---
 
 ## 1. What is running
 
 ```
-Telegram      @acuity123_bot  ("Acuity Bot")
+Telegram      @lkceyebot  ("LKC OphSoc Bot")
 Droplet       DigitalOcean, Singapore (sgp1), 1 GB RAM, Ubuntu 24.04
               IP in the DigitalOcean account (the one holding the LKC OphSoc key)
 Service       systemd unit `studybot`, running as user `deploy` from /opt/studybot
@@ -22,8 +31,8 @@ Backups       nightly pg_dump 17:04 into /var/backups/studybot (14-day rotation)
 ```
 
 Working now: `/quizme` (a set of five, options numbered 1–5, score at the end),
-`/stats`, `/topicalnotes`, `/randomnotes`, `/resources` (the sheets, as PDFs),
-`/changestreams`, `/weeklyquiz`, `/monthlynotes`, `/stopweekly`, `/stopmonthly`,
+`/notes` (the sheet progression), `/review`, `/stats`, `/resources`,
+`/changestreams`, `/weeklyquiz`, `/subscribenotes`, `/stopweekly`, `/stopmonthly`,
 `/tournament`, `/leaderboard`, and the four `/admin_*` commands. The older names
 (`/practice`, `/subscribe`, `/notes_sub`, `/level` and so on) still work as
 aliases.
@@ -34,14 +43,15 @@ Only IDs in `ADMIN_IDS` can run admin commands.
 
 ## 2. Adding a question bank
 
-This is the main outstanding piece of work. It is **four steps** and needs no code
-changes.
+All three levels now have one, so this is the procedure for **regenerating** a
+bank from edited sources, or adding a fourth level. It is **four steps**, and only
+§2.3 touches code.
 
 ### 2.1 Get the questions written in the right format
 
-The generator parses a `.docx` (or two) laid out exactly like this. Anything it
-cannot account for, it refuses to write — so a malformed file fails loudly rather
-than silently dropping a question.
+The generator parses a `.docx` (or two) laid out like this. Anything it cannot
+account for, it refuses to write — so a malformed file fails loudly rather than
+silently dropping a question.
 
 ```
 Question 1
@@ -74,8 +84,26 @@ Rules that matter:
 - **`Question type:`** is optional context (`Discipline | what it tests`). It is
   stored in `questions.tag` and is not currently used for anything.
 - **Numbering must be 1..N with no gaps** across the file(s).
-- A trailing "Coverage and Resources" / "Resource Guide" section is fine; the
-  parser stops there.
+- A trailing "Coverage and Resources" / "Resource Guide" / "Clinical Sources and
+  References" section is fine; the parser stops there (`STOP_RE`).
+
+The six documents already in the repo disagree on nearly every detail of this
+layout, and the parser tolerates all of it — so a new document does not have to
+match any one of them exactly:
+
+| Varies | Accepted |
+|---|---|
+| Header | `Question 1`, `Question 01`, `Sample question 01` |
+| Field separator | `Topic: X` and `Topic  X` |
+| Options header | `Options:`, `Options`, or **absent** — the first `a)`/`A)` line opens the list |
+| Option letters | `a)`–`e)` or `A)`–`D)` |
+| Question type | the `Question type:` label, or an unlabelled `Part 1 \| Anatomy \| applied inference` line under the header |
+| After the answer | the **first** paragraph is the explanation; any further paragraphs are treated as a reading list and dropped |
+
+One thing it will not accept silently: a question whose block contains an
+**inline image**. Those are flagged and held back from the seed, because the bot
+sends text-only question cards — see
+[§2.6](#26-the-seventeen-clinical-cases-that-are-held-back).
 
 ### 2.2 Put the file in the repo
 
@@ -85,16 +113,22 @@ cp "Clinical_Ophthalmology_MCQs.docx" resources/questions/
 
 ### 2.3 Register it and regenerate
 
-Edit `LEVELS` in `tools/build_question_seed.py` — add the file to the `clin` list
-(the `postmbbs` list for the other one):
+Edit `LEVELS` in `tools/build_question_seed.py` — add the file to that level's
+list. All three are populated today:
 
 ```python
 LEVELS = {
-    "preclin": ("01", [ ...two files... ]),
-    "clin":    ("02", [ROOT / "resources" / "questions" / "Clinical_Ophthalmology_MCQs.docx"]),
-    "postmbbs":("03", []),
+    "preclin":  ("01", [Preclinical_Ophthalmology_20_MCQs.docx,
+                        Preclinical_Ophthalmology_100_Additional_MCQs.docx]),
+    "clin":     ("02", [Clinical_Ophthalmology_M3_M5_20_Case_MCQs.docx,
+                        Clinical_Ophthalmology_M3_M5_100_Additional_Cases_Q21_Q120.docx]),
+    "postmbbs": ("03", [FRCOphth_Post_MBBS_20_Sample_MCQ.docx,
+                        FRCOphth_Post_MBBS_150_Additional_MCQ_Q21_Q170.docx]),
 }
 ```
+
+Question numbering has to run `1..N` across a level's files together, not restart
+per file — the two documents in each pair already do (`1..20` then `21..120`).
 
 Then:
 
@@ -149,27 +183,134 @@ by itself once the tier has questions.
 > `provision.sh` also loads every `seeds/*.sql` automatically, but only for tiers
 > that have nothing in them yet — so a fresh server needs no manual step.
 
+### 2.6 The seventeen clinical cases that are held back
+
+**This is the one piece of loaded content that is deliberately incomplete, so it
+is the thing most likely to be forgotten.** The two clinical documents hold 120
+cases. Seventeen of them are built around an embedded fundus, OCT or lid
+photograph, and `bot/sender.py` sends question cards as **text messages** — there
+is no code path that uploads an image with a question. A student would be asked
+to interpret a photograph that never arrives, so the generator holds them back
+and the loaded clinical bank is **103, not 120**.
+
+They are not dropped silently. `parse_document` flags any question whose block
+contains an inline image (`graphicData` in the paragraph XML — the detection is
+structural, so it cannot drift out of step with the documents), validates it like
+every other question, and then `build_level` removes it and prints exactly which:
+
+```
+held back 17 figure-dependent question(s): Q9, Q10, Q11, Q12, Q13, Q14, Q52,
+Q53, Q56, Q59, Q61, Q64, Q66, Q74, Q78, Q102, Q107
+```
+
+| # | Topic | Image in the source | Stem depends on it |
+|---|---|---|---|
+| Q9 | Retinal vascular disease | `Mamalis_retina_9.jpg` | **yes** |
+| Q10 | Retinal vascular disease | `big_55590ee180e14.jpg` | **yes** |
+| Q11 | Retinal vascular disease | `big_6…6.82258709.jpg` | **yes** |
+| Q12 | Macular and vitreoretinal disease | `IMG_4065.jpg` | caption only |
+| Q13 | Macular and vitreoretinal disease | `Rhegm…chment-HST.jpg` | **yes** |
+| Q14 | Macular and vitreoretinal disease | `paste…b3a5a453fc.jpg` | **yes** |
+| Q52 | Retinal vascular disease | `QuizSeries_p3_img0_X13.png` | caption only |
+| Q53 | Retinal vascular disease | `macular oedema.jpeg` | **yes** |
+| Q56 | Retinal vascular disease | `big_631b0e824e4a35.14412017.jpg` | **yes** |
+| Q59 | Retinal vascular disease | `big_55590ee180e14.jpg` | **yes** |
+| Q61 | Retinal vascular disease | `7EetI4r7HfXCMv…BRx3TroQ9L.png` | **yes** |
+| Q64 | Retinal vascular disease | `Mamalis_retina_11.jpg` | **yes** |
+| Q66 | Macular and vitreoretinal disease | `big_5081d9424a0cd.jpg` | caption only |
+| Q74 | Macular and vitreoretinal disease | `600px-ASRS-RIB-Image-170.jpg` | **yes** |
+| Q78 | Retinal vascular disease | `paste-0da49873…045fd9a01a.jpg` | **yes** |
+| Q102 | Lens lids and paediatric eye | `paste-7780e3e6…d26d06e4b0.jpg` | **yes** |
+| Q107 | Clinical assessment and vision loss | `paste-52ba7000…23f11ab0f9.jpg` | caption only |
+
+"Stem depends on it" is the column that matters:
+
+- **13 genuinely need the picture** (Q9, Q10, Q11, Q13, Q14, Q53, Q56, Q59, Q61, Q64, Q74, Q78, Q102). Their stems say
+  things like *"the photographed diffuse haemorrhagic pattern"* or *"the fundus
+  appearance shown"*. Q10 asks the student to separate BRVO from CRVO, and the
+  only evidence for that is the image. These cannot be fixed by editing text.
+- **4 carry only a caption** (Q12, Q52, Q66, Q107). The photograph sits
+  next to the stem but nothing in the question refers to it — Q66 is *"bilateral
+  intermediate AMD with large drusen … which recommendation matches her stage and
+  smoking history?"*, which is answerable as written. **These four are the cheap
+  win**: confirm with the content team that the picture is decorative, and they
+  can ship as text-only questions, taking the clinical bank to 107.
+
+#### Two ways to finish the other thirteen
+
+1. **Upload the figure with the card.** Extract the images to
+   `resources/questions/figures/`, carry the reference through the seed (a
+   `questions.figure` column, or a naming convention keyed on question id), and
+   teach `sender.send_question` to `send_photo` first. Note the Bot API caps a
+   photo caption at 1024 characters and these cards routinely exceed that, so it
+   has to be photo-then-text, and the answer buttons must stay attached to the
+   text message.
+2. **Rewrite the thirteen stems** so the finding is described in words
+   ("diffuse haemorrhage in all four quadrants with a swollen disc"). Cheaper,
+   loses the image-interpretation skill the cases were written to test.
+
+> **Copyright, before either route.** The source appendix lists these images as
+> coming from an M3 Anki deck, a supplied quiz PDF and senior notes, and one
+> caption reads *"image unmodified"*. The content policy in the README and
+> `schema.sql` keeps iRAT/tRAT, AMBOSS, PassMedicine and school or senior
+> material out of this repo until it has been rewritten — rewritten prose is
+> fine, an unmodified photograph is not. Clear the images with the content team
+> before shipping them, whichever route you take. The prose cases themselves are
+> newly written and are not affected.
+
+#### Re-enabling them
+
+One line, `tools/build_question_seed.py`:
+
+```python
+SKIP_FIGURE_QUESTIONS = False
+```
+
+Then `python tools/build_question_seed.py --level clin`, and update the
+`EXPECTED["clin"]` count and topic split in the same file plus `TOPICS["clin"]`
+in `tests/test_seed_data.py` — both assert 103 today and will fail loudly, which
+is the intended behaviour rather than something to work around.
+
 ---
 
 ## 3. Adding revision sheets
 
 The sheets are PDFs; the bot sends the file itself, so there is nothing to host.
 
+Sheets are **per level**, so the folder you drop a PDF into is what decides who
+sees it:
+
 ```
-resources/notes/tier_a/     one broad sheet per topic        01_<Topic>.pdf
-resources/notes/tier_b/     deeper sheets on single points   B01_<Topic>.pdf
+resources/notes/<level>/tier_a/   one broad sheet per topic        01_<Topic>.pdf
+resources/notes/<level>/tier_b/   deeper sheets on single points   B01_<Topic>.pdf
+
+                         tier_a   tier_b   codes
+  preclin                     6       20   01-06      / B01-B20
+  clin                        7       40   C01-C07    / B01-B40
+  postmbbs                   15       65   A01-A15    / B01-B65
 ```
 
-To add one: name it `B21_Some_Topic.pdf` (`CODE_Name_With_Underscores.pdf`),
-commit it, and `git pull` on the server. **That is the whole process** — the
-catalogue is built by scanning the directory, so there is no code change and no
-database row.
+To add one: name it `B41_Some_Topic.pdf` (`CODE_Name_With_Underscores.pdf`), put
+it in the right level folder, commit it, and `git pull` on the server. **That is
+the whole process** — the catalogue is built by scanning the directory, so there
+is no code change and no database row.
 
-Students see the two kinds as **"Overview"** and **"Focused"** sheets. "Tier A /
-Tier B" is internal shorthand and is never shown to them.
+Two things to know before you touch this:
 
-`tests/test_resources.py` fails if a file is misnamed, missing, or if the six
-overview sheets stop matching the six question topics.
+- **Codes repeat across levels.** `B01` exists three times. Every lookup in
+  `bot/resources.py` takes a level for that reason, and a bare number like `14`
+  only matches within the student's own level. A code spelled with its letter
+  (`C01`) is taken literally, so it will not fall through to another level's `01`.
+- **The filename is the student-facing title.** `B01_Clinical_Type_B_Vision_...`
+  would have been shown as "Clinical Type B Vision ...", so that shorthand was
+  stripped when the clinical sheets were imported. Students see **"Overview"**
+  and **"Focused"**; "Tier A / Tier B" is internal and never shown.
+
+`tests/test_resources.py` fails if a file is misnamed or missing, if `B01` stops
+resolving to three different sheets, or if the preclinical and clinical overview
+sheets stop matching their question topics. Post-MBBS has eighteen question
+topics against fifteen overview sheets, so those are pinned rather than matched
+(`test_post_mbbs_sheets_do_not_line_up_with_its_topics` explains why).
 
 ---
 
@@ -197,8 +338,19 @@ sudo systemctl restart studybot
 ```
 
 **Wording** lives in two places: the credit block at the top of `bot/config.py`
-(`ACUITY_CREDIT`, `SOCIETY_CREDIT`, `DISCLAIMER`) and the feature blurb in
-`bot/handlers.py` (`FEATURES`). Editing either needs a `git pull` + restart.
+(`ACUITY_CREDIT`, `SOCIETY_CREDIT`, `DISCLAIMER`) and the `/start` screen in
+`bot/handlers.py` (`TAGLINE`, `FUNCTIONS`, and `welcome()` which assembles them).
+Editing either needs a `git pull` + restart.
+
+Two copy rules are enforced by tests, so a well-meant edit can fail CI:
+
+- **No em dashes** anywhere a student can see
+  (`tests/test_handlers.py::test_no_em_dashes_in_anything_students_see`). Use
+  `->` or a comma, as the existing copy does.
+- **Every `/command` named in the welcome must be registered**
+  (`test_welcome_only_names_commands_that_exist`). It walks the router, so
+  advertising a command that does not exist fails rather than shipping a dead
+  link for students to tap.
 
 ---
 
@@ -264,19 +416,25 @@ The redesign specified after the first release is **implemented**:
 
 | Feature | Where it lives |
 |---|---|
-| Sets of five: a shared benchmark, soft to leave, score at the end | `db.set_board` / `db.quiz_set` / `db.set_score`, `sender.send_question_for_level`, `handlers._report_set_if_finished` |
+| Sets of five: topic-diverse, adaptive, soft to leave, score at the end | `db.pick_question` / `db.current_set` / `db.last_set_score`, `sender.send_question_for_level`, `handlers._report_set_if_finished` |
 | Marker A: the running total, by topic and by question type | `db.stats`, behind `/stats` |
 | Marker B: the tournament-window score, shown as standings only | `db.tournament_mark`, surfaced by `/tournament` and `/leaderboard` |
 | Tournament auto-enrolment and an announcement to every user | `db.enrol_everyone` / `db.all_users`, `jobs.announce_tournament`, wired into `/admin_tournament_start` and `/start` |
-| `/weeklyquiz` (a set every Monday) and `/monthlynotes` (six overview sheets plus the six reserved focused ones, monthly) | `jobs.weekly_quiz`, `jobs.monthly_notes` |
-| `/quizme`, `/topicalnotes`, `/randomnotes` | handlers, with the menu in `bot/commands.py` |
-| Six focused sheets reserved for the monthly drop | `resources.MONTHLY_CODES` |
+| `/weeklyquiz` (a set every Monday) and `/subscribenotes` (the next few sheets, 1st and 15th) | `jobs.weekly_quiz`, `jobs.fortnightly_notes` |
+| Topic-diverse, adaptive question selection | `db.pick_question`, behind `sender.send_question_for_level` |
+| `/notes` as a progression, and `/review` for missed questions | `db.notes_delivered` / `db.record_notes_sent`, `db.wrong_questions` |
+| Per-student delivery history, so no sheet is ever sent twice | `note_deliveries`, `handlers._deliver` |
+
+All three question banks are loaded as of this update: Pre-Clinical 120,
+Clinical 103, Post-MBBS 170. The parser was widened to take the clinical and
+FRCOphth layouts (§2.1), and `tests/test_seed_data.py` now checks all three.
 
 Still open, and nothing here is blocked by anything else:
 
 | Open | Notes |
 |---|---|
-| **The Clinical and Post-MBBS banks** | §2. This is the main outstanding work |
+| **Content is shipped by git, not by the content team** | The biggest architectural limitation here: every question, sheet and line of copy is baked into the deploy artifact, so changing any of it is a developer task. Three incremental steps out of it, and the traps to avoid, in [§11](#11-the-content-pipeline-needs-to-stop-being-the-git-repo) |
+| **Seventeen clinical cases need their photographs** | The clinical bank is 103 of 120 cases: the rest are built around an embedded photograph the bot cannot send. Four of them probably stand alone as text and are a quick win; thirteen need `sender.send_question` to upload a figure, or a rewritten stem. The images are unmodified M3 Anki and quiz-PDF material, so the README's content policy has to be cleared first. Everything — the list, both routes, and the one-line switch — is in [§2.6](#26-the-seventeen-clinical-cases-that-are-held-back) |
 | **Dropping the old command names** | `/practice`, `/subscribe`, `/unsubscribe`, `/notes_sub`, `/notes_unsub` and `/level` still work as aliases so nothing in a student's existing chat breaks. They are the extra names on each `Command(...)` decorator |
 | **Sets are deliberately not adaptive** | A shared benchmark needs the same five questions for everyone, so per-student topic weighting was removed. The adaptive selector is in git history, at the commit before the sets landed |
 | **Nothing shows a student their question history** | Intentional for marker B: other students cannot see anyone's activity. Every answer is in `attempts` if a per-question view is ever wanted |
@@ -288,7 +446,7 @@ Still open, and nothing here is blocked by anything else:
 ```
 bot/config.py       credit block, levels, tuning, repo links
 bot/commands.py     the command menu and its per-chat scopes
-bot/handlers.py     commands and callbacks (FEATURES text is here)
+bot/handlers.py     commands and callbacks (the /start copy is here)
 bot/db.py           every SQL statement, including topic weighting and no-repeats
 bot/resources.py    the note catalogue, built by scanning resources/notes
 bot/text.py         option numbering and rendering (pure, easy to unit test)
@@ -308,12 +466,15 @@ locally.
 
 ## 9. Open questions
 
-1. **Should the Clinical and Post-MBBS banks have their own notes?** The sheets in
-   the repo are topic-based and shared across levels today.
+1. **Is six sheets per fortnightly drop the right pace?** `jobs.SHEETS_PER_DROP`
+   is one constant. At six, preclinical (26 sheets) is finished in about two
+   months and post-MBBS (80) in about seven. The reserved-six scheme it replaced
+   is gone: `note_deliveries` means nothing is ever sent twice, so there is no
+   per-level curation to do.
 2. **Is a set of five the right size?** It is one constant (`db.SET_SIZE`). A
    student clearing 120 questions walks 24 sets; if that feels long for an event,
    a bigger set is a one-line change, and progress carries over.
-3. **Should the reserved six rotate?** `resources.MONTHLY_CODES` is fixed, so the
+3. **Should the reserved sheets rotate?** `resources.MONTHLY_CODES` is fixed, so the
    same six focused sheets go out every month. If the drop should walk through the
    whole bank over several months, that becomes a rotation keyed on the month.
 
@@ -324,8 +485,92 @@ locally.
 | Thing | Who has it |
 |---|---|
 | DigitalOcean droplet + SSH key | the account holding the LKC OphSoc key |
-| Telegram bot token | @BotFather, under whoever created `@acuity123_bot` |
+| Telegram bot token | @BotFather, under whoever created `@lkceyebot` |
 | GitHub repo | [github.com/hongpenggg/acuity123-bot](https://github.com/hongpenggg/acuity123-bot) |
 
 Hand the bot token on through BotFather's transfer, not by pasting it about — and
 rotate it (`/revoke`) if it ever lands in a chat log.
+
+---
+
+## 11. The content pipeline needs to stop being the git repo
+
+**This is the biggest architectural limitation in the project, and it is worth
+fixing before the content team grows.**
+
+### What happens today
+
+Every piece of content is baked into the deploy artifact:
+
+| Content | Where it lives | To change it |
+|---|---|---|
+| Question banks | `.docx` in `resources/questions/` → `tools/build_question_seed.py` → `seeds/*.sql` | edit the .docx, regenerate, commit, `git pull` on the server, `psql -f` the seed |
+| Revision sheets | 153 PDFs in `resources/notes/<level>/tier_<a\|b>/` | commit the PDF, `git pull` on the server |
+| Bot copy | string constants in `bot/config.py` and `bot/handlers.py` | commit, `git pull`, `systemctl restart studybot` |
+
+`sender.send_note` uploads the file straight from the deployed working copy, and
+falls back to a `raw.githubusercontent.com` link built from `REPO_SLUG` /
+`REPO_REF` when a file is missing or too large.
+
+### Why that is a problem
+
+- **The content team cannot ship anything without a developer.** Writing a new
+  cheat sheet is the society's work; `git pull` on a DigitalOcean droplet is not.
+  Every sheet, every typo fix and every new question is a developer task today.
+- **Content changes need a deploy.** A question bank reload is a manual `psql`
+  against production. There is no way to preview, stage or roll back one sheet.
+- **The repo carries the payload.** It is roughly 17 MB of PDFs and `.docx`
+  already, and the clinical documents alone are 2.8 MB of embedded images for
+  seventeen questions that are not even loaded (§2.6). This only grows.
+- **The fallback links assume a public repo.** If `acuity123-bot` is ever made
+  private, every `raw.githubusercontent.com` fallback silently 404s for students,
+  and nothing in the code notices.
+- **Nothing is per-environment.** Staging and production read the same files from
+  the same commit, so there is no way to try content on a test bot first.
+
+### What "dynamic" should mean
+
+Content lives **outside** the deploy artifact, the bot reads it at runtime, and a
+non-developer can change it without a release.
+
+Three steps, smallest first, each useful on its own:
+
+1. **Cache Telegram's own `file_id`s.** The first time a sheet is uploaded,
+   Telegram returns a `file_id`; store it and resend by id instead of re-uploading
+   the bytes. Cheap, no new infrastructure, and it makes the fortnightly fan-out
+   dramatically faster. Caveat worth knowing: **`file_id`s are per bot**, so the
+   move to `@lkceyebot` invalidates any that were cached under the old token.
+   This speeds delivery up but does not solve authoring.
+
+2. **Move the catalogue into the database.** `schema.sql` already creates a
+   `notes` table with `level`, `tier`, `topic`, `title` and `body` — and
+   **nothing has ever inserted a row into it** (`bot/db.py` has
+   `note_topics`/`get_notes`/`all_notes` ready and `handlers.notes` already falls
+   through to the PDFs when it is empty). Repurpose it: swap `body` for a
+   storage URL plus the cached `file_id`, point `bot/resources.py` at the table
+   instead of `Path.glob`, and keep the directory scan only as a local-development
+   fallback. The level/tier/code model the catalogue uses now maps onto it
+   directly.
+
+3. **Let an admin upload.** `/admin_addnote` taking a Telegram document: store
+   the file in object storage (Supabase Storage is already an option in the
+   deployment appendix, and S3 or Cloudflare R2 are equivalent), write the `notes`
+   row, cache the `file_id`. At that point the society ships content by sending the
+   bot a PDF, and the repo holds code only.
+
+For the question banks the same logic applies but the generator earns its keep:
+keep `.docx` authoring and the strict parser (it is what catches a mis-lettered
+answer), but make the import something an admin triggers against the database
+rather than a `psql` command someone runs over SSH.
+
+### What to be careful about
+
+- Keep the **validation**. The reason the question pipeline is trustworthy is that
+  `tools/build_question_seed.py` refuses to emit anything it cannot account for
+  and `tests/test_seed_data.py` checks the loaded result. A dynamic upload path
+  must run the same checks, or it is a downgrade dressed up as a feature.
+- Keep a **local fallback** so the test suite and a developer laptop do not need
+  network or credentials. `tests/test_resources.py` asserts the catalogue matches
+  what is on disk; that test is cheap insurance and should survive in some form.
+- PDFs are **student-facing medical content**. Whatever replaces the repo needs
+  the same review gate the content policy describes, not a free-for-all upload.
