@@ -1,7 +1,8 @@
 """Explanation generation.
 
-The LLM only writes explanations — weakness detection stays in SQL (see
-`db._weighted_topic`), so a broken or slow provider can never block practice.
+The LLM only writes explanations. All the analysis students see (set progress,
+`/stats`) is plain SQL in `db`, so a broken or slow provider can never block
+practice or scoring.
 """
 from __future__ import annotations
 

@@ -79,7 +79,9 @@ def card_header(mode: str) -> str | None:
     return WEEKLY_HEADER if mode == "weekly" else None
 
 
-async def send_question(bot: Bot, uid: int, question, mode: str) -> bool:
+async def send_question(bot: Bot, uid: int, question, mode: str,
+                        lead: str | None = None) -> bool:
+    """Send one question card. `lead` is prepended, for the set heading."""
     if question is None:
         return await safe_send(bot, uid, "No questions loaded yet. Check back soon!")
     try:
@@ -89,20 +91,25 @@ async def send_question(bot: Bot, uid: int, question, mode: str) -> bool:
         log.exception("question %s is malformed", question.get("id"))
         return await safe_send(
             bot, uid, "That question has a problem on our side, so we skipped it. "
-                      "Tap /practice for another one.")
+                      "Tap /quizme for another one.")
+    if lead:
+        body = f"{lead}\n{body}"
     return await safe_send(bot, uid, body, parse_mode="HTML",
                            reply_markup=question_kb(question["id"], count, mode))
 
 
 async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> bool:
-    """A question at this level, or a clear explanation of why there isn't one.
+    """The next question in this student's current set of five.
 
-    Three states a student can be in, and each deserves a sentence rather than
-    silence: their level has no bank yet, they have answered everything at their
-    level correctly, or there is a question to answer.
+    Sets are fixed blocks of five in id order, so ``set 1`` is the same five
+    questions for every student: the scores are comparable, which is the point of
+    a benchmark. Because the block is fixed, a question is never repeated within a
+    run either. A student who stops halfway through a set resumes it.
+
+    Three states deserve a sentence rather than silence: their level has no bank
+    yet, they have finished every set, or there is a question to answer.
     """
     fresh, total = await db.progress(uid, level)
-
     if total == 0:
         available = await db.levels_with_questions()
         if not available:
@@ -114,20 +121,27 @@ async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> 
             f"For now you can practise {names}. Switch with /changestreams.",
         )
 
-    question = await db.pick_question(uid, level)
-    if question is None:
-        return await send_question(bot, uid, None, mode)
-
-    if fresh == 0:
-        # pick_question only reaches for repeats in this state, so say so once
-        # rather than silently serving the same questions again.
-        await safe_send(
+    current = await db.quiz_set(uid, level)
+    if current is None:
+        return await safe_send(
             bot, uid,
-            f"🏁 That's every {LEVELS.get(level, level)} question answered correctly "
-            f"({total} of them), nice. Here's one again to keep it sharp.\n"
-            "The revision sheets are in /resources.",
+            f"🏁 You have answered every one of the {total} "
+            f"{LEVELS.get(level, level)} questions. Send /stats for your breakdown, "
+            "/resources for the sheets, or /changestreams to switch level.",
         )
-    return await send_question(bot, uid, question, mode)
+
+    remaining = current["remaining"]
+    if not remaining:
+        # Unreachable: a set with nothing remaining counts as complete, and
+        # quiz_set moves on. Guarded so an odd row cannot crash the handler.
+        log.error("set %s for %s has no remaining questions", current["set_no"], uid)
+        return await safe_send(bot, uid,
+                               "I could not find your next question. Try /quizme again.")
+
+    position = current["answered"] + 1
+    lead = (f"📋 <b>Set {current['number']} of {current['total_sets']}</b> · "
+            f"question {position} of {current['size']}")
+    return await send_question(bot, uid, remaining[0], mode, lead=lead)
 
 
 async def send_note(bot: Bot, uid: int, note) -> bool:

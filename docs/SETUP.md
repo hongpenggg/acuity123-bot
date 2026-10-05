@@ -384,9 +384,9 @@ Expect a line like `polling started (tz=Asia/Singapore)`. In Telegram, message
 your bot:
 
 1. **`/start`** → the credit block, your level (Pre-Clinical), the command list.
-2. **`/practice`** → a question with five A–E buttons.
+2. **`/quizme`** → a set of five questions, options numbered 1–5.
 3. Tap an answer → ✅ or ❌ with the correct option, then **💡 Explain** and **Next**.
-4. **`/level`** → set it to Clinical. `/practice` now says the Clinical bank is
+4. **`/changestreams`** → set it to Clinical. `/quizme` now says the Clinical bank is
    still being written and tells you what *is* available. Set it back.
 5. **`/tournament`** → "No tournament is running right now." (expected — you'll
    start one in Phase 4.)
@@ -420,7 +420,7 @@ systemctl is-active studybot     # Verify: active
 journalctl -u studybot -n 20     # Verify: "polling started"
 ```
 
-Then send `/practice` in Telegram to confirm end to end.
+Then send `/quizme` in Telegram to confirm end to end.
 
 ---
 
@@ -511,12 +511,12 @@ Notes are **not** seeded yet — the 20 PDFs in `resources/` are lecture materia
 not the cheat-sheet format. `/notes` will say "No Tier B notes for Pre-Clinical
 yet" until you load some.
 
-Two tiers, per the plan:
+Two kinds, per the plan:
 
-| Tier | Meaning | Delivered |
+| Kind | Meaning | Delivered |
 |---|---|---|
-| **A** | High-yield | Pushed fortnightly to `/notes_sub` subscribers |
-| **B** | Low-yield niche | On demand, `/notes <topic>` |
+| **Overview** | One broad sheet per topic (`01`–`06`) | `/topicalnotes` on demand, and all six in the monthly drop |
+| **Focused** | Deeper on a single point (`B01`–`B20`) | `/randomnotes` on demand; six are reserved for the monthly drop |
 
 Both are per-level. Add them like this:
 
@@ -541,30 +541,38 @@ sheet can be one row. To check what a level has:
 psql "$DATABASE_URL" -c "select level, tier, topic, count(*) from notes group by 1,2,3 order by 1,2,3;"
 ```
 
-### 4.5 Adaptive practice
+### 4.5 Sets of five
 
-Behaviour is in `db.pick_question` / `db._weighted_topic`. Two knobs in `.env`:
+Progress is measured in sets of five. The sets are **consecutive blocks of five
+questions in id order** (`db.SET_SIZE`), so set 1 is the same five questions for
+every student and the scores are comparable. Nothing about the sets is stored:
+`db.set_board` derives how far a student has got from the `attempts` table, which
+is why there is no session state to go stale and why a student who stops halfway
+through a set resumes it.
 
-- `MIN_ATTEMPTS_FOR_ADAPTIVE` (default `10`) — answers before weighting starts.
-  Below this, topics are chosen uniformly.
-- `WEIGHT_FLOOR` (default `0.15`) — the floor on a topic's error rate, so a topic
-  the student has mastered still reappears occasionally instead of never.
+The numbers are all in `bot/db.py`: `set_board`, `quiz_set`, `set_no_for`,
+`set_score` (progress and scoring) and `stats` (marker A, the per-topic and
+per-question-type breakdown behind `/stats`).
 
-Roughly: a topic's chance is proportional to its smoothed error rate. After
-enough answers the weighting is per-level and per-topic.
+**Changing the set size** is one constant (`db.SET_SIZE`). It takes effect on the
+next answer: existing attempts simply fall into the new blocks, so nobody's
+progress is lost.
 
-**Tune it if:** students report seeing nothing but their weakest topic (raise
-`WEIGHT_FLOOR`), or that it doesn't feel adaptive (lower
-`MIN_ATTEMPTS_FOR_ADAPTIVE`). Then
-`sudo systemctl restart studybot`.
+### 4.6 Weekly quiz and monthly sheets
 
-### 4.6 Weekly question
+`weekly_quiz` fires **Mondays 09:00** (server timezone, Asia/Singapore from Phase
+1.3) and sends each subscriber the rest of their current set, so a student who
+stopped mid-set gets the remainder rather than a fresh five. Answers to the
+Monday set use the `weekly` mode and **do not score for the tournament**, which is
+what stops the push from becoming a leaderboard farm.
 
-Fires **Mondays 09:00** (server timezone, set to Asia/Singapore in Phase 1.3).
-One topic per week, rotating through all topics by ISO week number, one question
-per subscriber, same topic for everyone at a given level.
+`monthly_notes` fires on the **1st at 10:00** and sends all six overview sheets
+plus the six reserved focused ones, as PDFs.
 
-`/subscribe` and `/unsubscribe` control it. To test without waiting for Monday:
+Both can be fired on demand with `/admin_weekly_now` and `/admin_notes_now`.
+
+`/weeklyquiz` and `/stopweekly` control the Monday set; `/monthlynotes` and
+`/stopmonthly` control the sheets. To test without waiting for the schedule:
 
 ```
 /admin_weekly_now
@@ -574,15 +582,19 @@ Job settings live in `jobs.register`: `misfire_grace_time=3600` — APScheduler'
 1-second default would silently skip the push if the process happened to be
 restarting at 09:00.
 
-### 4.7 Fortnightly notes
+### 4.7 Monthly sheets
 
-Fires **Mondays 10:00 on odd ISO weeks** — genuinely fortnightly, except across a
-53-week year where you get a one-week gap. `/notes_sub` and `/notes_unsub`
-control it; `/admin_notes_now` fires it on demand.
+Fires on the **1st at 10:00**. Sends all six overview sheets plus the six focused
+sheets reserved for the drop (`resources.MONTHLY_CODES`), as PDFs.
+`/monthlynotes` and `/stopmonthly` control it; `/admin_notes_now` fires it on
+demand.
+
+`/randomnotes` deliberately draws from the *other* fourteen focused sheets, so a
+student cannot be handed the monthly bundle at random before it goes out.
 
 ### 4.8 The tournament
 
-Two weeks, admin-controlled, opt-in.
+Two weeks, admin-controlled, and **entry is automatic**.
 
 **Start it:**
 
@@ -590,12 +602,14 @@ Two weeks, admin-controlled, opt-in.
 /admin_tournament_start
 ```
 
-**Students join** with `/tournament` (the same command leaves again).
+**Students do not join.** Everyone active is entered automatically when the
+tournament opens, and anyone who sends `/start` while it runs is entered then, so
+`/tournament` only reports the status. There is nothing to opt in or out of.
 
-**Scoring:** every correct `/practice` answer earns **one point, once per
-question**. `pick_question` eventually re-serves a topic a student has cleared, so
-without that rule the leaderboard would be farmable — the `tournament_answers`
-table enforces it in SQL.
+**Scoring:** every correct `/quizme` answer earns **one point, once per question**.
+The `mode` on each attempt decides this, so the Monday set (`weekly`) contributes
+nothing; the `tournament_answers` table enforces the once-per-question rule in SQL
+so re-answering a known question cannot farm the board.
 
 **Standings:** `/leaderboard` shows the top 3 to everyone with the last two
 characters of each username hidden, plus the caller's own rank. Admins get the
@@ -725,7 +739,7 @@ uncapped key is the classic way to wake up to a bill.
 | `TelegramConflictError: terminated by other getUpdates request` | Two processes polling one token. `systemctl status studybot`; don't also run it on your laptop |
 | Bot silent, service `active` | Almost always the DB. `journalctl -u studybot -n 50`; check `psql "$DATABASE_URL" -c 'select 1'` |
 | `password authentication failed for user "studybot"` | `.env` password doesn't match the role. Reset: `sudo -u postgres psql -c "alter role studybot password 'NEW';"` |
-| `/practice` says no questions for your level | Correct behaviour — that bank isn't loaded. `/level` switches back |
+| `/quizme` says no questions for your level | Correct behaviour — that bank isn't loaded. `/changestreams` switches back |
 | `/notes` finds nothing | No notes loaded for that level/tier yet. See 4.4 |
 | A student taps an answer and the spinner hangs | Shouldn't happen — every callback path answers. Check `journalctl -u studybot -p err` and report it |
 | Answer button says "Already answered" | That message was already scored. Tap **Next** for a new question |
@@ -751,7 +765,7 @@ sudo -u postgres ls -la /var/backups/studybot | tail -3
 Then, in Telegram:
 
 - [ ] `/start` on a phone you have never used — the credit block and `/level` show
-- [ ] `/practice` → answer → 💡 Explain works
+- [ ] `/quizme` → answer a full set of five → the score lands → 💡 Explain works
 - [ ] `/level` → Clinical → the honest "still being written" message
 - [ ] `/subscribe` → `/admin_weekly_now` → the question arrives
 - [ ] `/admin_tournament_start` → `/tournament` → `/leaderboard` shows you

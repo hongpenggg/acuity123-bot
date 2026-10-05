@@ -36,19 +36,24 @@ Built by the **Acuity Team** — Zhong Han, Hongpeng, Rahul, Jeromy.
 
 | Area | Behaviour |
 |---|---|
-| `/practice` | A question at the student's tier, options numbered 1–5, each with a written explanation |
-| No repeats | A question answered **correctly** is retired for that student, so they work through the bank. Wrong answers come back until they land, and when a tier is cleared the bot says so instead of repeating silently |
-| Adaptive weighting | After 10 answers, topics are chosen in proportion to the student's error rate, with a floor so a mastered topic still resurfaces |
-| `/resources` | The revision sheets, sent as **real PDF files** in the chat — browsable, or by code (`/resources b14`) |
-| `/changestreams` | Pre-Clinical / Clinical / Post-MBBS — questions *and* notes follow it, changeable any time |
-| `/subscribe` | A question every Monday, one topic per week, rotating through all topics |
-| `/notes`, `/notes_sub` | Notes on demand by topic; the overview sheets pushed fortnightly |
-| Tournament | An admin switches it on for 2 weeks; correct answers score **once per question**; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
-| 💡 Explain | Serves the written explanation stored with the question — the LLM is only a fallback and is optional |
-| Menu | Telegram keeps a command list per chat. The default shows only `/start`; sending `/start` sets that chat's full menu, which is what makes `/practice` and the rest appear |
+| `/quizme` | A **set of five** questions, options numbered 1–5. The set is a fixed block of five in id order, so every student's set 1 is the same five questions: the scores mean the same thing for everyone. The score is reported when the fifth is answered |
+| Sets, softly | Stop whenever you like; the set resumes where you left off. The blocks are derived from the database rather than stored, so there is no session state to go stale |
+| `/stats` | Marker A: the running total, then accuracy broken down by **topic** and by **question type** (`questions.tag`), weakest first |
+| `/topicalnotes` | An overview sheet, one per topic, sent as a real PDF |
+| `/randomnotes` | A focused sheet at random, excluding the six the monthly drop holds back |
+| `/resources` | Browse every sheet, or fetch one by code (`/resources b14`) |
+| `/changestreams` | Pre-Clinical / Clinical / Post-MBBS. Questions *and* sheets follow it |
+| `/weeklyquiz` | The Monday set of five. Deliberately does **not** score for the tournament |
+| `/monthlynotes` | On the 1st: all six overview sheets plus the six reserved focused ones, as PDFs |
+| Tournament | An admin switches it on and **everyone who has used `/start` is entered automatically**; only `/quizme` scores, once per question; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
+| Marker B | Tournament points, shown as standings only. Question and activity counts are never shown to students |
+| 💡 Explain | Serves the written explanation stored with the question; the LLM is only a fallback and is optional |
+| Menu | Telegram keeps a command list per chat. The default shows only `/start`; sending `/start` sets that chat's full menu, which is what makes `/quizme` and the rest appear |
 
-Weakness detection is plain SQL (per-topic accuracy), so a slow or missing LLM
-provider can never block practice.
+Fixed sets replaced per-student adaptive weighting. The point of a benchmark is
+that everyone answers the same five questions, so the scores are comparable; the
+adaptive selector is in git history (the commit before the sets landed) if that
+trade-off is ever worth revisiting.
 
 ## Revision notes
 
@@ -72,6 +77,13 @@ around, so a rename on either side fails CI.
 
 To students these are "Overview" and "Focused" sheets, never "Tier A" and
 "Tier B" — that is internal shorthand for the content team.
+
+**Six focused sheets are reserved for the monthly drop** (`resources.MONTHLY_CODES`
+— one per overview topic). `/monthlynotes` sends all six overview sheets plus
+those six; `/randomnotes` draws from the other fourteen, so the monthly bundle is
+not made up of sheets students have already been handed at random.
+`/topicalnotes` is the overview picker. Only the code list is in the repo, so
+changing which six are reserved is a one-line edit.
 
 ## The question bank
 
@@ -148,15 +160,20 @@ Everything comes from the environment; nothing needs editing to deploy.
 | `LLM_API_KEY` | no | **Leave blank for zero LLM spend** |
 | `LLM_MODEL` | no | Set together with the key to enable generation |
 | `BOT_TZ` | no | Display/schedule timezone, defaults to `Asia/Singapore` |
-| `MIN_ATTEMPTS_FOR_ADAPTIVE` | no | Answers before weighting kicks in, default `10` |
-| `WEIGHT_FLOOR` | no | Error-rate floor, default `0.15` |
+| `REPO_SLUG`, `REPO_REF` | no | Which repo the fallback sheet links point at — set these if you fork |
 
 ## Commands
 
-**Students** — `/start` `/help` `/practice` `/level` `/subscribe` `/unsubscribe`
-`/resources` `/notes` `/notes_sub` `/notes_unsub` `/tournament` `/leaderboard`
+**Students** — `/start` `/help` `/quizme` `/stats` `/topicalnotes` `/randomnotes`
+`/resources` `/changestreams` `/weeklyquiz` `/stopweekly` `/monthlynotes`
+`/stopmonthly` `/tournament` `/leaderboard`
 
-`/level` still works as an alias for `/changestreams`.
+Older names still work as aliases, so nothing already sitting in a student's chat
+breaks:
+
+`/practice` = `/quizme` · `/subscribe` = `/weeklyquiz` · `/unsubscribe` =
+`/stopweekly` · `/notes_sub` = `/monthlynotes` · `/notes_unsub` = `/stopmonthly` ·
+`/level` = `/changestreams`
 
 **Admins** (`ADMIN_IDS`) — `/admin_tournament_start` `/admin_tournament_end`
 `/admin_weekly_now` `/admin_notes_now`
@@ -176,7 +193,7 @@ bot/
   db.py        every SQL statement
   llm.py       explanation fallback (optional)
   handlers.py  commands and callbacks
-  jobs.py      weekly / fortnightly / tournament-close cron entries
+  jobs.py      weekly quiz / monthly sheets / tournament-close cron entries
   main.py      wiring, error handler, graceful shutdown
 schema.sql                 structure only, nothing seeded
 migrations/                upgrade path for an existing database
@@ -196,8 +213,8 @@ Three design choices worth knowing:
 - **Every callback path answers its callback**, or the user's client spins
   forever. There is a `dp.errors` handler as a backstop.
 - **Tournament points are deduplicated in SQL** (`tournament_answers`), because
-  `pick_question` eventually re-serves a cleared topic and would otherwise let
-  students farm the leaderboard.
+  a student could otherwise re-answer a question they already know to farm the
+  leaderboard. Only `practice` scores, so the Monday set cannot be used either.
 
 ## Development
 

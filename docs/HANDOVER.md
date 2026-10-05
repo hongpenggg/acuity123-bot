@@ -21,10 +21,12 @@ Database      PostgreSQL on the same box — role `studybot` owns db `studybot`
 Backups       nightly pg_dump 17:04 into /var/backups/studybot (14-day rotation)
 ```
 
-Working now: `/start`, `/practice` (options numbered 1–5, no repeats once you get
-one right), `/resources` (the revision sheets, as PDFs), `/changestreams`,
-`/subscribe`, `/tournament`, `/leaderboard`, `/notes`, `/notes_sub`, and the four
-`/admin_*` commands.
+Working now: `/quizme` (a set of five, options numbered 1–5, score at the end),
+`/stats`, `/topicalnotes`, `/randomnotes`, `/resources` (the sheets, as PDFs),
+`/changestreams`, `/weeklyquiz`, `/monthlynotes`, `/stopweekly`, `/stopmonthly`,
+`/tournament`, `/leaderboard`, and the four `/admin_*` commands. The older names
+(`/practice`, `/subscribe`, `/notes_sub`, `/level` and so on) still work as
+aliases.
 
 Only IDs in `ADMIN_IDS` can run admin commands.
 
@@ -140,7 +142,7 @@ safe — it will tell you the bank is already present rather than duplicating it
 psql "$DATABASE_URL" -c "select level, count(*) from questions group by level order by level;"
 ```
 
-Then in Telegram: `/changestreams` → Clinical → `/practice`, and a Clinical
+Then in Telegram: `/changestreams` → Clinical → `/quizme`, and a Clinical
 question should arrive. The "that bank is still being written" message disappears
 by itself once the tier has questions.
 
@@ -183,8 +185,9 @@ needs editing to deploy.
 | `ADMIN_IDS` | comma-separated numeric Telegram IDs allowed to run `/admin_*` |
 | `LLM_API_KEY`, `LLM_MODEL` | **leave blank.** Every question ships with a written explanation, so the bot never calls a provider. Setting both enables generation for any question that has none |
 | `BOT_TZ` | display/schedule timezone, `Asia/Singapore` |
-| `MIN_ATTEMPTS_FOR_ADAPTIVE` | answers before topic weighting starts (default 10) |
-| `WEIGHT_FLOOR` | floor on a topic's error rate (default 0.15) |
+
+Quiz behaviour is not configured by env any more: sets of five are fixed blocks in
+question-id order, controlled by `db.SET_SIZE`. See `docs/SETUP.md` §4.5.
 
 **Who is an admin** is the one thing people usually want to change. Add the numeric
 ID (not the `@username` — get it from @userinfobot), then restart:
@@ -232,41 +235,51 @@ sudo -u postgres ls -la /var/backups/studybot | tail -3
 
 ## 6. Tournament day
 
-```
-/admin_tournament_start      # 2 weeks; students opt in with /tournament
+```bash
+/admin_tournament_start      # 2 weeks. Enters everyone and announces it
 /leaderboard                 # top 3, masked, plus the caller's own rank
 /admin_tournament_end        # announces winners and sends you the full table
 ```
 
-Correct `/practice` answers score **once per question**, so the board cannot be
-farmed by repeating an easy question. Ties break by join order.
+**Entry is automatic.** `/admin_tournament_start` adds every active user to the
+tournament and announces it to all of them, so a student never has to opt in to a
+competition they are already answering questions for. Anyone who sends `/start`
+while a tournament is running is entered too.
 
-Winners are told to contact the society for their award — keep the admin table the
-closing command sends you, since it is the only place with real usernames and
-Telegram IDs.
+Only `/quizme` scores, and **once per question**, so the board cannot be farmed by
+repeating an easy question and the Monday set cannot be used to climb it. Ties
+break by join order.
+
+Winners are told to contact the LKC OphSoc EXCO at `@lkceye` for their award. Keep
+the admin table the closing command sends you: it is the only place with real
+usernames and Telegram IDs.
 
 Checklist the day before is in `docs/SETUP.md` §5.7.
 
 ---
 
-## 7. Not built yet
+## 7. What was built, and what is still open
 
-These were requested but are **not implemented**. They are listed so the next
-person does not assume they exist.
+The redesign specified after the first release is **implemented**:
 
-| Wanted | Notes for whoever builds it |
+| Feature | Where it lives |
 |---|---|
-| **Practice in sets of 5**, with the score for the set, then a running total | Today `/practice` serves one question at a time. A set needs per-set state (which of the 5 are answered) — either a `sets` table or a session keyed on the message ids |
-| **Marker A: long-run tracking** of how many are correct and of what *kind*, by topic and tag | `attempts` already stores `level`, `topic`, `correct` per answer, so this is a reporting query plus a `/stats` command. `questions.tag` is stored and currently unused |
-| **Marker B: a tournament-window count**, shown on top of Marker A | The tournament tables already score only during the window. Surfacing it as a separate counter, and hiding question counts from students, is the remaining work |
-| **Tournament auto-enrolment** — admin switches it on and everyone is in | Today students opt in with `/tournament`. Auto-entry means inserting membership rows for every active user on start, plus an announcement to all chats (mind Telegram's rate limit — `jobs.FANOUT_PAUSE` already exists for this) |
-| **Announce the tournament to all users** when it starts | Needs an "all active users" query; `db.subscribers(flag)` is the existing pattern |
-| **Subscription shape**: `/weeklyquiz` (a set of 5, weekly) and `/monthlynotes` (overview sheets + a few focused ones, monthly) | Today it is one question weekly and the overview sheets fortnightly. The cadence is a one-line change in `jobs.register`; the weekly *set* depends on the set-of-5 work above |
-| **`/quizme`, `/topicalnotes`, `/randomnotes`** as the command names | `/resources` is the current entry point. Renaming is a menu change in `bot/commands.py` plus handler decorators |
-| **A `/randomnotes` that excludes some sheets** | The intent was "a random focused sheet, excluding the ones the monthly push sends". Which sheets are reserved needs deciding — see the open question in §9 |
+| Sets of five: a shared benchmark, soft to leave, score at the end | `db.set_board` / `db.quiz_set` / `db.set_score`, `sender.send_question_for_level`, `handlers._report_set_if_finished` |
+| Marker A: the running total, by topic and by question type | `db.stats`, behind `/stats` |
+| Marker B: the tournament-window score, shown as standings only | `db.tournament_mark`, surfaced by `/tournament` and `/leaderboard` |
+| Tournament auto-enrolment and an announcement to every user | `db.enrol_everyone` / `db.all_users`, `jobs.announce_tournament`, wired into `/admin_tournament_start` and `/start` |
+| `/weeklyquiz` (a set every Monday) and `/monthlynotes` (six overview sheets plus the six reserved focused ones, monthly) | `jobs.weekly_quiz`, `jobs.monthly_notes` |
+| `/quizme`, `/topicalnotes`, `/randomnotes` | handlers, with the menu in `bot/commands.py` |
+| Six focused sheets reserved for the monthly drop | `resources.MONTHLY_CODES` |
 
-Nothing above is blocked by the others except the subscriptions, which need the
-sets-of-5 work first.
+Still open, and nothing here is blocked by anything else:
+
+| Open | Notes |
+|---|---|
+| **The Clinical and Post-MBBS banks** | §2. This is the main outstanding work |
+| **Dropping the old command names** | `/practice`, `/subscribe`, `/unsubscribe`, `/notes_sub`, `/notes_unsub` and `/level` still work as aliases so nothing in a student's existing chat breaks. They are the extra names on each `Command(...)` decorator |
+| **Sets are deliberately not adaptive** | A shared benchmark needs the same five questions for everyone, so per-student topic weighting was removed. The adaptive selector is in git history, at the commit before the sets landed |
+| **Nothing shows a student their question history** | Intentional for marker B: other students cannot see anyone's activity. Every answer is in `attempts` if a per-question view is ever wanted |
 
 ---
 
@@ -295,15 +308,14 @@ locally.
 
 ## 9. Open questions
 
-1. **Which sheets does `/randomnotes` exclude?** The spec said "a random focused
-   sheet, excluding the six that the monthly push sends". If the monthly push sends
-   a fixed six, that list needs naming.
-2. **Does practice ever repeat a cleared question?** Today: no, until the whole
-   tier is answered correctly, and then the bot says so and serves the
-   least-repeated one. If revision-by-repetition is wanted instead, that is one
-   query in `bot/db.py`.
-3. **Should the Clinical and Post-MBBS banks have their own notes?** The sheets in
-   the repo are topic-based and shared across tiers today.
+1. **Should the Clinical and Post-MBBS banks have their own notes?** The sheets in
+   the repo are topic-based and shared across levels today.
+2. **Is a set of five the right size?** It is one constant (`db.SET_SIZE`). A
+   student clearing 120 questions walks 24 sets; if that feels long for an event,
+   a bigger set is a one-line change, and progress carries over.
+3. **Should the reserved six rotate?** `resources.MONTHLY_CODES` is fixed, so the
+   same six focused sheets go out every month. If the drop should walk through the
+   whole bank over several months, that becomes a rotation keyed on the month.
 
 ---
 

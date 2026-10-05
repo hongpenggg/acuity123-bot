@@ -4,8 +4,13 @@ Two *kinds* of sheet. The folders and code names are the content team's
 ("tier_a" / "tier_b", ``01``-``06`` / ``B01``-``B20``), but students are never
 shown "Tier A" or "Tier B" - they see what the sheet actually is:
 
-* **Overview** - one broad sheet per topic (``01``-``06``). The fortnightly push.
-* **Focused** - a deeper sheet on a single point (``B01``-``B20``), on demand.
+* **Overview** - one broad sheet per topic (``01``-``06``).
+* **Focused** - a deeper sheet on a single point (``B01``-``B20``).
+
+The monthly drop sends the six overview sheets plus six focused sheets that are
+reserved for it (:data:`MONTHLY_CODES`, one per overview topic). ``/randomnotes``
+draws from the *rest* of the focused sheets, so the monthly bundle is not made up
+of things students have already been handed at random.
 
 The catalogue is built by **scanning the directory**, not hard-coded, so adding a
 note is: drop the PDF in, commit it. No code change, no database row. A test
@@ -19,6 +24,7 @@ to a GitHub link instead - see ``sender.send_note``.
 """
 from __future__ import annotations
 
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +107,24 @@ ALL: list[Note] = TIER_A + TIER_B
 
 #: Tier A topics are the same six topics the question bank is built around.
 TIER_A_TOPICS: list[str] = [note.topic for note in TIER_A]
+
+#: The focused sheets held back for the monthly drop: one per overview topic, so
+#: the bundle reads as a complete pass over the course rather than a random grab.
+MONTHLY_CODES: tuple[str, ...] = ("B02", "B05", "B08", "B13", "B15", "B17")
+
+#: What `/monthlynotes` sends, in code order.
+MONTHLY: list[Note] = [note for note in TIER_B if note.code in MONTHLY_CODES]
+
+#: What `/randomnotes` draws from: every focused sheet the monthly drop does not.
+RANDOM_POOL: list[Note] = [note for note in TIER_B
+                           if note.code not in MONTHLY_CODES]
+
+
+def random_focused(rng: random.Random | None = None) -> Note | None:
+    """One focused sheet, excluding the ones reserved for the monthly drop."""
+    if not RANDOM_POOL:
+        return None
+    return (rng or random).choice(RANDOM_POOL)
 
 
 def tier(code: str) -> list[Note]:

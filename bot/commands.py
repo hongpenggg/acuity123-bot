@@ -6,7 +6,7 @@ Telegram keeps a command list per *scope*. Two consequences shape this module:
   /help - because a stranger has nothing to practise with until the bot has
   recorded them.
 * Sending /start sets a **chat-scoped** list for that user with everything on it.
-  That is what makes the menu fill up with /practice and friends instead of
+  That is what makes the menu fill up with /quizme and friends instead of
   sitting on /start. Telegram caches the menu per chat, so this also refreshes a
   client that is still showing a stale list.
 
@@ -29,16 +29,18 @@ BEFORE_START = [
 
 #: The student-facing menu, set for a chat once they send /start.
 PUBLIC = [
-    BotCommand(command="practice", description="Adaptive practice question"),
+    BotCommand(command="quizme", description="A set of five questions"),
+    BotCommand(command="stats", description="Your scores and weak topics"),
+    BotCommand(command="topicalnotes", description="Overview sheet by topic"),
+    BotCommand(command="randomnotes", description="A focused sheet, at random"),
     BotCommand(command="resources", description="Revision sheets as PDFs"),
     BotCommand(command="changestreams", description="Pre-Clinical / Clinical / Post-MBBS"),
-    BotCommand(command="tournament", description="Join or leave the tournament"),
+    BotCommand(command="weeklyquiz", description="A set of five every Monday"),
+    BotCommand(command="stopweekly", description="Stop the Monday set"),
+    BotCommand(command="monthlynotes", description="The monthly sheet drop"),
+    BotCommand(command="stopmonthly", description="Stop the monthly sheets"),
     BotCommand(command="leaderboard", description="Top 3 and your rank"),
-    BotCommand(command="subscribe", description="A question every Monday"),
-    BotCommand(command="unsubscribe", description="Stop the weekly question"),
-    BotCommand(command="notes", description="Notes by topic, on demand"),
-    BotCommand(command="notes_sub", description="Tier A notes, fortnightly"),
-    BotCommand(command="notes_unsub", description="Stop the fortnightly notes"),
+    BotCommand(command="tournament", description="Tournament status"),
     BotCommand(command="help", description="What this bot can do"),
 ]
 
@@ -46,8 +48,8 @@ PUBLIC = [
 ADMIN = [
     BotCommand(command="admin_tournament_start", description="Start a tournament"),
     BotCommand(command="admin_tournament_end", description="Close it and announce winners"),
-    BotCommand(command="admin_weekly_now", description="Send this week's question now"),
-    BotCommand(command="admin_notes_now", description="Send the Tier A notes now"),
+    BotCommand(command="admin_weekly_now", description="Send the Monday sets now"),
+    BotCommand(command="admin_notes_now", description="Send the monthly sheets now"),
 ]
 
 
