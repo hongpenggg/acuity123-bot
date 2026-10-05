@@ -173,6 +173,22 @@ async def test_same_message_id_from_two_users_both_count(pool):
     assert await db.record_attempt(2, q, 0, True, "practice", 500) is True
 
 
+async def test_practice_streak_counts_back_to_the_last_miss(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    q = await db.get_question(await add_question(db))
+    assert await db.practice_streak(1) == 0
+
+    results = [True, False, True, True, True]
+    for msg_id, correct in enumerate(results, start=600):
+        await db.record_attempt(1, q, 0, correct, "practice", msg_id)
+    # Weekly answers don't break or extend a practice streak.
+    await db.record_attempt(1, q, 1, False, "weekly", 700)
+
+    assert await db.practice_streak(1) == 3
+
+
 # ------------------------------------------------------------- tournament
 
 

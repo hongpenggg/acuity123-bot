@@ -54,8 +54,8 @@ async def fortnightly_notes(bot) -> int:
             continue
         await safe_send(
             bot, uid,
-            f"📘 Tier A cheat sheets — {LEVELS[level]}\n"
-            f"{len(notes)} topic(s) this fortnight:",
+            f"📘 Your {LEVELS[level]} cheat sheets for this fortnight "
+            f"({len(notes)} topic{'s' if len(notes) != 1 else ''}):",
         )
         await asyncio.sleep(FANOUT_PAUSE)
         for note in notes:
@@ -80,17 +80,17 @@ async def finish_tournament(bot, tid: int) -> list:
     for row in rows[:3]:
         await safe_send(
             bot, row["user_id"],
-            f"🏆 The tournament has closed — you finished #{row['rk']} with "
-            f"{row['points']} points!\n\nMessage LKC OphSoc to claim your reward. 🎉",
+            f"🏆 The tournament's over and you finished #{row['rk']} with "
+            f"{row['points']} points! 🎉\n\nMessage LKC OphSoc to claim your prize.",
         )
         await asyncio.sleep(FANOUT_PAUSE)
 
     table = "\n".join(
-        f"{r['rk']}. @{r['username'] or '—'} (id {r['user_id']}) — {r['points']} pts"
+        f"{r['rk']}. @{r['username'] or '(no username)'} (id {r['user_id']}): {r['points']} pts"
         for r in rows[:10]
     ) or "no participants"
     for admin in sorted(ADMIN_IDS):
-        await safe_send(bot, admin, f"Tournament {tid} closed.\nFinal standings:\n{table}")
+        await safe_send(bot, admin, f"🏁 Tournament {tid} closed. Final standings:\n\n{table}")
         await asyncio.sleep(FANOUT_PAUSE)
 
     log.info("tournament %s closed with %s participant(s)", tid, len(rows))

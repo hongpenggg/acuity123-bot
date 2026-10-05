@@ -14,12 +14,13 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from . import db
 from .config import LEVELS
-from .text import TELEGRAM_LIMIT, chunks, letter, render
+from .text import MAX_OPTIONS, TELEGRAM_LIMIT, WEEKLY_HEADER, chunks, letter, render
 
 log = logging.getLogger(__name__)
 
 _SEND_ATTEMPTS = 3
-_BUTTONS_PER_ROW = 4
+# One row of letters: five A-E buttons on a 4-wide grid left E stranded alone.
+_BUTTONS_PER_ROW = MAX_OPTIONS
 
 
 async def _send_once(bot: Bot, uid: int, text: str, **kw) -> bool:
@@ -28,7 +29,7 @@ async def _send_once(bot: Bot, uid: int, text: str, **kw) -> bool:
             await bot.send_message(uid, text, **kw)
             return True
         except TelegramForbiddenError:
-            # Blocked the bot or deleted the chat — stop trying, forever.
+            # Blocked the bot or deleted the chat: stop trying, forever.
             await db.deactivate(uid)
             return False
         except TelegramRetryAfter as exc:
@@ -72,16 +73,23 @@ def question_kb(qid: int, count: int, mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def card_header(mode: str) -> str | None:
+    return WEEKLY_HEADER if mode == "weekly" else None
+
+
 async def send_question(bot: Bot, uid: int, question, mode: str) -> bool:
     if question is None:
-        return await safe_send(bot, uid, "No questions available yet — check back soon.")
+        return await safe_send(bot, uid, "No questions loaded yet. Check back soon!")
     try:
-        body, count = render(question)
+        body, count = render(question, header=card_header(mode))
     except ValueError:
         # Malformed row (wrong number of options). Report it instead of crashing.
         log.exception("question %s is malformed", question.get("id"))
-        return await safe_send(bot, uid, "That question is mis-configured — skipping it.")
-    return await safe_send(bot, uid, body, reply_markup=question_kb(question["id"], count, mode))
+        return await safe_send(
+            bot, uid, "That question has a problem on our side, so we skipped it. "
+                      "Tap /practice for another one.")
+    return await safe_send(bot, uid, body, parse_mode="HTML",
+                           reply_markup=question_kb(question["id"], count, mode))
 
 
 async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> bool:
@@ -99,11 +107,11 @@ async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> 
     if not available:
         return await send_question(bot, uid, None, mode)
 
-    names = ", ".join(LEVELS.get(name, name) for name in available)
+    names = " and ".join(LEVELS.get(name, name) for name in available)
     return await safe_send(
         bot, uid,
-        f"No {LEVELS.get(level, level)} questions yet — that bank is still being "
-        f"written.\nAvailable now: {names}.\nSwitch with /level.",
+        f"🚧 No {LEVELS.get(level, level)} questions yet, we're still writing them.\n\n"
+        f"For now you can practise {names}. Switch with /level.",
     )
 
 
@@ -111,7 +119,7 @@ async def ack(c: CallbackQuery, text: str | None = None, alert: bool = False) ->
     """Close the client-side spinner on a callback query.
 
     Every callback path must call this exactly once or the user's Telegram client
-    spins forever. Answering twice, or after the query expired, raises — so this
+    spins forever. Answering twice, or after the query expired, raises, so this
     must never propagate.
     """
     try:
@@ -120,33 +128,71 @@ async def ack(c: CallbackQuery, text: str | None = None, alert: bool = False) ->
         log.debug("callback answer failed", exc_info=True)
 
 
+async def edit_in_place(message, text: str,
+                        keyboard: InlineKeyboardMarkup | None) -> bool:
+    """Edit a card's HTML text and buttons. False if Telegram refused the edit."""
+    try:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return True
+    except Exception as exc:
+        log.info("edit of message %s failed (%s)",
+                 getattr(message, "message_id", "?"), exc)
+        return False
+
+
 async def deliver_verdict(c: CallbackQuery, text: str, keyboard: InlineKeyboardMarkup) -> None:
     """Replace the question message with the scored version.
 
     Telegram refuses edits more than 48 hours after the message was sent, which a
-    Monday weekly question answered on Thursday hits — and a double tap whose text
+    Monday weekly question answered on Thursday hits, and a double tap whose text
     is unchanged raises too. Falling back to a new message means the user always
     sees their result, instead of the attempt being recorded invisibly.
     """
     message = getattr(c, "message", None)
     if message is None:
         return
-    try:
-        await message.edit_text(text, reply_markup=keyboard)
+    if await edit_in_place(message, text, keyboard):
         return
-    except Exception as exc:
-        log.info("edit of message %s failed (%s); sending a new message",
-                 getattr(message, "message_id", "?"), exc)
     try:
-        await message.answer(text, reply_markup=keyboard)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
     except Exception:
         log.exception("could not deliver verdict for message %s",
                       getattr(message, "message_id", "?"))
 
 
+def remaining_buttons(message, drop) -> InlineKeyboardMarkup | None:
+    """The message's current keyboard minus every button `drop(data)` matches.
+
+    Read from the message itself, so the bot needs no record of which buttons a
+    card still shows. None when nothing is left.
+    """
+    markup = getattr(message, "reply_markup", None)
+    if markup is None:
+        return None
+    rows = [[b for b in row if not drop(b.callback_data or "")]
+            for row in markup.inline_keyboard]
+    rows = [row for row in rows if row]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def drop_buttons(message, drop) -> None:
+    """Remove used buttons from an old card so the chat doesn't fill up with
+    stale Next buttons. Purely cosmetic: failures are ignored."""
+    if message is None or getattr(message, "reply_markup", None) is None:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=remaining_buttons(message, drop))
+    except Exception:
+        log.debug("could not trim buttons", exc_info=True)
+
+
 __all__ = [
     "ack",
+    "card_header",
     "deliver_verdict",
+    "drop_buttons",
+    "edit_in_place",
+    "remaining_buttons",
     "question_kb",
     "safe_send",
     "send_question",

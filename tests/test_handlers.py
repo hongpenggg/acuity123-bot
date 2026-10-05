@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot import db as real_db
 from bot import handlers, jobs
@@ -30,17 +31,28 @@ class FakeBot:
 
 
 class FakeMessage:
-    def __init__(self, text="Question body", message_id=10, fail_edit=False):
+    def __init__(self, text="Question body", message_id=10, fail_edit=False,
+                 reply_markup=None):
         self.text = text
         self.message_id = message_id
         self.fail_edit = fail_edit
+        self.reply_markup = reply_markup
         self.edits = []
+        self.markup_edits = []
         self.replies = []
+
+    @property
+    def html_text(self):
+        return self.text
 
     async def edit_text(self, text, **kw):
         if self.fail_edit:
             raise TelegramBadRequest(SimpleNamespace(), "message can't be edited")
         self.edits.append({"text": text, **kw})
+        return True
+
+    async def edit_reply_markup(self, reply_markup=None, **kw):
+        self.markup_edits.append(reply_markup)
         return True
 
     async def answer(self, text, **kw):
@@ -72,6 +84,7 @@ class FakeDB:
         self.tournament = None
         self.notes = []
         self.calls = []
+        self.streak = 0
 
     # -- users
     async def upsert_user(self, uid, username):
@@ -104,6 +117,9 @@ class FakeDB:
 
     async def levels_with_questions(self):
         return sorted({q["level"] for q in self.questions.values()})
+
+    async def practice_streak(self, uid):
+        return self.streak
 
     async def record_attempt(self, uid, question, idx, correct, mode, msg_id):
         if (uid, msg_id) in self.attempts:
@@ -203,7 +219,11 @@ async def test_correct_answer_is_scored_and_revealed(fake):
 
     assert c.answers, "callback must always be answered"
     assert not any(a["alert"] for a in c.answers)
-    assert "✅ Correct!" in message.edits[-1]["text"]
+    edit = message.edits[-1]
+    assert edit["parse_mode"] == "HTML"
+    assert "✅ <b>B.</b> option 1" in edit["text"], "the right option is ticked in place"
+    assert edit["text"].rstrip().splitlines()[-1].startswith("✅ <b>")
+    assert "❌" not in edit["text"]
     assert fake.points == {(1, 1): True}
     # Neighbours are offered back.
     labels = [b.text for b in message.edits[-1]["reply_markup"].inline_keyboard[0]]
@@ -219,7 +239,7 @@ async def test_five_option_question_no_longer_crashes(fake):
 
     await handlers.on_answer(c)
 
-    assert "✅ Correct!" in message.edits[-1]["text"]
+    assert "✅ <b>E.</b> option 4" in message.edits[-1]["text"]
 
 
 @pytest.mark.asyncio
@@ -230,8 +250,12 @@ async def test_wrong_answer_shows_the_right_option(fake):
 
     await handlers.on_answer(c)
 
-    assert "❌ Wrong" in message.edits[-1]["text"]
-    assert "C. option 2" in message.edits[-1]["text"]
+    text = message.edits[-1]["text"]
+    assert "❌ <b>A.</b> option 0" in text, "the wrong pick is crossed"
+    assert "✅ <b>C.</b> option 2" in text
+    assert "The answer is <b>C</b>." in text
+    # The verdict points at the letter; the option text appears once, not twice.
+    assert text.count("option 2") == 1
     assert fake.points == {}
 
 
@@ -244,7 +268,7 @@ async def test_double_tap_is_idempotent(fake):
 
     await handlers.on_answer(second)
 
-    assert second.answers[-1]["text"] == "Already answered"
+    assert second.answers[-1]["text"] == "You've already answered this one 👍"
     assert len(message.edits) == 1
 
 
@@ -283,7 +307,8 @@ async def test_edit_failure_still_delivers_the_verdict(fake):
     await handlers.on_answer(c)
 
     assert message.replies, "must fall back to a fresh message"
-    assert "✅ Correct!" in message.replies[-1]["text"]
+    assert "✅ <b>A.</b> option 0" in message.replies[-1]["text"]
+    assert message.replies[-1]["parse_mode"] == "HTML"
 
 
 @pytest.mark.asyncio
@@ -298,7 +323,48 @@ async def test_weekly_answer_scores_nothing(fake):
     assert fake.points == {}
     labels = [b.text for b in message.edits[-1]["reply_markup"].inline_keyboard[0]]
     assert labels == ["💡 Explain"]
+    assert "Question of the week" in message.edits[-1]["text"]
 
+
+@pytest.mark.asyncio
+async def test_streak_shows_from_three_in_a_row(fake):
+    add_question(fake, correct_idx=0)
+    fake.streak = 3
+    message = FakeMessage()
+
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=message))
+
+    assert "🔥 3 in a row" in message.edits[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_no_streak_line_below_three(fake):
+    add_question(fake, correct_idx=0)
+    fake.streak = 2
+    message = FakeMessage()
+
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=message))
+
+    assert "🔥" not in message.edits[-1]["text"]
+
+
+def answered_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💡 Explain", callback_data="e:1"),
+        InlineKeyboardButton(text="Next ➡️", callback_data="next"),
+    ]])
+
+
+@pytest.mark.asyncio
+async def test_next_removes_its_button_from_the_old_card(fake):
+    add_question(fake)
+    old = FakeMessage(reply_markup=answered_keyboard())
+
+    await handlers.next_question(FakeCallback("next", message=old), fake.bot)
+
+    kept = [b.callback_data for row in old.markup_edits[-1].inline_keyboard for b in row]
+    assert kept == ["e:1"], "Explain stays usable, the used Next goes"
+    assert fake.bot.sent, "and the next question still arrives"
 
 @pytest.mark.asyncio
 async def test_explain_rate_limit(fake, monkeypatch):
@@ -310,14 +376,15 @@ async def test_explain_rate_limit(fake, monkeypatch):
     monkeypatch.setattr(handlers.llm, "explain", fake_explain)
     handlers._recent_explain.clear()
 
-    first = FakeCallback("e:1", message=FakeMessage())
-    await handlers.on_explain(first, fake.bot)
-    assert any("because" in m["text"] for m in fake.bot.sent)
+    card = FakeMessage(text="card")
+    await handlers.on_explain(FakeCallback("e:1", message=card), fake.bot)
+    assert "because" in card.edits[-1]["text"]
 
-    second = FakeCallback("e:1", message=FakeMessage())
+    other = FakeMessage(text="card")
+    second = FakeCallback("e:1", message=other)
     await handlers.on_explain(second, fake.bot)
     assert second.answers[-1]["alert"] is True
-    assert len(fake.bot.sent) == 1
+    assert other.edits == [] and fake.bot.sent == []
 
 
 @pytest.mark.asyncio
@@ -333,10 +400,34 @@ async def test_explain_serves_the_written_explanation_without_an_llm(fake, monke
     monkeypatch.setattr(handlers.llm.httpx, "AsyncClient", no_http)
     handlers._recent_explain.clear()
 
-    await handlers.on_explain(FakeCallback("e:1", message=FakeMessage()), fake.bot)
+    card = FakeMessage(text="card", reply_markup=answered_keyboard())
+    await handlers.on_explain(FakeCallback("e:1", message=card), fake.bot)
 
-    assert any("fissure failed to close" in m["text"] for m in fake.bot.sent)
-    assert any("not clinical advice" in m["text"] for m in fake.bot.sent)
+    edit = card.edits[-1]
+    assert edit["text"].startswith("card\n\n💡 <b>Why</b>\n")
+    assert "fissure failed to close" in edit["text"]
+    assert "clinical advice" not in edit["text"], "the disclaimer lives on /start only"
+    kept = [b.callback_data for row in edit["reply_markup"].inline_keyboard for b in row]
+    assert kept == ["next"], "Explain is used up, Next stays"
+
+    # Written explanations cost nothing, so there is no cooldown on them.
+    again = FakeCallback("e:1", message=FakeMessage(text="card"))
+    await handlers.on_explain(again, fake.bot)
+    assert not any(a["alert"] for a in again.answers)
+
+
+@pytest.mark.asyncio
+async def test_explanation_falls_back_to_a_new_message_when_the_card_is_locked(fake):
+    add_question(fake, correct_idx=0)
+    fake.questions[1]["explanation"] = "Because <reasons> & more."
+    handlers._recent_explain.clear()
+
+    card = FakeMessage(text="card", fail_edit=True)
+    await handlers.on_explain(FakeCallback("e:1", message=card), fake.bot)
+
+    sent = fake.bot.sent[-1]
+    assert sent["parse_mode"] == "HTML"
+    assert "Because &lt;reasons&gt; &amp; more." in sent["text"]
 
 
 @pytest.mark.asyncio
@@ -352,17 +443,21 @@ async def test_explain_says_so_when_there_is_nothing_to_show(fake, monkeypatch):
 
     await handlers.on_explain(FakeCallback("e:1", message=FakeMessage()), fake.bot)
 
-    assert fake.bot.sent[-1]["text"] == "No written explanation for this question yet."
+    assert fake.bot.sent[-1]["text"] == "No explanation written for this one yet."
 
 
 @pytest.mark.asyncio
 async def test_level_callback_updates_the_user(fake):
-    c = FakeCallback("lv:clin")
+    picker = FakeMessage(text="the /start welcome")
+    c = FakeCallback("lv:clin", message=picker)
 
     await handlers.set_level(c)
 
     assert fake.users[1] == "clin"
-    assert c.answers[-1]["text"] == "Level set to Clinical"
+    assert c.answers[-1]["text"] == "🩺 You're on Clinical now"
+    assert picker.edits == [], "the welcome text must survive a level change"
+    labels = [row[0].text for row in picker.markup_edits[-1].inline_keyboard]
+    assert labels == ["📖 Pre-Clinical", "✅ Clinical", "🎓 Post-MBBS"]
 
 
 @pytest.mark.asyncio
@@ -386,7 +481,7 @@ async def test_tournament_join_then_leave(fake):
 
     await handlers.tournament(joined)
     assert fake.joined == set()
-    assert "You left the tournament" in joined.answer.messages[-1]
+    assert "You've left the tournament" in joined.answer.messages[-1]
 
 
 def _recorder():
@@ -407,7 +502,8 @@ async def test_leaderboard_masks_the_last_two_characters(fake):
     await handlers.leaderboard(msg)
 
     text = msg.answer.messages[-1]
-    assert "@hongpeng**" in text
+    assert "🥇 @hongpeng**, 3 pts" in text
+    assert "🥉 @**, 1 pt" in text
     # No username on file falls back to a uid-derived label.
     assert "user8" in text
 
@@ -468,4 +564,41 @@ async def test_practice_with_an_empty_database_says_so(fake):
 
     await handlers.practice(msg, fake.bot)
 
-    assert fake.bot.sent[-1]["text"] == "No questions available yet — check back soon."
+    assert fake.bot.sent[-1]["text"] == "No questions loaded yet. Check back soon!"
+
+
+@pytest.mark.asyncio
+async def test_start_greets_by_name_and_escapes_it(fake):
+    msg = SimpleNamespace(
+        from_user=SimpleNamespace(id=1, username="t", first_name="<Zay>"),
+        answer=_recorder(),
+    )
+
+    await handlers.start(msg)
+
+    text = msg.answer.messages[-1]
+    assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b>")
+    assert "/practice" in text and "Acuity Team" in text
+
+
+def test_no_em_dashes_in_anything_students_see():
+    """Copy rule: no em dashes in user-facing text."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "bot"
+    offenders = []
+    for path in root.glob("*.py"):
+        tree = ast.parse(path.read_text())
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+        }
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings and "\u2014" in node.value):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert offenders == []

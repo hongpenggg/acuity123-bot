@@ -22,7 +22,7 @@ _ATTEMPTS = 2
 _PROMPT = (
     "You are a concise ophthalmology tutor for medical students. Explain why the "
     "correct answer is right, and briefly why each other option is wrong. "
-    "Max 120 words, plain text, no markdown.\n\n"
+    "Max 120 words, plain text, no markdown, no em dashes.\n\n"
 )
 
 

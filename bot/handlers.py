@@ -12,9 +12,11 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from . import db, jobs, llm
-from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVELS, TZ
-from .sender import ack, deliver_verdict, safe_send, send_question_for_level
-from .text import letter, mask, parse_options
+from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVEL_EMOJI, LEVELS, TZ
+from .sender import (ack, card_header, deliver_verdict, drop_buttons, edit_in_place,
+                     remaining_buttons, safe_send, send_question_for_level)
+from .text import (EXPLANATION_HEADING, TELEGRAM_LIMIT, esc, explanation_block, mask,
+                   parse_options, render, verdict)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -27,16 +29,17 @@ _recent_explain: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 MODES = ("practice", "weekly")
 
 HELP = (
-    "/practice — adaptive question, weighted to your weak topics\n"
-    "/level — Pre-Clinical / Clinical / Post-MBBS\n"
-    "/subscribe — a question every Monday\n"
-    "/unsubscribe — stop the weekly question\n"
-    "/notes — Tier B cheat sheets, on demand\n"
-    "/notes_sub — Tier A cheat sheets, fortnightly\n"
-    "/notes_unsub — stop the fortnightly notes\n"
-    "/tournament — join or leave the running tournament\n"
-    "/leaderboard — top 3 and your rank"
+    "📝 /practice for a question\n"
+    "📚 /level to switch level\n"
+    "📅 /subscribe for a question every Monday\n"
+    "🗒 /notes for cheat sheets\n"
+    "🏆 /tournament to join the tournament\n"
+    "🥇 /leaderboard to see who's leading\n\n"
+    "/unsubscribe stops the Monday question. /notes_sub sends you the high-yield "
+    "cheat sheets every two weeks (/notes_unsub to stop)."
 )
+
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
 def _level(level: str | None) -> str:
@@ -44,13 +47,18 @@ def _level(level: str | None) -> str:
 
 
 def _level_kb(current: str | None) -> InlineKeyboardMarkup:
+    current = _level(current)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=("✅ " if key == current else "") + label,
+            text=f"{'✅' if key == current else LEVEL_EMOJI[key]} {label}",
             callback_data=f"lv:{key}",
         )]
         for key, label in LEVELS.items()
     ])
+
+
+def _pts(n: int) -> str:
+    return f"{n} pt" if n == 1 else f"{n} pts"
 
 
 def _local(when: datetime | None) -> str:
@@ -68,12 +76,16 @@ async def start(m: Message):
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = await db.get_level(uid)
+    name = getattr(m.from_user, "first_name", None)
+    hello = f"👋 <b>Hi {esc(name)}!</b>" if name else "👋 <b>Hi!</b>"
     await m.answer(
-        f"{CREDIT}\n\n"
-        f"Your level: {LEVELS[_level(level)]}\n"
-        "Tap below to set it (you can change it any time):\n\n"
+        f"{hello} This is the LKC OphSoc revision bot.\n\n"
+        "Practise ophthalmology MCQs at your level. The more you answer, the more "
+        "it focuses on the topics you find tricky.\n\n"
         f"{HELP}\n\n"
-        f"{DISCLAIMER}",
+        "<b>Pick your level below</b> 👇 You can change it any time.\n\n"
+        f"<i>{esc(CREDIT)}\n{esc(DISCLAIMER)}</i>",
+        parse_mode="HTML",
         reply_markup=_level_kb(level),
     )
 
@@ -84,8 +96,7 @@ async def level_cmd(m: Message):
     await db.upsert_user(uid, m.from_user.username)
     current = await db.get_level(uid)
     await m.answer(
-        f"Your level: {LEVELS[_level(current)]}\n"
-        "Questions and notes follow your level. Change it any time.",
+        "📚 Pick your level. Your questions and cheat sheets follow it.",
         reply_markup=_level_kb(current),
     )
 
@@ -97,20 +108,19 @@ async def set_level(c: CallbackQuery):
         key = c.data.split(":", 1)[1]
         if key not in LEVELS:
             answered = True
-            return await ack(c, "Unknown level.", True)
+            return await ack(c, "That level doesn't exist.", True)
         uid = c.from_user.id
         await db.upsert_user(uid, c.from_user.username)
         await db.set_level(uid, key)
         answered = True
-        await ack(c, f"Level set to {LEVELS[key]}")
+        await ack(c, f"{LEVEL_EMOJI[key]} You're on {LEVELS[key]} now")
         if c.message is not None:
+            # Only move the tick. Rewriting the text would wipe the /start welcome
+            # when the picker is tapped from there.
             try:
-                await c.message.edit_text(
-                    f"✅ Level set to {LEVELS[key]}. Your questions and notes "
-                    f"now follow this level. Change it any time with /level.",
-                )
+                await c.message.edit_reply_markup(reply_markup=_level_kb(key))
             except Exception:
-                log.debug("level confirmation edit failed", exc_info=True)
+                log.debug("level picker update failed", exc_info=True)
     except Exception:
         log.exception("set_level failed")
     finally:
@@ -135,6 +145,7 @@ async def next_question(c: CallbackQuery, bot: Bot):
     try:
         await ack(c)
         answered = True
+        await drop_buttons(c.message, lambda data: data == "next")
         uid = c.from_user.id
         level = _level(await db.get_level(uid))
         await send_question_for_level(bot, uid, level, "practice")
@@ -181,15 +192,19 @@ async def on_answer(c: CallbackQuery):
 
         if not scored:
             answered = True
-            return await ack(c, "Already answered")
+            return await ack(c, "You've already answered this one 👍")
 
+        streak = 0
         if correct and mode == "practice":
             await db.award_point(c.from_user.id, question["id"])
+            try:
+                streak = await db.practice_streak(c.from_user.id)
+            except Exception:
+                log.debug("streak lookup failed", exc_info=True)
 
-        verdict = "✅ Correct!" if correct else (
-            f"❌ Wrong. Answer: {letter(question['correct_idx'])}. "
-            f"{options[question['correct_idx']]}"
-        )
+        # Re-rendered from the database rather than appended to message.text, so
+        # the answered card can mark the options in place.
+        body, _ = render(question, chosen=idx, header=card_header(mode))
         buttons = [InlineKeyboardButton(text="💡 Explain", callback_data=f"e:{question['id']}")]
         if mode == "practice":
             buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data="next"))
@@ -198,7 +213,7 @@ async def on_answer(c: CallbackQuery):
         await ack(c)
         await deliver_verdict(
             c,
-            f"{message.text}\n\n{verdict}",
+            f"{body}\n\n{verdict(correct, question['correct_idx'], streak)}",
             InlineKeyboardMarkup(inline_keyboard=[buttons]),
         )
     except Exception:
@@ -224,25 +239,44 @@ async def on_explain(c: CallbackQuery, bot: Bot):
             answered = True
             return await ack(c, "That question is no longer available.", True)
 
-        last = _recent_explain.get(uid)
-        if last is not None and time.monotonic() - last < _EXPLAIN_COOLDOWN:
+        # The cooldown only guards LLM spend. Written explanations are free, so
+        # a student moving quickly through the bank is never told to wait.
+        if not question["explanation"]:
+            last = _recent_explain.get(uid)
+            if last is not None and time.monotonic() - last < _EXPLAIN_COOLDOWN:
+                answered = True
+                return await ack(c, "Give it a few seconds and try again 🙏", True)
+            _recent_explain[uid] = time.monotonic()
             answered = True
-            return await ack(c, "Slow down a little — try again in a few seconds.", True)
-        _recent_explain[uid] = time.monotonic()
+            await ack(c, "Thinking 🤔")
+        else:
+            answered = True
+            await ack(c)
 
-        answered = True
-        await ack(c, "Thinking…")
-
+        failed = False
         try:
             text = await llm.explain(question)
         except Exception:
             log.exception("explain failed for question %s", question["id"])
-            text = "Sorry, explanations are unavailable right now."
-        if text:
-            await safe_send(bot, uid, f"💡 {text}\n\n({DISCLAIMER})")
-        else:
-            # No stored explanation and no provider configured.
-            await safe_send(bot, uid, "No written explanation for this question yet.")
+            text, failed = None, True
+        if not text:
+            await safe_send(bot, uid, "Couldn't load the explanation right now. Try again in a bit."
+                            if failed else "No explanation written for this one yet.")
+            return
+
+        # Show it inside the answered card, so question, answer and reasoning sit
+        # together. A card past Telegram's 48h edit window, or one that would grow
+        # past the length limit, gets the explanation as its own message instead.
+        block = explanation_block(text)
+        message = c.message
+        base = getattr(message, "html_text", None) if message is not None else None
+        if base and EXPLANATION_HEADING in base:
+            return  # already showing (a second tap raced the first)
+        if base and len(base) + len(block) + 2 <= TELEGRAM_LIMIT:
+            keyboard = remaining_buttons(message, lambda data: data.startswith("e:"))
+            if await edit_in_place(message, f"{base}\n\n{block}", keyboard):
+                return
+        await safe_send(bot, uid, block, parse_mode="HTML")
     except Exception:
         log.exception("on_explain failed")
     finally:
@@ -257,7 +291,7 @@ async def on_explain(c: CallbackQuery, bot: Bot):
 async def subscribe(m: Message):
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "weekly_sub", True)
-    await m.answer("Subscribed — you'll get a question every Monday morning (SGT).")
+    await m.answer("📅 You're subscribed! A new question lands every Monday at 9am.")
 
 
 @router.message(Command("unsubscribe"))
@@ -265,7 +299,7 @@ async def unsubscribe(m: Message):
     # upsert first, otherwise the flag write hits no rows and the confirmation lies.
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "weekly_sub", False)
-    await m.answer("Unsubscribed from the weekly question.")
+    await m.answer("Done, no more Monday questions. /subscribe if you change your mind.")
 
 
 @router.message(Command("notes"))
@@ -278,18 +312,18 @@ async def notes(m: Message, command: CommandObject, bot: Bot):
         topics = await db.note_topics(level, "B")
         if not topics:
             return await m.answer(
-                f"No Tier B notes for {LEVELS[level]} yet. /level to switch level, "
-                "or /notes_sub for the fortnightly Tier A set."
+                f"🗒 No {LEVELS[level]} cheat sheets up yet, they're on the way.\n\n"
+                "Want the high-yield ones sent to you every two weeks? /notes_sub"
             )
-        listing = "\n".join(f"— {t}" for t in topics)
+        listing = "\n".join(f"• {t}" for t in topics)
         return await m.answer(
-            f"Tier B notes for {LEVELS[level]}:\n{listing}\n\n"
-            "Use /notes <topic>. Tier A sets arrive by subscription: /notes_sub."
+            f"🗒 Cheat sheets for {LEVELS[level]}:\n{listing}\n\n"
+            f"Send /notes with a topic name, like:\n/notes {topics[0]}"
         )
 
     rows = await db.get_notes(command.args.strip(), level, "B")
     if not rows:
-        return await m.answer("No notes for that topic. Send /notes to see the list.")
+        return await m.answer("Couldn't find that topic. Send /notes to see the list.")
     for row in rows:
         # safe_send splits anything over Telegram's 4096-char limit instead of
         # slicing the tail off.
@@ -302,8 +336,8 @@ async def notes_sub(m: Message):
     level = _level(await db.get_level(m.from_user.id))
     await db.set_flag(m.from_user.id, "notes_sub", True)
     await m.answer(
-        f"Subscribed — Tier A ({LEVELS[level]}) cheat sheets arrive fortnightly. "
-        "Stop with /notes_unsub."
+        f"📘 Done! You'll get the high-yield {LEVELS[level]} cheat sheets every two "
+        "weeks. /notes_unsub to stop."
     )
 
 
@@ -311,7 +345,7 @@ async def notes_sub(m: Message):
 async def notes_unsub(m: Message):
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "notes_sub", False)
-    await m.answer("Unsubscribed from the fortnightly notes.")
+    await m.answer("Done, no more fortnightly cheat sheets.")
 
 
 # ------------------------------------------------------------------- tournament
@@ -323,15 +357,15 @@ async def tournament(m: Message):
     await db.upsert_user(uid, m.from_user.username)
     t = await db.active_tournament()
     if not t:
-        return await m.answer("No tournament is running right now — watch this space.")
+        return await m.answer("No tournament on right now. We'll announce the next one 👀")
     if await db.is_joined(uid):
         await db.leave_tournament(uid)
-        return await m.answer("You left the tournament. Send /tournament to rejoin.")
+        return await m.answer("You've left the tournament. Changed your mind? /tournament")
     await db.join_tournament(uid)
     await m.answer(
-        f"🏆 You're in! This tournament closes {_local(t['ends_at'])}.\n"
-        "Every correct /practice answer scores a point — once per question. "
-        "Top 3 win a reward: contact LKC OphSoc when it closes."
+        f"🏆 You're in! The tournament ends {_local(t['ends_at'])}.\n\n"
+        "Every question you get right in /practice is worth 1 point (each question "
+        "only counts once). Top 3 win a prize from LKC OphSoc 🎁"
     )
 
 
@@ -339,20 +373,21 @@ async def tournament(m: Message):
 async def leaderboard(m: Message):
     rows = await db.leaderboard(limit=3)
     if rows is None:
-        return await m.answer("No tournament is running right now.")
+        return await m.answer("No tournament on right now.")
     if not rows:
-        return await m.answer("🏆 No participants yet — be first: /tournament")
+        return await m.answer("🏆 Nobody's joined yet. Be the first: /tournament")
 
     top = "\n".join(
-        f"{r['rk']}. @{mask(r['username'], r['user_id'])} — {r['points']} pts"
+        f"{MEDALS.get(r['rk'], str(r['rk']) + '.')} @{mask(r['username'], r['user_id'])}, "
+        f"{_pts(r['points'])}"
         for r in rows
     )
     mine = await db.my_rank(m.from_user.id)
     if mine is None:
-        tail = "\n\nYou haven't joined — send /tournament."
+        tail = "\n\nYou're not in yet. Join with /tournament"
     else:
-        tail = f"\n\nYou: rank {mine['rk']}, {mine['points']} pts"
-    await m.answer(f"🏆 Top 3\n{top}{tail}")
+        tail = f"\n\nYou're #{mine['rk']} with {_pts(mine['points'])}."
+    await m.answer(f"🏆 Leaderboard\n\n{top}{tail}")
 
 
 # ------------------------------------------------------------------------ admin
@@ -370,9 +405,9 @@ async def admin_tournament_start(m: Message):
     if not _is_admin(m):
         return
     if await db.active_tournament():
-        return await m.answer("A tournament is already running.")
+        return await m.answer("There's already a tournament running.")
     tid = await db.start_tournament(14)
-    await m.answer(f"Tournament {tid} started and runs for 2 weeks. Users join with /tournament.")
+    await m.answer(f"🏆 Tournament {tid} is live for 2 weeks. Students join with /tournament.")
 
 
 @router.message(Command("admin_tournament_end"))
@@ -381,10 +416,10 @@ async def admin_tournament_end(m: Message, bot: Bot):
         return
     t = await db.active_tournament()
     if not t:
-        return await m.answer("No active tournament.")
-    await m.answer(f"Closing tournament {t['id']} and notifying the top 3…")
+        return await m.answer("No tournament running.")
+    await m.answer(f"Closing tournament {t['id']} and messaging the top 3...")
     rows = await jobs.finish_tournament(bot, t["id"])
-    await m.answer(f"Done — {len(rows)} participant(s) scored.")
+    await m.answer(f"Done. {len(rows)} participant(s) scored.")
 
 
 @router.message(Command("admin_weekly_now"))
@@ -392,7 +427,7 @@ async def admin_weekly_now(m: Message, bot: Bot):
     """Manual trigger, so you never have to wait for Monday to demo the push."""
     if not _is_admin(m):
         return
-    await m.answer("Sending the weekly question now…")
+    await m.answer("Sending this week's question...")
     sent = await jobs.weekly_question(bot)
     await m.answer(f"Sent to {sent} subscriber(s).")
 
@@ -401,6 +436,6 @@ async def admin_weekly_now(m: Message, bot: Bot):
 async def admin_notes_now(m: Message, bot: Bot):
     if not _is_admin(m):
         return
-    await m.answer("Sending the fortnightly notes now…")
+    await m.answer("Sending the cheat sheets...")
     sent = await jobs.fortnightly_notes(bot)
     await m.answer(f"Sent {sent} message(s).")
