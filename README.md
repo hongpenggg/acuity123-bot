@@ -147,6 +147,7 @@ seeds/                     the question bank
 scripts/check_sql.py       parse every statement with libpg_query
 tests/                     unit, handler and live-database suites
 deploy/studybot.service    systemd unit
+deploy/provision.sh        one-shot server setup (idempotent)
 ```
 
 Three design choices worth knowing:
@@ -193,8 +194,16 @@ psql "$DATABASE_URL" -f seeds/01_preclin_mcqs.sql
 
 ## Deployment
 
-Contabo VPS, Ubuntu LTS, systemd, Postgres on the same box. Step-by-step in
-[docs/SETUP.md](docs/SETUP.md).
+VPS (Contabo or DigitalOcean), Ubuntu LTS, systemd, Postgres on the same box.
+Step-by-step in [docs/SETUP.md](docs/SETUP.md) — including per-provider notes and
+the DigitalOcean $4-tier memory caveat.
+
+The short version, once you have a droplet and your key is on it:
+
+```bash
+ssh root@YOUR.IP 'bash -s' < deploy/provision.sh   # swap, hardening, Postgres, venv, unit
+# then write /opt/studybot/.env, load schema.sql + seeds/*.sql, and start the service
+```
 
 **One instance only** — two processes polling the same token produce `Conflict`
 errors. Don't run the bot locally while the service is up.
