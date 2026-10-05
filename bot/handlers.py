@@ -80,9 +80,12 @@ HELP = (
 )
 
 RESOURCES_INTRO = (
-    "📚 Revision sheets\n"
-    "Overview sheets cover a whole topic; focused sheets go deep on one point.\n"
-    "Pick one and it arrives here as a PDF."
+    "📚 <b>Revision sheets</b>\n"
+    "Overview sheets cover a whole topic; focused sheets go deep on one point. "
+    "Pick one and it arrives here as a PDF.\n\n"
+    "Know what you want? <code>/resources b14</code> or "
+    "<code>/resources glaucoma</code> fetches it straight away.\n"
+    "Or send /notes and I'll just hand you the next one you have not read."
 )
 
 OVERVIEW_INTRO = (
@@ -116,11 +119,11 @@ def _resources_home_kb(level: str | None) -> InlineKeyboardMarkup:
     rows = []
     if (overview := resources.overview(level)):
         rows.append([InlineKeyboardButton(
-            text=f"📘 Overview sheets: all {len(overview)} topics",
+            text=f"📘 Overview sheets · {len(overview)}",
             callback_data="res:tier:a")])
     if (focused := resources.focused(level)):
         rows.append([InlineKeyboardButton(
-            text=f"📄 Focused sheets: {len(focused)} deep-dives",
+            text=f"📄 Focused sheets · {len(focused)}",
             callback_data="res:tier:b")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -490,16 +493,19 @@ async def review(m: Message, bot: Bot):
     waiting = await db.wrong_count(uid, level)
     if not waiting:
         return await m.answer(
-            f"🎯 Nothing to review: no {LEVELS[level]} questions wrong so far. "
+            f"🎯 Nothing to review yet: you have not got a "
+            f"{LEVELS[level]} question wrong.\n"
             "Send /quizme for a set of five.")
 
     pile = await db.wrong_questions(uid, level)
     shown = len(pile)
     more = waiting - shown
-    tail = f" {more} more after these." if more > 0 else ""
-    await m.answer(
-        f"🔁 <b>Review</b> · the {shown} you most recently missed.{tail}",
-        parse_mode="HTML")
+    head = ("🔁 <b>Review</b> · the one you most recently missed."
+            if shown == 1
+            else f"🔁 <b>Review</b> · the {shown} you most recently missed.")
+    if more > 0:
+        head += f" {more} more after these."
+    await m.answer(head, parse_mode="HTML")
     for question in pile:
         await send_question(bot, uid, question, "practice")
 
@@ -557,7 +563,7 @@ async def weeklyquiz(m: Message):
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "weekly_sub", True)
     await m.answer(
-        "\U0001f4c5 You're in. Every Monday at 9am you'll get a set of five.\n\n"
+        "📅 You're in. Every Monday at 9am you'll get a set of five.\n\n"
         "Only questions you answer through /quizme score for the tournament, so "
         "the Monday set is pure practice.",
         reply_markup=_sub_off_kb("weekly"),
@@ -616,7 +622,8 @@ async def resources_cmd(m: Message, command: CommandObject, bot: Bot):
             return await m.answer("No sheet matches that. Send /resources to browse.")
         await _deliver(bot, uid, level, note)
         return None
-    await m.answer(RESOURCES_INTRO, reply_markup=_resources_home_kb(level))
+    await m.answer(RESOURCES_INTRO, parse_mode="HTML",
+                          reply_markup=_resources_home_kb(level))
 
 
 @router.callback_query(F.data.startswith("res:"))
@@ -636,8 +643,9 @@ async def resources_cb(c: CallbackQuery, bot: Bot):
             await ack(c)
             if message is not None:
                 with contextlib.suppress(Exception):
-                    await message.edit_text(RESOURCES_INTRO,
-                                            reply_markup=_resources_home_kb(level))
+                    await message.edit_text(
+                        RESOURCES_INTRO, parse_mode="HTML",
+                        reply_markup=_resources_home_kb(level))
         elif action in ("tier", "page"):
             await ack(c)
             tier_code = parts[2] if len(parts) > 2 else "a"
@@ -708,7 +716,7 @@ async def notes(m: Message, command: CommandObject, bot: Bot):
                 "/notes for the next one.")
     else:
         tail = "That was the last one. Send /notes again for the good news."
-    await m.answer(f"\U0001f5d2 Your next {kind} sheet. {tail}")
+    await m.answer(f"🗒 Your next {kind} sheet. {tail}")
     return None
 
 
@@ -729,12 +737,12 @@ async def subscribenotes(m: Message):
     left = (len(resources.unsent(level, "a", delivered["a"]))
             + len(resources.unsent(level, "b", delivered["b"])))
     if left:
-        body = (f"\U0001f4ec You're in. On the 1st and the 15th you'll get up to "
+        body = (f"📬 You're in. On the 1st and the 15th you'll get up to "
                 f"{jobs.SHEETS_PER_DROP} cheat sheets for "
                 f"{LEVELS[_level(level)]}, picking up where you left off. "
                 f"{left} to go.\n\nWant one right now? /notes")
     else:
-        body = (f"\U0001f4ec You're in, but you have already had every "
+        body = (f"📬 You're in, but you have already had every "
                 f"{LEVELS[_level(level)]} sheet. Nothing will be sent until there "
                 "is new content, and /resources still has them all.")
     await m.answer(body, reply_markup=_sub_off_kb("notes"))
@@ -795,14 +803,37 @@ async def randomnotes(m: Message, command: CommandObject, bot: Bot):
 
 
 @router.message(Command("stats"))
+def _ranked(rows, key) -> list[tuple[str, int, int]]:
+    """(name, correct, answered) grouped by `key`, weakest first."""
+    out: dict[str, list[int]] = {}
+    for row in rows:
+        name = key(row) or "(not labelled)"
+        bucket = out.setdefault(name, [0, 0])
+        bucket[0] += row["answered"]
+        bucket[1] += row["correct"]
+    ranked = sorted(out.items(), key=lambda kv: (kv[1][1] / kv[1][0], kv[0]))
+    return [(name, c, n) for name, (n, c) in ranked]
+
+
+def _score_line(name: str, correct: int, answered: int) -> str:
+    return f"{esc(name)} · {correct}/{answered} ({round(100 * correct / answered)}%)"
+
+
+#: How many question types /stats names. Each level has 71 to 92 of them and some
+#: run to 62 characters, so the full list runs to thousands of characters and
+#: Telegram would split it into a two-message wall.
+_TYPES_SHOWN = 5
+
+
+@router.message(Command("stats"))
 async def stats_cmd(m: Message):
     """Marker A: how this student is doing, overall and broken down.
 
     Split by topic and by question type (`questions.tag`, e.g. "Physiology |
     optical compensation"), because "you are weak on optics" is far less useful
     than knowing which kind of optics question keeps catching them out. Weakest
-    first, since that is the list a student should act on - and it is the same
-    ranking `db.pick_question` uses to decide what to serve next.
+    first throughout, since that is the list a student should act on, and it is
+    the same ranking `db.pick_question` uses to pick what to serve next.
     """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
@@ -811,14 +842,14 @@ async def stats_cmd(m: Message):
     total = await db.level_total(level)
     if not total:
         return await m.answer(
-            f"\U0001f6a7 No {LEVELS[level]} questions yet, so there is nothing "
+            f"🚧 No {LEVELS[level]} questions yet, so there is nothing "
             "to report on.")
 
     answered = await db.answered_count(uid, level)
     if answered == 0:
         return await m.answer(
-            "\U0001f4ca Nothing answered yet. Send /quizme to start your first "
-            "set of five.")
+            f"📊 Nothing answered yet at {LEVELS[level]}.\n"
+            "Send /quizme for your first set of five.")
 
     rows = await db.stats(uid, level)
     correct = sum(row["correct"] for row in rows)
@@ -828,37 +859,38 @@ async def stats_cmd(m: Message):
     waiting = await db.wrong_count(uid, level)
 
     lines = [
-        f"\U0001f4ca <b>Your {LEVELS[level]} progress</b>",
-        f"Answered: {answered} of {total} ({round(100 * answered / total)}%)",
-        f"Correct: {correct} of {attempts} ({round(100 * correct / attempts)}%)",
-        f"Sets finished: {answered // db.SET_SIZE} of {total_sets}",
+        f"📊 <b>Your {LEVELS[level]} progress</b>",
+        f"Answered <b>{answered}</b> of {total} "
+        f"({round(100 * answered / total)}%)",
+        f"Correct <b>{correct}</b> of {attempts} "
+        f"({round(100 * correct / attempts)}%)",
+        f"Sets finished <b>{answered // db.SET_SIZE}</b> of {total_sets}",
     ]
     if streak >= 2:
-        lines.append(f"\U0001f525 On a {streak} answer streak")
+        lines.append(f"🔥 {streak} in a row right now")
     if waiting:
-        lines.append(f"\U0001f501 {waiting} to /review")
+        plural = "" if waiting == 1 else "s"
+        lines.append(f"🔁 {waiting} question{plural} waiting in /review")
 
-    def _group(key) -> dict[str, list[int]]:
-        out: dict[str, list[int]] = {}
-        for row in rows:
-            name = key(row) or "(not labelled)"
-            bucket = out.setdefault(name, [0, 0])
-            bucket[0] += row["answered"]
-            bucket[1] += row["correct"]
-        return out
+    topics = _ranked(rows, lambda r: r["topic"])
+    if topics:
+        lines.append("\n<b>By topic</b>  <i>weakest first</i>")
+        lines += [_score_line(*t) for t in topics]
 
-    for heading, key in (("By topic", lambda r: r["topic"]),
-                         ("By question type", lambda r: r["tag"])):
-        grouped = _group(key)
-        if not grouped:
-            continue
-        # Weakest first: that is the list a student should actually act on.
-        ranked = sorted(grouped.items(), key=lambda kv: (kv[1][1] / kv[1][0], kv[0]))
-        lines.append(f"\n<b>{heading}</b>")
-        for name, (n, c) in ranked:
-            lines.append(f"{name}: {c}/{n}")
-        if len(ranked) > 1:
-            lines.append(f"Weakest here: {ranked[0][0]}")
+    # Question types are NOT ranked by accuracy, deliberately. `questions.tag` is
+    # close to a per-question label - 71 to 92 distinct types over 103 to 170
+    # questions, averaging 1.1 to 2.4 questions each - so "your weakest type is
+    # 0/1" is noise dressed up as a statistic. What is honest, and what a student
+    # can act on, is which kinds of question they have actually missed.
+    missed = sorted({(row["tag"] or "(not labelled)")
+                     for row in rows if row["answered"] > row["correct"]})
+    if missed:
+        shown = missed[:_TYPES_SHOWN]
+        lines.append("\n<b>Question types you have missed</b>")
+        lines += [esc(name) for name in shown]
+        rest = len(missed) - len(shown)
+        if rest:
+            lines.append(f"<i>and {rest} more. /review serves them back.</i>")
 
     await m.answer("\n".join(lines), parse_mode="HTML")
 
@@ -895,7 +927,10 @@ async def tournament(m: Message):
 async def leaderboard(m: Message):
     rows = await db.leaderboard(limit=3)
     if rows is None:
-        return await m.answer("No tournament on right now.")
+        return await m.answer(
+            "🏆 No tournament running. When OphSoc starts one you are "
+            "entered automatically.\n\n"
+            "Meanwhile /quizme keeps your /stats moving.")
     if not rows:
         return await m.answer("🏆 Nobody has scored yet. Set the pace with /quizme!")
 

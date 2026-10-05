@@ -47,7 +47,7 @@ async def weekly_quiz(bot) -> int:
             continue          # finished this level, nothing left to push
         await safe_send(
             bot, uid,
-            f"\U0001f4c5 Your Monday quiz: set {current['number']} of "
+            f"📅 Your Monday quiz: set {current['number']} of "
             f"{current['total_sets']}, {SET_PER_PUSH} questions.",
         )
         await asyncio.sleep(FANOUT_PAUSE)

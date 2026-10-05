@@ -734,6 +734,54 @@ async def test_start_greets_by_name_and_escapes_it(fake):
     assert "/quizme" in text and "Acuity Team" in text
 
 
+def test_html_is_never_sent_without_parse_mode():
+    """Copy rule: a message containing markup must declare parse_mode="HTML".
+
+    Telegram does not guess. Without it a student sees the literal characters
+    "<b>Revision sheets</b>", which is exactly what happened to RESOURCES_INTRO
+    the moment it gained a bold heading. Static rather than per-handler, so a new
+    message cannot slip through untested.
+    """
+    import ast
+    import re
+    from pathlib import Path as _Path
+
+    tag = re.compile(r"</?(?:b|i|code|pre|u|s|a)\b")
+    senders = ("answer", "edit_text", "send_message", "safe_send")
+    offenders = []
+
+    for path in sorted((_Path(__file__).resolve().parent.parent / "bot").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        # Module-level string constants, so a message held in one is checked at
+        # its send site rather than only where it is defined.
+        consts = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)):
+                try:
+                    value = ast.literal_eval(node.value)
+                except Exception:
+                    continue
+                if isinstance(value, str):
+                    consts[node.targets[0].id] = value
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "attr", None)
+            if name not in senders or "parse_mode" in {k.arg for k in node.keywords}:
+                continue
+            # safe_send(bot, uid, text); everything else takes the text first.
+            index = 2 if name == "safe_send" else 0
+            if len(node.args) <= index:
+                continue
+            source = ast.unparse(node.args[index])
+            if tag.search(consts.get(source, source)):
+                offenders.append(f"{path.name}:{node.lineno} {name}({source[:40]})")
+
+    assert offenders == [], offenders
+
+
 def test_no_em_dashes_in_anything_students_see():
     """Copy rule: no em dashes in user-facing text."""
     import ast
@@ -1096,11 +1144,23 @@ async def test_stats_breaks_the_running_total_down(fake):
     await handlers.stats_cmd(msg)
 
     text = msg.answer.messages[-1]
-    assert "Correct: 2 of 3 (67%)" in text
-    assert "Optics: 1/2" in text
-    assert "Retina: 1/1" in text
-    assert "Weakest here: Optics" in text
-    assert "Physiology | optics: 1/2" in text, "broken down by question type too"
+    assert "Correct <b>2</b> of 3 (67%)" in text
+    # Topics are ranked by accuracy, weakest first, with the percentage spelled
+    # out: there are only 6 to 18 of them per level and each carries enough
+    # answers for a percentage to mean something.
+    assert "Optics \u00b7 1/2 (50%)" in text
+    assert "Retina \u00b7 1/1 (100%)" in text
+    assert text.index("Optics \u00b7") < text.index("Retina \u00b7"), "weakest first"
+
+    # Question types are listed, NOT ranked. `questions.tag` is close to a
+    # per-question label (71 to 92 distinct types over 103 to 170 questions), so
+    # a percentage on one of them would be fake precision. What the student gets
+    # is which kinds of question they actually missed.
+    assert "Question types you have missed" in text
+    assert "Physiology | optics" in text
+    assert "Pathology | retina" not in text, "they got that one right"
+    assert "%)" not in text.split("Question types you have missed")[1], (
+        "a type with one or two answers must not be given a percentage")
 
 
 @pytest.mark.asyncio
