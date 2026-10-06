@@ -290,22 +290,52 @@ async def test_safe_send_refuses_an_empty_message():
 
 
 def a_question(level, topic):
-    """A real level and topic, so the Notes pointer is resolved for real rather
+    """A real level and topic, so the Notes button is resolved for real rather
     than through a stub."""
     return {"id": 1, "level": level, "topic": topic, "text": "Question?",
             "options": '["a","b","c","d","e"]', "correct_idx": 0}
 
 
+def notes_row(kwargs):
+    """The trailing Notes button from a sent card, if there is one."""
+    rows = kwargs["reply_markup"].inline_keyboard
+    if len(rows) < 2:
+        return None
+    return rows[-1][0]
+
+
 @pytest.mark.asyncio
-async def test_a_question_card_points_at_the_sheets_for_its_topic():
+async def test_a_question_carries_a_notes_button_for_its_topic():
     bot = Recorder()
 
     await sender.send_question(bot, 7, a_question(
         "preclin", "Optics and visual transduction"), "practice")
 
-    text, kwargs = bot.messages[-1]
-    assert text.endswith("📘 Notes for this topic: /notes 03")
+    _, kwargs = bot.messages[-1]
+    button = notes_row(kwargs)
+    assert button is not None, "the card should offer the topic's sheet"
+    assert button.text == "📘 Notes for this topic"
+    # The sheet itself travels in the callback. A `/notes 03` line in the text
+    # did not survive being tapped: Telegram only makes the command word
+    # tappable, so the tap arrived as a bare `/notes` and sent the wrong sheet.
+    assert button.callback_data == "res:get:preclin:a:03"
     assert kwargs["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_the_option_buttons_are_untouched_by_the_notes_row():
+    bot = Recorder()
+
+    await sender.send_question(bot, 7, a_question(
+        "preclin", "Optics and visual transduction"), "practice")
+
+    _, kwargs = bot.messages[-1]
+    rows = kwargs["reply_markup"].inline_keyboard
+    assert len(rows) == 2, "options on one row, Notes on its own below them"
+    assert [b.text for b in rows[0]] == ["1", "2", "3", "4", "5"]
+    assert [b.callback_data for b in rows[0]] == [
+        "a:1:0:practice", "a:1:1:practice", "a:1:2:practice",
+        "a:1:3:practice", "a:1:4:practice"]
 
 
 @pytest.mark.asyncio
@@ -315,17 +345,20 @@ async def test_a_postmbbs_question_finds_its_sheet_through_the_title():
     await sender.send_question(bot, 7, a_question(
         "postmbbs", "Uveitis and inflammatory medicine"), "practice")
 
-    text, _ = bot.messages[-1]
-    assert text.endswith("📘 Notes for this topic: /notes A07")
+    _, kwargs = bot.messages[-1]
+    assert notes_row(kwargs).callback_data == "res:get:postmbbs:a:A07"
 
 
 @pytest.mark.asyncio
-async def test_a_topic_with_no_sheet_carries_no_notes_line():
+async def test_a_topic_with_no_sheet_carries_no_notes_button():
+    """No sheet for the topic means no button, rather than one that would send
+    the wrong sheet or an error."""
     bot = Recorder()
 
     await sender.send_question(bot, 7, a_question("postmbbs", "Pathology"),
                                "practice")
 
-    text, _ = bot.messages[-1]
-    assert "/notes" not in text
-    assert text.endswith("<b>5.</b> e")
+    _, kwargs = bot.messages[-1]
+    rows = kwargs["reply_markup"].inline_keyboard
+    assert len(rows) == 1, "options only"
+    assert all(b.callback_data.startswith("a:") for row in rows for b in row)

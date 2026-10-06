@@ -18,7 +18,7 @@ from . import db
 from .config import LEVELS
 from .resources import MAX_UPLOAD_BYTES, for_topic
 from .text import (MAX_OPTIONS, TELEGRAM_LIMIT, WEEKLY_HEADER, chunks, letter,
-                   notes_line, render)
+                   render)
 
 log = logging.getLogger(__name__)
 
@@ -217,12 +217,21 @@ async def safe_send(bot: Bot, uid: int, text: str, *,
     return True
 
 
-def question_kb(qid: int, count: int, mode: str) -> InlineKeyboardMarkup:
+def question_kb(qid: int, count: int, mode: str,
+                notes: InlineKeyboardButton | None = None) -> InlineKeyboardMarkup:
+    """The option buttons, with the topic's Notes button on its own row below.
+
+    Its own row on purpose: the option rows are the answer, and a Notes button
+    among them would be one mis-tap away from answering the question for them.
+    Callers that pass no `notes` get exactly the keyboard they got before.
+    """
     buttons = [
         InlineKeyboardButton(text=letter(i), callback_data=f"a:{qid}:{i}:{mode}")
         for i in range(count)
     ]
     rows = [buttons[i:i + _BUTTONS_PER_ROW] for i in range(0, len(buttons), _BUTTONS_PER_ROW)]
+    if notes is not None:
+        rows.append([notes])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -236,15 +245,27 @@ def card_header(mode: str) -> str | None:
     return WEEKLY_HEADER if mode == "weekly" else None
 
 
-def notes_footer(question) -> str | None:
-    """The Notes pointer for a question's topic, or None if no sheet covers it.
+def notes_button(question) -> InlineKeyboardButton | None:
+    """A button that sends the sheet for this question's topic, or None.
+
+    A button rather than a `/notes 03` line in the card text, which is how this
+    started. Telegram only makes the *command word* tappable: tapping
+    "/notes 03" sends a bare "/notes", so the student got the first sheet in their
+    queue instead of the one on the card in front of them. Callback data carries
+    the sheet itself, so the tap cannot lose it.
 
     Read off the question's own level and topic, so the same card points at the
-    same sheet no matter which command sent it, and a question in a topic with no
-    sheet yet simply goes without the line rather than showing a dead reference.
+    same sheet no matter which command sent it. A question in a topic with no
+    sheet goes without the button.
     """
     note = for_topic(question.get("level"), question.get("topic") or "")
-    return notes_line(note.code) if note else None
+    if note is None:
+        return None
+    return InlineKeyboardButton(
+        text="📘 Notes for this topic",
+        # The same callback the /resources browser uses, so the sheet goes out
+        # through the one delivery path and is recorded as delivered either way.
+        callback_data=f"res:get:{note.level}:{note.tier}:{note.code}")
 
 
 async def send_question(bot: Bot, uid: int, question, mode: str,
@@ -255,8 +276,7 @@ async def send_question(bot: Bot, uid: int, question, mode: str,
                                pace=pace)
     try:
         body, count = render(question,
-                             header=None if lead else card_header(mode),
-                             footer=notes_footer(question))
+                             header=None if lead else card_header(mode))
     except ValueError:
         # Malformed row (wrong number of options). Report it instead of crashing.
         log.exception("question %s is malformed", question.get("id"))
@@ -265,8 +285,10 @@ async def send_question(bot: Bot, uid: int, question, mode: str,
                       "Tap /quizme for another one.", pace=pace)
     if lead:
         body = f"{lead}\n{body}"
-    return await safe_send(bot, uid, body, parse_mode="HTML", pace=pace,
-                           reply_markup=question_kb(question["id"], count, mode))
+    return await safe_send(
+        bot, uid, body, parse_mode="HTML", pace=pace,
+        reply_markup=question_kb(question["id"], count, mode,
+                                 notes=notes_button(question)))
 
 
 async def send_question_for_level(bot: Bot, uid: int, level: str, mode: str) -> bool:
