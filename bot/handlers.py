@@ -17,8 +17,8 @@ from . import commands, db, jobs, llm, resources
 from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVEL_EMOJI, LEVELS, TZ
 from .sender import (ack, card_header, deliver_verdict, drop_buttons, edit_in_place,
                      forget_outstanding,
-                     remaining_buttons, safe_send, send_note, send_question,
-                     send_question_for_level)
+                     notes_button, remaining_buttons, safe_send, send_note,
+                     send_question, send_question_for_level)
 from .text import (EXPLANATION_HEADING, MAX_OPTIONS, TELEGRAM_LIMIT, esc,
                    explanation_block, mask, parse_options, render, sheets_done, verdict)
 
@@ -489,18 +489,23 @@ async def on_answer(c: CallbackQuery):
                 log.debug("streak lookup failed", exc_info=True)
 
         # Re-rendered from the database rather than appended to message.text, so
-        # the answered card can mark the options in place.
+        # the answered card can mark the options in place. The Notes button is
+        # rebuilt here too: the answered card is what stays in the chat, so a
+        # pointer that vanished on the first tap would be useless.
         body, _ = render(question, chosen=idx, header=card_header(mode))
         buttons = [InlineKeyboardButton(text="💡 Explain", callback_data=f"e:{question['id']}")]
         if mode == "practice":
             buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data="next"))
+        rows = [buttons]
+        if (notes := notes_button(question)) is not None:
+            rows.append([notes])
 
         answered = True
         await ack(c)
         await deliver_verdict(
             c,
             f"{body}\n\n{verdict(correct, question['correct_idx'], streak)}",
-            InlineKeyboardMarkup(inline_keyboard=[buttons]),
+            InlineKeyboardMarkup(inline_keyboard=rows),
         )
         if mode in SET_CLOSING_MODES:
             # Only a question answered for the first time advances a set, so only

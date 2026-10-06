@@ -1781,3 +1781,64 @@ async def test_reset_refuses_unexpected_callback_data(fake, data):
 
     assert c.answers and c.answers[-1]["alert"] is True
     assert not any(call[0] == "reset_progress" for call in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_the_answered_card_still_offers_the_notes(fake):
+    """The fresh card is edited into the answered one, so a button that vanished
+    on the first tap would be useless: this is the card that stays in the chat,
+    and having just read the question is exactly when the background is wanted."""
+    question = add_question(fake, correct_idx=0)
+    question["topic"] = "Optics and visual transduction"
+    message = FakeMessage()
+
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=message))
+
+    rows = message.edits[-1]["reply_markup"].inline_keyboard
+    assert [b.text for b in rows[0]] == ["💡 Explain", "Next ➡️"]
+    assert [b.text for b in rows[1]] == ["📘 Notes for this topic"]
+    assert rows[1][0].callback_data == "res:get:preclin:a:03"
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_answer_also_keeps_the_notes_button(fake):
+    question = add_question(fake, correct_idx=0)
+    question["topic"] = "Retinal and anterior segment pathology"
+    message = FakeMessage()
+
+    await handlers.on_answer(FakeCallback("a:1:2:practice", message=message))
+
+    rows = message.edits[-1]["reply_markup"].inline_keyboard
+    assert rows[1][0].callback_data == "res:get:preclin:a:06"
+
+
+@pytest.mark.asyncio
+async def test_tapping_the_notes_button_delivers_the_sheet_on_the_card(fake):
+    """The whole path, from the button's callback data to the document.
+
+    This is precisely what the `/notes 03` text line got wrong: Telegram made only
+    the command word tappable, so the tap arrived as a bare `/notes` and the
+    student got whatever happened to be first in their queue. The callback carries
+    the sheet, so the sheet is what arrives.
+    """
+    from bot import sender
+
+    button = sender.notes_button({
+        "id": 1, "level": "preclin", "topic": "Optics and visual transduction"})
+    assert button is not None and button.callback_data == "res:get:preclin:a:03"
+
+    c = FakeCallback(button.callback_data, message=FakeMessage())
+    await handlers.resources_cb(c, fake.bot)
+
+    sent = [m for m in fake.bot.sent if "document" in m]
+    assert sent, fake.bot.sent
+    assert "Optics and visual transduction" in sent[-1]["caption"], sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_notes_button_sends_nothing_for_a_topic_with_no_sheet(fake):
+    """No sheet means no button, so there is nothing to tap and nothing to fail."""
+    from bot import sender
+
+    assert sender.notes_button({"id": 1, "level": "postmbbs",
+                                "topic": "Pathology"}) is None

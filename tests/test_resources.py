@@ -240,3 +240,69 @@ def test_an_unknown_level_falls_back_rather_than_raising():
     assert resources.overview(None) == resources.overview("preclin")
     assert resources.overview("nonsense") == resources.overview("preclin")
     assert resources.find(None, "03") is not None
+
+
+# ------------------------------------------------------- by question topic
+
+
+@pytest.mark.parametrize("level", LEVELS)
+def test_every_overview_sheet_finds_itself_by_topic(level):
+    """A sheet's own topic must resolve back to that sheet, or a question in that
+    topic would be pointed at some other topic's notes."""
+    for note in resources.overview(level):
+        found = resources.for_topic(level, note.topic)
+        assert found is not None and found.code == note.code, note.topic
+
+
+def test_a_preclinical_topic_resolves_to_its_overview_sheet():
+    note = resources.for_topic("preclin", "Optics and visual transduction")
+    assert note is not None and note.code == "03"
+
+
+@pytest.mark.parametrize("topic,code", [
+    ("Clinical assessment and vision loss", "C01"),
+    ("Lens lids and paediatric eye", "C07"),
+])
+def test_clinical_topics_resolve(topic, code):
+    note = resources.for_topic("clin", topic)
+    assert note is not None and note.code == code
+
+
+@pytest.mark.parametrize("topic,code", [
+    # The post-MBBS overview sheets are descriptive titles rather than the bank's
+    # own topic names, so these only resolve through the shared-word fallback.
+    ("Anatomy and embryology", "A01"),
+    ("Physiology and biochemistry", "A02"),
+    ("Optics and refraction", "A03"),
+    ("Biostatistics and evidence", "A05"),
+    ("Uveitis and inflammatory medicine", "A07"),
+    ("Cataract and lens surgery", "A09"),
+    ("Optics and refractive surgery", "A10"),
+])
+def test_postmbbs_topics_match_the_descriptive_titles(topic, code):
+    note = resources.for_topic("postmbbs", topic)
+    assert note is not None and note.code == code, topic
+
+
+@pytest.mark.parametrize("topic", ["Pathology", "Pharmacology", "Genetics",
+                                   "Microbiology and immunology"])
+def test_a_topic_with_no_sheet_gets_no_pointer(topic):
+    """The post-MBBS bank has questions the sheets do not cover. A question with
+    no Notes line is better than one pointing at a sheet about something else."""
+    assert resources.for_topic("postmbbs", topic) is None
+
+
+def test_a_topic_nobody_wrote_a_sheet_for_gets_no_pointer():
+    assert resources.for_topic("preclin", "Underwater basket weaving") is None
+    assert resources.for_topic("preclin", "") is None
+    assert resources.for_topic("preclin", "   ") is None
+
+
+def test_the_match_never_leaves_the_level():
+    """The pointer travels with the question's own level, so a look-up can only
+    ever return a sheet from that level."""
+    for level in LEVELS:
+        for note in resources.overview(level):
+            for other in LEVELS:
+                found = resources.for_topic(other, note.topic)
+                assert found is None or found.level == other

@@ -41,6 +41,7 @@ Built by the **Acuity Team** — Zhong Han, Hongpeng, Rahul, Jeromy.
 | `/weeklyquiz` scoring | The Monday push answers count toward your sets, but **never** toward the tournament |
 | `/stats` | Marker A: the running total, then accuracy broken down by **topic** and by **question type** (`questions.tag`), weakest first |
 | `/notes` | Your next unseen cheat sheet: overview sheets first, then focused, then "syllabus complete" |
+| Notes under a question | Every question card carries a **📘 Notes for this topic** button under the options, so the sheet for whatever is being tested is one tap away. It stays on the card after it is answered, and it sends the sheet for *that* question rather than the next one in the queue |
 | `/review` | Re-serves the questions you got wrong, with their explanations |
 | `/resources` | Browse every sheet, or fetch one by code (`/resources b14`) |
 | `/changestreams` | Pre-Clinical / Clinical / Post-MBBS. Questions *and* sheets follow it |
@@ -103,6 +104,29 @@ To students these are "Overview" and "Focused" sheets, never "Tier A" and
 arrived named `B01_Clinical_Type_B_...`; that shorthand was stripped on import,
 and the clinical overview sheets were renamed to the seven clinical question
 topics so the sheets and the bank describe the same seven things.
+
+**Every question points at the sheet for its own topic.** The button under the
+options comes from `resources.for_topic(level, question["topic"])`, resolved from
+the question's own level and topic, so the same card points at the same sheet
+however it was sent and the button survives the card being edited into its
+answered state.
+
+**It is a button rather than a `/notes 03` line in the card text, and that is not
+a style choice.** Telegram only makes the *command word* tappable: a tapped
+`/notes 03` arrives as a bare `/notes`, which hands the student the first sheet in
+their queue rather than the one on the card. The button's callback data carries
+the level, kind and code, so the tap cannot lose the sheet — and it reuses the
+`/resources` delivery path, so the sheet still goes through the one place that
+records a delivery.
+
+Matching is an exact topic match first; failing that, shared words carry it,
+because the post-MBBS overview sheets are descriptive titles ("Applied ocular
+anatomy and development") rather than the bank's shorter topic names ("Anatomy
+and embryology"). A shared word that appears in only one sheet's title is enough
+on its own, otherwise two shared words are needed. Where the sheets genuinely do
+not cover a topic — the post-MBBS bank has questions on pathology, pharmacology,
+genetics and microbiology with no sheet for any of them — the question carries no
+button rather than a wrong one.
 
 **`/notes` is a progression, not a picker.** It hands over the next sheet the
 student has not had — overview sheets first, then focused ones — and when they
