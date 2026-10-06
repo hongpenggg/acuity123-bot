@@ -7,10 +7,10 @@ import logging
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import CallbackQuery, ErrorEvent
+from aiogram.types import CallbackQuery, ErrorEvent, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from . import commands, db, handlers, jobs
+from . import commands, db, handlers, jobs, throttle
 from .config import ADMIN_IDS, BOT_TOKEN, DATABASE_URL, TZ
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,11 @@ async def on_error(event: ErrorEvent) -> None:
     log.error("unhandled %s", type(event.update.event).__name__,
               exc_info=event.exception)
     if isinstance(event.update.event, CallbackQuery):
+        with contextlib.suppress(Exception):
+            await event.update.event.answer("Something went wrong. Please try again.")
+    elif isinstance(event.update.event, Message):
+        # A command that fails used to end in silence, which a student cannot
+        # tell apart from the bot being down.
         with contextlib.suppress(Exception):
             await event.update.event.answer("Something went wrong. Please try again.")
 
@@ -33,6 +38,9 @@ async def main() -> None:
 
     await db.init(DATABASE_URL)
     bot = Bot(BOT_TOKEN)
+    # Every call goes through one outbound budget and is retried on a 429, so a
+    # busy moment queues briefly instead of a student getting silence.
+    bot.session.middleware(throttle.FloodGuard())
     dp = Dispatcher()
     dp.include_router(handlers.router)
     dp.errors.register(on_error)
