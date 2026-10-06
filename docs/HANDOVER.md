@@ -2,7 +2,8 @@
 
 Everything here is written for whoever picks this up next. No prior context needed.
 
-**Status at handover.** All three banks are loaded — **Pre-Clinical** 120
+**Status at handover.** 283 tests, four CI steps, six migrations. All three banks
+are loaded — **Pre-Clinical** 120
 questions, **Clinical** 103, **Post-MBBS** 170, so 393 in total, every one with a
 written explanation and none of them needing the LLM.
 [§2](#2-adding-a-question-bank) is the step-by-step for regenerating a bank or
@@ -342,15 +343,30 @@ sudo systemctl restart studybot
 `bot/handlers.py` (`TAGLINE`, `FUNCTIONS`, and `welcome()` which assembles them).
 Editing either needs a `git pull` + restart.
 
-Two copy rules are enforced by tests, so a well-meant edit can fail CI:
+Four rules are enforced by tests, so a well-meant edit can fail CI. Each exists
+because the thing it forbids actually shipped:
 
 - **No em dashes** anywhere a student can see
   (`tests/test_handlers.py::test_no_em_dashes_in_anything_students_see`). Use
   `->` or a comma, as the existing copy does.
-- **Every `/command` named in the welcome must be registered**
-  (`test_welcome_only_names_commands_that_exist`). It walks the router, so
-  advertising a command that does not exist fails rather than shipping a dead
-  link for students to tap.
+- **Every `/command` named in the welcome must be registered, and be in the
+  menu** (`test_welcome_only_names_commands_that_exist`). It walks the router
+  rather than a hand-kept list. A draft of the welcome once advertised
+  `/subscribeqn`, `/subscribenotes`, `/unsub_qns` and `/unsub_notes`, none of
+  which existed; a student tapping one would have got silence.
+- **Any message containing markup must pass `parse_mode="HTML"`**
+  (`test_html_is_never_sent_without_parse_mode`). Telegram does not guess: it
+  shows the literal `<b>`. This test originally inspected only method calls, so
+  every bare `safe_send(...)` in `bot/` escaped it and the tournament
+  announcement went out with visible tags.
+- **The sheet catalogue must match what is on disk** (`tests/test_resources.py`).
+  Adding a sheet is dropping a PDF in and committing it, so a misnamed file fails
+  here rather than quietly disappearing from the list students see.
+
+If you are changing copy, the fastest check is not to read it. Drive the real
+handlers against a real database with a fake bot and print what comes out, the
+way `tests/test_handlers.py` does. Several bugs that survived careful reading
+were obvious on the first render.
 
 ---
 
@@ -371,7 +387,31 @@ sudo -u deploy .venv/bin/pip install -r requirements.txt   # if dependencies cha
 sudo systemctl restart studybot
 ```
 
-**After a schema change** also run the matching file in `migrations/`.
+**After a schema change, run the migrations.** `schema.sql` builds a *fresh*
+database; an existing one is brought forward by the numbered files in
+`migrations/`, in order. They are idempotent, so running them all is always safe
+and is the correct response to not being sure which have been applied:
+
+```bash
+cd /opt/studybot
+for f in migrations/*.sql; do
+    psql "$(grep '^DATABASE_URL=' .env | cut -d= -f2-)" -v ON_ERROR_STOP=1 -f "$f"
+done
+```
+
+| Migration | What it adds | Needed by |
+|---|---|---|
+| `001` | `level` columns, `tournament_answers` | levels, tournament dedup |
+| `002` | `questions.tag` | the per-question-type half of `/stats` |
+| `003` | `note_deliveries` | `/notes` as a progression, the fortnightly drop |
+| `004` | `'review'` as an answer mode | `/review`, and keeping it out of scoring |
+| `005` | one scoring answer per question; `level` CHECKs | two live cards for one question |
+| `006` | one active tournament | two concurrent `/admin_tournament_start` taps |
+
+`005` reclassifies any existing duplicate answers rather than deleting them, and
+both `005` and `006` abort with a readable message if the data already breaks
+the rule they are about to enforce. Nothing is applied half-way: each runs in a
+transaction.
 
 > **`systemctl is-active` lies on a crash loop.** With `Restart=always`, a unit
 > that is dying and restarting still reports `active`. Always check `NRestarts`
@@ -436,8 +476,33 @@ Still open, and nothing here is blocked by anything else:
 | **Content is shipped by git, not by the content team** | The biggest architectural limitation here: every question, sheet and line of copy is baked into the deploy artifact, so changing any of it is a developer task. Three incremental steps out of it, and the traps to avoid, in [§11](#11-the-content-pipeline-needs-to-stop-being-the-git-repo) |
 | **Seventeen clinical cases need their photographs** | The clinical bank is 103 of 120 cases: the rest are built around an embedded photograph the bot cannot send. Four of them probably stand alone as text and are a quick win; thirteen need `sender.send_question` to upload a figure, or a rewritten stem. The images are unmodified M3 Anki and quiz-PDF material, so the README's content policy has to be cleared first. Everything — the list, both routes, and the one-line switch — is in [§2.6](#26-the-seventeen-clinical-cases-that-are-held-back) |
 | **Dropping the old command names** | `/practice`, `/subscribe`, `/unsubscribe`, `/notes_sub`, `/notes_unsub` and `/level` still work as aliases so nothing in a student's existing chat breaks. They are the extra names on each `Command(...)` decorator |
-| **Sets are deliberately not adaptive** | A shared benchmark needs the same five questions for everyone, so per-student topic weighting was removed. The adaptive selector is in git history, at the commit before the sets landed |
 | **Nothing shows a student their question history** | Intentional for marker B: other students cannot see anyone's activity. Every answer is in `attempts` if a per-question view is ever wanted |
+| **A restart can skip a weekly push** | APScheduler computes `next_run_time` from boot with the default in-memory job store, so a restart at 09:05 on a Monday schedules the push for the *following* Monday, silently. Both fixes are costed in the comment at `jobs.register`; neither looked worth the dependency |
+| **A shutdown can truncate a fan-out** | `main.py` drains for up to 5s before the scheduler goes down. Subscribers not reached keep their queue, so the cost is a fortnight's nudge rather than a sheet |
+
+### What four audits found, and why it is worth knowing
+
+After the banks landed, four read-only audits went over the scheduled jobs, the
+message copy, the SQL and the handler flows. They found 20-odd real defects and
+every one was reproduced before it was fixed. The pattern is worth carrying
+forward, because it will repeat:
+
+- **Numbers that were right but described wrongly.** `/admin_weekly_now` reported
+  "Sent 15 question(s)" for a five-question set, because the total was summed
+  across subscribers while the sentence read as one student's. Arithmetic is not
+  the hard part; saying what a number counts is.
+- **Code with no test at all.** `weekly_quiz` and `fortnightly_notes` fan out to
+  every subscriber and had zero coverage, which is how both of the bugs a live
+  user hit got there. `tests/test_jobs_live.py` exists now.
+- **Guards with holes.** The test that forbids unmarked HTML read only method
+  calls, so every bare `safe_send(...)` in `bot/` went unchecked, and the
+  tournament announcement shipped literal `<b>` tags to every user.
+- **Copy that outlived its code.** A docstring still described sets as a fixed
+  benchmark months after they became adaptive. Treat a comment that disagrees
+  with the code as a bug report.
+- **Races that only a database can settle.** Two admin taps opened two
+  tournaments; two job runs sent the same PDF twice. Check-then-act in Python
+  does not survive concurrency, and this bot answers updates as tasks.
 
 ---
 
@@ -445,38 +510,67 @@ Still open, and nothing here is blocked by anything else:
 
 ```
 bot/config.py       credit block, levels, tuning, repo links
-bot/commands.py     the command menu and its per-chat scopes
+bot/commands.py     the Telegram command menu and its per-chat scopes
 bot/handlers.py     commands and callbacks (the /start copy is here)
-bot/db.py           every SQL statement, including topic weighting and no-repeats
+bot/db.py           every SQL statement: question selection, sets, notes, tournament
 bot/resources.py    the note catalogue, built by scanning resources/notes
-bot/text.py         option numbering and rendering (pure, easy to unit test)
-bot/jobs.py         the scheduled pushes and tournament closing
-seeds/              the question banks, one file per tier
-resources/          the .docx sources and the note PDFs
+bot/text.py         rendering, option numbering, HTML-safe splitting (pure)
+bot/sender.py       outbound Telegram: retry, rate limiting, uploads, outstanding cards
+bot/jobs.py         the scheduled pushes, tournament closing, single-flight guards
+bot/main.py         wiring, the error handler, graceful shutdown and drain
+schema.sql          a fresh database
+migrations/         bringing an existing one forward, 001 to 006
+seeds/              the question banks, one file per level
+resources/          the .docx sources and 153 note PDFs, per level
 tools/              regenerates the seeds from the .docx files
+scripts/check_sql.py  parses every statement with the real PostgreSQL grammar
 docs/SETUP.md       full server runbook, troubleshooting table, event-day checklist
-tests/              unit, handler and live-database suites — all run in CI
 ```
 
-`pytest` runs everything. The live-database tests skip unless `TEST_DATABASE_URL`
-is set; CI sets one up, so **push a branch and let CI run** rather than testing
-locally.
+**The tests, 283 of them.** `pytest` runs everything; the live-database ones skip
+unless `TEST_DATABASE_URL` is set, and CI provides one.
+
+| File | Covers |
+|---|---|
+| `test_text.py` | rendering, numbering, masking, HTML-safe splitting |
+| `test_handlers.py` | every command and callback, against in-memory fakes |
+| `test_sender.py` | retry, flood control, the rate limiter |
+| `test_sender_live.py` | outstanding cards, against a real database |
+| `test_db_live.py` | the SQL, the constraints, the tournament dedup |
+| `test_sets_live.py` | set arithmetic, the adaptive picker, the review pile |
+| `test_jobs_live.py` | both scheduled fan-outs |
+| `test_seed_data.py` | the three loaded banks, rendered through the real path |
+| `test_resources.py` | the catalogue against what is on disk |
+| `test_llm.py` | the optional explanation fallback |
+
+**Push a branch and let CI run** rather than relying on a local pass: CI stands up
+a real PostgreSQL, so the live suites actually execute there.
 
 ---
 
 ## 9. Open questions
 
-1. **Is six sheets per fortnightly drop the right pace?** `jobs.SHEETS_PER_DROP`
-   is one constant. At six, preclinical (26 sheets) is finished in about two
-   months and post-MBBS (80) in about seven. The reserved-six scheme it replaced
-   is gone: `note_deliveries` means nothing is ever sent twice, so there is no
-   per-level curation to do.
-2. **Is a set of five the right size?** It is one constant (`db.SET_SIZE`). A
-   student clearing 120 questions walks 24 sets; if that feels long for an event,
-   a bigger set is a one-line change, and progress carries over.
-3. **Should the reserved sheets rotate?** `resources.MONTHLY_CODES` is fixed, so the
-   same six focused sheets go out every month. If the drop should walk through the
-   whole bank over several months, that becomes a rotation keyed on the month.
+1. **Is one sheet per fortnightly drop the right pace?** `jobs.SHEETS_PER_DROP`
+   is one constant. At one, preclinical (26 sheets) takes about a year and
+   post-MBBS (80) far longer, so for most students `/notes` on demand will be the
+   real route and the drop is a nudge. Raising it is a one-line change; the
+   earlier six felt like a wall of PDFs in a phone client, which is why it is one.
+2. **Is a set of five the right size?** One constant (`db.SET_SIZE`). Pre-Clinical
+   is 24 sets, Clinical 21, Post-MBBS 34. A bigger set is a one-line change and
+   progress carries over, because a set is derived from the answer count rather
+   than stored.
+3. **Should the Clinical and Post-MBBS banks have their own sheets?** The
+   catalogue is per level now, and Pre-Clinical and Clinical overview sheets match
+   their question topics one-to-one. Post-MBBS does not: eighteen question topics
+   against fifteen overview sheets, organised differently
+   (`test_post_mbbs_sheets_do_not_line_up_with_its_topics` pins what is actually
+   there and explains why).
+4. **Should a student be able to start the sheets again?** `db.reset_notes` is
+   written and tested but nothing calls it. Someone who has finished their level
+   has no way to re-read the set as a course.
+5. **Should `/review` ever expire?** The pile is "every question whose latest
+   answer was wrong", with no sense of when. A question missed in September and
+   never revisited sits there forever alongside one missed yesterday.
 
 ---
 

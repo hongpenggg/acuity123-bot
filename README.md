@@ -36,24 +36,35 @@ Built by the **Acuity Team** — Zhong Han, Hongpeng, Rahul, Jeromy.
 
 | Area | Behaviour |
 |---|---|
-| `/quizme` | A **set of five** questions, options numbered 1–5. The set is a fixed block of five in id order, so every student's set 1 is the same five questions: the scores mean the same thing for everyone. The score is reported when the fifth is answered |
-| Sets, softly | Stop whenever you like; the set resumes where you left off. The blocks are derived from the database rather than stored, so there is no session state to go stale |
+| `/quizme` | A **set of five** questions, options numbered 1–5, picked for you: spread across topics first, then weighted toward the topics you keep getting wrong. The score is reported when the fifth is answered |
+| Sets, softly | Stop whenever you like and pick up where you left off. A set is simply your next five answers, derived from the `attempts` table rather than stored, so there is no session state to go stale |
+| `/weeklyquiz` scoring | The Monday push answers count toward your sets, but **never** toward the tournament |
 | `/stats` | Marker A: the running total, then accuracy broken down by **topic** and by **question type** (`questions.tag`), weakest first |
 | `/notes` | Your next unseen cheat sheet: overview sheets first, then focused, then "syllabus complete" |
 | `/review` | Re-serves the questions you got wrong, with their explanations |
 | `/resources` | Browse every sheet, or fetch one by code (`/resources b14`) |
 | `/changestreams` | Pre-Clinical / Clinical / Post-MBBS. Questions *and* sheets follow it |
-| `/weeklyquiz` | The Monday set of five. Deliberately does **not** score for the tournament |
+| `/weeklyquiz` | Five questions every Monday, picked the same way. Deliberately does **not** score for the tournament |
 | `/subscribenotes` | On the 1st and 15th: the next few sheets you have not had, as PDFs |
 | Tournament | An admin switches it on and **everyone who has used `/start` is entered automatically**; only `/quizme` scores, once per question; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
 | Marker B | Tournament points, shown as standings only. Question and activity counts are never shown to students |
 | 💡 Explain | Serves the written explanation stored with the question; the LLM is only a fallback and is optional |
 | Menu | Telegram keeps a command list per chat. The default shows only `/start`; sending `/start` sets that chat's full menu, which is what makes `/quizme` and the rest appear |
 
-Fixed sets replaced per-student adaptive weighting. The point of a benchmark is
-that everyone answers the same five questions, so the scores are comparable; the
-adaptive selector is in git history (the commit before the sets landed) if that
-trade-off is ever worth revisiting.
+**Sets are adaptive, and that is a deliberate trade.** An earlier version served
+a fixed block of five in id order so every student's set 1 was identical and the
+scores were directly comparable. Variety and revisiting weak topics were judged
+worth more than that comparability, so `db.pick_question` now ranks every
+unattempted question by: a topic not already in the set being built, then an
+unused question type, then the topics the student is weakest on, then random. An
+untouched topic sits exactly between weak and mastered, so new material still
+comes round.
+
+Two students therefore do not walk the same path, and set numbers are **not**
+comparable between students. Compare them with `/stats` or the tournament
+instead. `/review` exists because of this too: `pick_question` only ever serves
+questions a student has never attempted, so without it a missed question would
+never come back.
 
 ## Revision notes
 
