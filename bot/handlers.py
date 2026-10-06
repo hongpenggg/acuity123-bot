@@ -91,7 +91,8 @@ HELP = (
     "📅 /weeklyquiz a set every Monday\n"
     "🗓 /subscribenotes cheat sheets every fortnight\n"
     "🏆 /tournament the competition status\n"
-    "🥇 /leaderboard the top 3 and your rank\n\n"
+    "🥇 /leaderboard the top 3 and your rank\n"
+    "🔄 /reset start your sets and stats again\n\n"
     "Turn the two subscriptions off with /stopweekly and /stopmonthly, or with "
     "the button on their confirmation.\n"
     "/topicalnotes and /randomnotes still work if you prefer them."
@@ -614,6 +615,92 @@ async def review(m: Message, bot: Bot):
     await m.answer(head, parse_mode="HTML")
     for question in pile:
         await send_question(bot, uid, question, "review")
+
+
+# ------------------------------------------------------------------- reset
+
+
+def _reset_kb(level: str) -> InlineKeyboardMarkup:
+    """The level rides in the callback data, so a student who switches stream
+    between /reset and the tap still resets the level the button names."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔄 Reset {LEVELS[level]}",
+                              callback_data=f"rs:lvl:{level}")],
+        [InlineKeyboardButton(text="🔄 Reset all levels", callback_data="rs:all")],
+        [InlineKeyboardButton(text="Cancel", callback_data="rs:no")],
+    ])
+
+
+@router.message(Command("reset"))
+async def reset_cmd(m: Message):
+    """Ask first. Clearing answers cannot be undone, so the command only offers
+    it; the button does it."""
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    level = _level(await db.get_level(uid))
+    await m.answer(
+        "🔄 <b>Start again?</b>\n\n"
+        "This clears your answers, so you go back to set 1 and /stats and "
+        "/review start empty.\n\n"
+        "Your tournament points and cheat-sheet progress stay as they are.\n"
+        "This can't be undone.",
+        parse_mode="HTML", reply_markup=_reset_kb(level))
+
+
+async def _close_reset(c: CallbackQuery, text: str) -> None:
+    """Replace the question with the outcome, buttons and all, so the same
+    confirmation cannot be tapped twice. A new message if the edit fails."""
+    message = c.message
+    if message is not None and await edit_in_place(message, text, None):
+        return
+    if message is not None:
+        try:
+            await message.answer(text, parse_mode="HTML")
+        except Exception:
+            log.exception("could not report the reset outcome")
+
+
+@router.callback_query(F.data.startswith("rs:"))
+async def reset_cb(c: CallbackQuery):
+    answered = False
+    try:
+        parts = (c.data or "").split(":")
+        if parts == ["rs", "no"]:
+            answered = True
+            await ack(c, "Cancelled")
+            return await _close_reset(c, "Cancelled. Nothing was changed.")
+        if parts == ["rs", "all"]:
+            level = None
+        elif len(parts) == 3 and parts[1] == "lvl" and parts[2] in LEVELS:
+            level = parts[2]
+        else:
+            # callback_data is client-supplied; anything unexpected is refused.
+            answered = True
+            return await ack(c, "That button has expired. Send /reset again.", True)
+
+        uid = c.from_user.id
+        await db.upsert_user(uid, c.from_user.username)
+        cleared = await db.reset_progress(uid, level)
+        # Cards served but unanswered are excluded from picking for a while;
+        # after a reset there is nothing they need protecting from.
+        forget_outstanding(uid)
+        answered = True
+        await ack(c, "Done")
+        which = f"{LEVELS[level]} " if level else ""
+        if not cleared:
+            return await _close_reset(
+                c, f"Nothing to clear: you hadn't answered any {which}questions yet.")
+        where = f" of {LEVELS[level]}" if level else ""
+        await _close_reset(
+            c,
+            f"✅ <b>Done.</b> Cleared your {which}answers"
+            f"{'' if level else ' at every level'}.\n"
+            f"/quizme starts you on set 1{where}.")
+    except Exception:
+        log.exception("reset failed")
+    finally:
+        if not answered:
+            await ack(c)
 
 
 # ---------------------------------------------------------------- subscriptions

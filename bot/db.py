@@ -192,6 +192,28 @@ async def record_attempt(uid: int, question, idx: int, correct: bool,
     return row is not None
 
 
+async def reset_progress(uid: int, level: str | None = None) -> int:
+    """Forget a student's answers at one level, or at every level when `level`
+    is None. Returns how many answers were cleared.
+
+    Set position, /stats, /review and the streak are all derived from
+    `attempts`, so this alone puts the student back on set 1 with empty stats.
+
+    The tournament is deliberately untouched. `tournament_answers` is what stops
+    a question scoring twice, so keeping it means a reset cannot be used to win
+    points again for questions already scored, and points already won stay won.
+    Sheet progress (`note_deliveries`) is separate too: starting the quiz again
+    is not the same as wanting every cheat sheet re-sent.
+    """
+    conn = _require_pool()
+    if level is None:
+        status = await conn.execute("delete from attempts where user_id = $1", uid)
+    else:
+        status = await conn.execute(
+            "delete from attempts where user_id = $1 and level = $2", uid, level)
+    return int(status.split()[-1])
+
+
 async def practice_streak(uid: int) -> int:
     """How many /quizme answers in a row the user has got right, counting back
     from the latest. Capped by the limit, which is far beyond what we display."""
