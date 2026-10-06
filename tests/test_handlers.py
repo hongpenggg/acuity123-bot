@@ -247,6 +247,15 @@ class FakeDB:
     async def practice_streak(self, uid):
         return self.streak
 
+    async def reset_progress(self, uid, level=None):
+        self.calls.append(("reset_progress", uid, level))
+        doomed = [key for key, rec in self.attempts.items()
+                  if key[0] == uid and (level is None
+                                        or self.questions[rec["qid"]]["level"] == level)]
+        for key in doomed:
+            del self.attempts[key]
+        return len(doomed)
+
     async def record_attempt(self, uid, question, idx, correct, mode, msg_id):
         """Both of the uniqueness rules bot.db.record_attempt relies on.
 
@@ -1126,7 +1135,7 @@ async def test_help_adds_the_full_command_list(fake):
 
     text = msg.answer.messages[-1]
     assert "All commands" in text
-    for cmd in ("/stats", "/topicalnotes", "/randomnotes", "/resources"):
+    for cmd in ("/stats", "/topicalnotes", "/randomnotes", "/resources", "/reset"):
         assert cmd in text, cmd
 
 
@@ -1673,3 +1682,102 @@ async def test_the_off_button_turns_a_subscription_off(fake):
     await handlers.sub_off(c)
 
     assert ("set_flag", 1, "notes_sub", False) in fake.calls
+
+
+# ------------------------------------------------------------------- /reset
+
+
+def _reset_buttons(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+@pytest.mark.asyncio
+async def test_reset_asks_before_clearing_anything(fake):
+    add_question(fake, level="clin")
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=FakeMessage()))
+    fake.users[1] = "clin"
+    msg = _chat_message()
+    sent = []
+
+    async def answer(text, **kw):
+        sent.append((text, kw))
+    msg.answer = answer
+
+    await handlers.reset_cmd(msg)
+
+    text, kw = sent[-1]
+    assert "Start again?" in text and "can't be undone" in text
+    assert kw["parse_mode"] == "HTML"
+    assert _reset_buttons(kw["reply_markup"]) == ["rs:lvl:clin", "rs:all", "rs:no"]
+    assert kw["reply_markup"].inline_keyboard[0][0].text == "🔄 Reset Clinical"
+    assert fake.attempts, "asking must not clear anything"
+    assert not any(c[0] == "reset_progress" for c in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_reset_level_clears_only_that_level(fake):
+    add_question(fake, qid=1, level="preclin")
+    add_question(fake, qid=2, level="clin")
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=FakeMessage(message_id=11)))
+    await handlers.on_answer(FakeCallback("a:2:0:practice", message=FakeMessage(message_id=12)))
+    card = FakeMessage(text="confirm")
+    c = FakeCallback("rs:lvl:clin", message=card)
+
+    await handlers.reset_cb(c)
+
+    assert ("reset_progress", 1, "clin") in fake.calls
+    assert [rec["qid"] for rec in fake.attempts.values()] == [1], "Pre-Clinical untouched"
+    assert c.answers[-1]["text"] == "Done"
+    edit = card.edits[-1]
+    assert "Cleared your Clinical answers" in edit["text"]
+    assert "set 1 of Clinical" in edit["text"]
+    assert edit["reply_markup"] is None, "the confirmation cannot be tapped twice"
+
+
+@pytest.mark.asyncio
+async def test_reset_all_clears_every_level(fake):
+    add_question(fake, qid=1, level="preclin")
+    add_question(fake, qid=2, level="clin")
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=FakeMessage(message_id=11)))
+    await handlers.on_answer(FakeCallback("a:2:0:practice", message=FakeMessage(message_id=12)))
+    card = FakeMessage(text="confirm")
+
+    await handlers.reset_cb(FakeCallback("rs:all", message=card))
+
+    assert ("reset_progress", 1, None) in fake.calls
+    assert fake.attempts == {}
+    assert "at every level" in card.edits[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_reset_cancel_changes_nothing(fake):
+    add_question(fake)
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=FakeMessage()))
+    card = FakeMessage(text="confirm")
+
+    await handlers.reset_cb(FakeCallback("rs:no", message=card))
+
+    assert fake.attempts
+    assert not any(c[0] == "reset_progress" for c in fake.calls)
+    assert card.edits[-1]["text"] == "Cancelled. Nothing was changed."
+
+
+@pytest.mark.asyncio
+async def test_reset_with_nothing_answered_says_so(fake):
+    card = FakeMessage(text="confirm")
+
+    await handlers.reset_cb(FakeCallback("rs:lvl:postmbbs", message=card))
+
+    assert "hadn't answered any Post-MBBS questions" in card.edits[-1]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["rs:lvl:consultant", "rs:lvl", "rs:", "rs:lvl:clin:x",
+                                  "rs:everything"])
+async def test_reset_refuses_unexpected_callback_data(fake, data):
+    c = FakeCallback(data, message=FakeMessage(text="confirm"))
+
+    await handlers.reset_cb(c)
+
+    assert c.answers and c.answers[-1]["alert"] is True
+    assert not any(call[0] == "reset_progress" for call in fake.calls)

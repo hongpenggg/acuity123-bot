@@ -245,6 +245,62 @@ async def test_award_point_scores_each_question_once(pool):
     assert rows[0]["points"] == 1
 
 
+async def test_reset_progress_is_scoped_to_one_student_and_level(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.upsert_user(2, None)
+    pre = await db.get_question(await add_question(db, level="preclin"))
+    clin = await db.get_question(await add_question(db, level="clin"))
+    await db.record_attempt(1, pre, 0, True, "practice", 701)
+    await db.record_attempt(1, clin, 0, True, "practice", 702)
+    await db.record_attempt(2, clin, 0, True, "practice", 703)
+
+    assert await db.reset_progress(1, "clin") == 1
+    left = await db.pool.fetch("select user_id, level from attempts order by user_id, level")
+    assert [(r["user_id"], r["level"]) for r in left] == [(1, "preclin"), (2, "clin")]
+
+    assert await db.reset_progress(1) == 1, "None clears every level"
+    assert await db.pool.fetchval("select count(*) from attempts where user_id = 1") == 0
+    assert await db.reset_progress(1) == 0
+
+
+async def test_reset_puts_the_student_back_on_set_one(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    ids = [await add_question(db, topic=f"T{i}") for i in range(12)]
+    for i, qid in enumerate(ids[:7]):     # leave the level unfinished
+        await db.record_attempt(1, await db.get_question(qid), 0, True, "practice", 800 + i)
+    assert (await db.current_set(1, "preclin"))["number"] == 2
+
+    await db.reset_progress(1, "preclin")
+
+    now = await db.current_set(1, "preclin")
+    assert now["number"] == 1 and now["answered_in_set"] == 0
+    assert await db.stats(1, "preclin") == []
+
+
+async def test_reset_cannot_be_used_to_score_a_question_twice(pool):
+    """The tournament keeps its own record of what scored, so clearing answers
+    and re-answering a question already scored wins nothing."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    q = await db.get_question(await add_question(db))
+    await db.start_tournament()
+    await db.join_tournament(1)
+    await db.record_attempt(1, q, 0, True, "practice", 900)
+    assert await db.award_point(1, q["id"]) is True
+
+    await db.reset_progress(1)
+    assert await db.record_attempt(1, q, 0, True, "practice", 901) is True
+    assert await db.award_point(1, q["id"]) is False
+
+    rows = await db.leaderboard()
+    assert rows[0]["points"] == 1, "points already won are kept, and not doubled"
+
+
 async def test_award_point_without_a_joined_tournament_does_nothing(pool):
     from bot import db
 
