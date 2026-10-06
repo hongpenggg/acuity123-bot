@@ -6,7 +6,7 @@ import re
 import pytest
 
 from bot.text import (MAX_OPTIONS, WEEKLY_HEADER, chunks, explanation_block, letter,
-                      mask, parse_options, render, verdict)
+                      mask, notes_line, parse_options, render, verdict)
 
 
 def q(options, correct_idx=0, topic="Sample", text="Question?"):
@@ -205,3 +205,20 @@ def test_chunks_prefers_a_paragraph_break_to_a_mid_sentence_cut():
     parts = chunks("\n\n".join(paragraph for _ in range(6)), limit=200)
 
     assert parts == [paragraph.strip()] * 6
+
+
+def test_the_notes_pointer_sits_under_the_options():
+    """Under the question and its options, which is where a student looks once
+    they have read the question and want the background."""
+    body, _ = render(q(["a", "b", "c", "d", "e"]), footer=notes_line("03"))
+    assert body.endswith("\n\n📘 Notes for this topic: /notes 03")
+    assert body.index("📘") > body.index("<b>5.</b>")
+
+
+def test_no_notes_pointer_unless_one_is_asked_for():
+    body, _ = render(q(["a", "b", "c", "d", "e"]))
+    assert "/notes" not in body
+
+
+def test_the_notes_line_names_the_sheet_code():
+    assert notes_line("C04") == "📘 Notes for this topic: /notes C04"

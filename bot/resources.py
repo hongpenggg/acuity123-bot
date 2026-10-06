@@ -56,6 +56,7 @@ from __future__ import annotations
 import random
 import re
 from collections.abc import Collection
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -165,6 +166,62 @@ def all_for(level: str | None) -> list[Note]:
 def topics(level: str | None) -> list[str]:
     """The topics the overview sheets cover at this level, in code order."""
     return [note.topic for note in overview(level)]
+
+
+def _key(text: str) -> str:
+    """A comparison key: letters and digits only, lowercased."""
+    return re.sub(r"[^a-z0-9]+", "", text.casefold())
+
+
+def _words(text: str) -> set[str]:
+    """The significant words in a topic name.
+
+    Four characters and up, which drops the joining words ("and", "the", "of")
+    without needing a stopword list, and also drops "eye", which is too common
+    here to tell two sheets apart.
+    """
+    return set(re.findall(r"[a-z]{4,}", text.casefold()))
+
+
+def for_topic(level: str | None, topic: str) -> Note | None:
+    """The overview sheet that covers one question topic, or None.
+
+    This is what puts a Notes pointer under every question. An exact match is
+    tried first, ignoring case and punctuation.
+
+    Failing that, the sheet titles and the bank's topics are matched on shared
+    words. They really are written differently: the preclinical and clinical
+    sheets carry the bank's own topic names, but the post-MBBS overview sheets
+    are descriptive titles ("Applied ocular anatomy and development") against
+    short bank topics ("Anatomy and embryology"). A shared word that appears in
+    only one sheet's title is a strong enough signal by itself; otherwise two
+    shared words are needed. A topic the sheets genuinely do not cover (the
+    post-MBBS bank has questions on pathology and pharmacology, and no sheet for
+    either) gets no pointer rather than a wrong one.
+    """
+    wanted = _key(topic)
+    if not wanted:
+        return None
+    sheets = overview(level)
+    for note in sheets:
+        if _key(note.topic) == wanted:
+            return note
+
+    words = _words(topic)
+    if not words:
+        return None
+    frequency = Counter(word for note in sheets for word in _words(note.topic))
+
+    scored: list[tuple[tuple[int, int, int], Note]] = []
+    for index, note in enumerate(sheets):
+        shared = words & _words(note.topic)
+        if not shared:
+            continue
+        distinctive = any(frequency[word] == 1 for word in shared)
+        if distinctive or len(shared) >= 2:
+            # Distinctive first, then the most overlap, then code order.
+            scored.append(((1 if distinctive else 0, len(shared), -index), note))
+    return max(scored)[1] if scored else None
 
 
 def unsent(level: str | None, tier_code: str,

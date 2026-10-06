@@ -1781,3 +1781,16 @@ async def test_reset_refuses_unexpected_callback_data(fake, data):
 
     assert c.answers and c.answers[-1]["alert"] is True
     assert not any(call[0] == "reset_progress" for call in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_the_answered_card_keeps_the_notes_pointer(fake):
+    """The fresh card is edited into the answered one, so a pointer shown only on
+    the fresh card would vanish the moment the student answered."""
+    question = add_question(fake, correct_idx=0)
+    question["topic"] = "Optics and visual transduction"
+    message = FakeMessage()
+
+    await handlers.on_answer(FakeCallback("a:1:0:practice", message=message))
+
+    assert "📘 Notes for this topic: /notes 03" in message.edits[-1]["text"]

@@ -287,3 +287,45 @@ async def test_safe_send_refuses_an_empty_message():
 
     assert await sender.safe_send(bot, 1, "   ") is False
     assert bot.messages == []
+
+
+def a_question(level, topic):
+    """A real level and topic, so the Notes pointer is resolved for real rather
+    than through a stub."""
+    return {"id": 1, "level": level, "topic": topic, "text": "Question?",
+            "options": '["a","b","c","d","e"]', "correct_idx": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_question_card_points_at_the_sheets_for_its_topic():
+    bot = Recorder()
+
+    await sender.send_question(bot, 7, a_question(
+        "preclin", "Optics and visual transduction"), "practice")
+
+    text, kwargs = bot.messages[-1]
+    assert text.endswith("📘 Notes for this topic: /notes 03")
+    assert kwargs["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_a_postmbbs_question_finds_its_sheet_through_the_title():
+    bot = Recorder()
+
+    await sender.send_question(bot, 7, a_question(
+        "postmbbs", "Uveitis and inflammatory medicine"), "practice")
+
+    text, _ = bot.messages[-1]
+    assert text.endswith("📘 Notes for this topic: /notes A07")
+
+
+@pytest.mark.asyncio
+async def test_a_topic_with_no_sheet_carries_no_notes_line():
+    bot = Recorder()
+
+    await sender.send_question(bot, 7, a_question("postmbbs", "Pathology"),
+                               "practice")
+
+    text, _ = bot.messages[-1]
+    assert "/notes" not in text
+    assert text.endswith("<b>5.</b> e")

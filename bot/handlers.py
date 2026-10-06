@@ -17,8 +17,8 @@ from . import commands, db, jobs, llm, resources
 from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVEL_EMOJI, LEVELS, TZ
 from .sender import (ack, card_header, deliver_verdict, drop_buttons, edit_in_place,
                      forget_outstanding,
-                     remaining_buttons, safe_send, send_note, send_question,
-                     send_question_for_level)
+                     notes_footer, remaining_buttons, safe_send, send_note,
+                     send_question, send_question_for_level)
 from .text import (EXPLANATION_HEADING, MAX_OPTIONS, TELEGRAM_LIMIT, esc,
                    explanation_block, mask, parse_options, render, sheets_done, verdict)
 
@@ -489,8 +489,11 @@ async def on_answer(c: CallbackQuery):
                 log.debug("streak lookup failed", exc_info=True)
 
         # Re-rendered from the database rather than appended to message.text, so
-        # the answered card can mark the options in place.
-        body, _ = render(question, chosen=idx, header=card_header(mode))
+        # the answered card can mark the options in place. The Notes footer is
+        # recomputed here too: the answered card is what stays in the chat, so a
+        # pointer shown only on the fresh card would vanish on the first tap.
+        body, _ = render(question, chosen=idx, header=card_header(mode),
+                         footer=notes_footer(question))
         buttons = [InlineKeyboardButton(text="💡 Explain", callback_data=f"e:{question['id']}")]
         if mode == "practice":
             buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data="next"))

@@ -61,11 +61,13 @@ STREAK_FROM = 3
 
 
 def render(question, *, chosen: int | None = None,
-           header: str | None = None) -> tuple[str, int]:
+           header: str | None = None,
+           footer: str | None = None) -> tuple[str, int]:
     """Return (HTML body, option count) for a question row.
 
     With `chosen` set the card is shown answered: ✅ on the right option and ❌
     on a wrong pick, so the verdict line never has to repeat a long option.
+    `footer` sits under the options, which is where the Notes pointer goes.
     """
     opts = parse_options(question["options"])
     correct = question["correct_idx"] if chosen is not None else None
@@ -84,7 +86,21 @@ def render(question, *, chosen: int | None = None,
     top = f"👁 <b>{esc(question['topic'])}</b>"
     if header:
         top = f"{header}\n{top}"
-    return f"{top}\n\n{esc(question['text'])}\n\n{gap.join(lines)}", len(opts)
+    body = f"{top}\n\n{esc(question['text'])}\n\n{gap.join(lines)}"
+    if footer:
+        body = f"{body}\n\n{footer}"
+    return body, len(opts)
+
+
+def notes_line(code: str) -> str:
+    """The pointer under a question to the sheets covering its topic.
+
+    Telegram turns a `/command` in message text into a tappable entity, so this is
+    a real affordance rather than a caption: tapping it sends `/notes 03`, which
+    `handlers.notes` already serves. The code rather than the topic name, because
+    it is short enough to sit on one line and unambiguous within a level.
+    """
+    return f"📘 Notes for this topic: /notes {code}"
 
 
 def verdict(correct: bool, answer_idx: int, streak: int = 0,

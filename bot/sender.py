@@ -16,8 +16,9 @@ from cachetools import TTLCache
 
 from . import db
 from .config import LEVELS
-from .resources import MAX_UPLOAD_BYTES
-from .text import MAX_OPTIONS, TELEGRAM_LIMIT, WEEKLY_HEADER, chunks, letter, render
+from .resources import MAX_UPLOAD_BYTES, for_topic
+from .text import (MAX_OPTIONS, TELEGRAM_LIMIT, WEEKLY_HEADER, chunks, letter,
+                   notes_line, render)
 
 log = logging.getLogger(__name__)
 
@@ -235,6 +236,17 @@ def card_header(mode: str) -> str | None:
     return WEEKLY_HEADER if mode == "weekly" else None
 
 
+def notes_footer(question) -> str | None:
+    """The Notes pointer for a question's topic, or None if no sheet covers it.
+
+    Read off the question's own level and topic, so the same card points at the
+    same sheet no matter which command sent it, and a question in a topic with no
+    sheet yet simply goes without the line rather than showing a dead reference.
+    """
+    note = for_topic(question.get("level"), question.get("topic") or "")
+    return notes_line(note.code) if note else None
+
+
 async def send_question(bot: Bot, uid: int, question, mode: str,
                         lead: str | None = None, *, pace: bool = False) -> bool:
     """Send one question card. `lead` replaces the mode's default banner."""
@@ -243,7 +255,8 @@ async def send_question(bot: Bot, uid: int, question, mode: str,
                                pace=pace)
     try:
         body, count = render(question,
-                             header=None if lead else card_header(mode))
+                             header=None if lead else card_header(mode),
+                             footer=notes_footer(question))
     except ValueError:
         # Malformed row (wrong number of options). Report it instead of crashing.
         log.exception("question %s is malformed", question.get("id"))
