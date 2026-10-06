@@ -51,7 +51,14 @@ async def main() -> None:
         await dp.start_polling(
             bot, allowed_updates=dp.resolve_used_update_types() or None)
     finally:
-        # Without this the pool and the HTTP session leak on every restart.
+        # Drain before the scheduler goes down, because it is the only chance a
+        # fan-out in flight gets: APScheduler's AsyncIOExecutor cancels every
+        # running job on shutdown whatever `wait` says, so wait=True would be a
+        # lie here rather than a fix. Suppressed because a cancelled drain must
+        # not skip the two closes below, which is what leaks the pool and the
+        # HTTP session on every restart.
+        with contextlib.suppress(asyncio.CancelledError):
+            await jobs.drain()
         scheduler.shutdown(wait=False)
         await bot.session.close()
         await db.close()

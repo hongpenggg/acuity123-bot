@@ -158,13 +158,33 @@ async def progress(uid: int, level: str) -> tuple[int, int]:
 
 async def record_attempt(uid: int, question, idx: int, correct: bool,
                          mode: str, msg_id: int) -> bool:
-    """Returns False if this message was already scored (double tap / retry)."""
+    """Record one answer. False means it was not recorded, for either reason:
+
+      * this *card* was already answered — a double tap or a retry, caught by
+        `unique (user_id, msg_id)`;
+      * this *question* already has a scoring answer from another card, caught
+        by `attempts_one_scoring_answer_idx`. A student can hold two live cards
+        for one question (a /quizme card left unanswered, then the Monday push
+        serving it again), and recording both corrupts the review pile, the
+        practice streak and the db.stats denominator.
+
+    Either way the caller says "you've already answered this one", so the two
+    do not need telling apart.
+
+    A `review` answer is exempt from the second rule and only has to clear the
+    first: re-answering a question is what /review is for.
+
+    `on conflict do nothing` carries no arbiter on purpose — it has to absorb
+    whichever of the two indexes fires, and a conflict target can only name
+    one. CHECK violations (a bad level or mode) still raise, which is what
+    keeps them from being swallowed here.
+    """
     conn = _require_pool()
     row = await conn.fetchval(
         """insert into attempts (user_id, question_id, level, topic, chosen_idx,
                                  correct, mode, msg_id)
            values ($1, $2, $3, $4, $5, $6, $7, $8)
-           on conflict (user_id, msg_id) do nothing
+           on conflict do nothing
            returning id""",
         uid, question["id"], question["level"], question["topic"],
         idx, correct, mode, msg_id,
@@ -598,7 +618,19 @@ async def award_point(uid: int, question_id: int) -> bool:
     Belts and braces: the fixed sets mean a question comes round once anyway, but
     without the tournament_answers uniqueness a student could still farm the board
     by re-answering one they already know.
-    Returns True only when this answer actually scored.
+    Returns True only when this answer actually scored, and writes the dedup row
+    only then — the two are one statement so they cannot disagree.
+
+    The `entered` gate is the fix for a bug that made a question permanently
+    unscorable. The insert used to fire whenever a tournament was open, while
+    the update matched nothing unless the student had a tournament_points row,
+    so answering anything while un-enrolled (left the tournament, or inactive
+    when enrol_everyone ran) burned the dedup row for nothing: a later join
+    could never score that question again.
+
+    `tournament_answers` stays the gate rather than the points row, because the
+    unique key is what serialises two simultaneous answers to one question into
+    a single point. Checking first and inserting after would let both through.
     """
     conn = _require_pool()
     row = await conn.fetchval(
@@ -607,9 +639,19 @@ async def award_point(uid: int, question_id: int) -> bool:
                 where active and now() between starts_at and ends_at
                 order by id
                 limit 1),
+             -- Membership, read in the same snapshot the insert and the update
+             -- run in, so a dedup row is never written without its point.
+             -- Picking the tournament first and *then* requiring membership
+             -- keeps this on whichever one active_tournament() reports, which
+             -- is the one /tournament and /leaderboard show.
+             entered as (
+               select a.id from active a
+                where exists (select 1 from tournament_points p
+                               where p.tournament_id = a.id
+                                 and p.user_id = $1)),
              scored as (
                insert into tournament_answers (tournament_id, user_id, question_id)
-               select active.id, $1, $2 from active
+               select entered.id, $1, $2 from entered
                on conflict (tournament_id, user_id, question_id) do nothing
                returning tournament_id)
            update tournament_points p

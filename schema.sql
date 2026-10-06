@@ -39,13 +39,19 @@ create table questions (
 create index questions_level_topic_idx on questions (level, topic);
 
 -- ------------------------------------------------------------- attempts
--- One row per answer. `unique (user_id, msg_id)` is what makes a double tap
--- idempotent AND is required by the `on conflict (user_id, msg_id)` in db.py.
+-- One row per answer. `unique (user_id, msg_id)` is what makes a double tap on
+-- one card idempotent; `attempts_one_scoring_answer_idx` below is what stops
+-- two *different* cards for the same question both being recorded. db.py relies
+-- on both through a bare `on conflict do nothing`.
 create table attempts (
   id           bigserial primary key,
   user_id      bigint      not null references users (telegram_id) on delete cascade,
   question_id  int         not null references questions (id) on delete cascade,
-  level        text        not null,
+  -- Same three levels as users/questions/notes. Without the check a typo is
+  -- accepted and the row is then invisible to every level-scoped read, which is
+  -- indistinguishable from the answer never having been recorded.
+  level        text        not null
+                           check (level in ('preclin', 'clin', 'postmbbs')),
   topic        text        not null,
   chosen_idx   int         not null,
   correct      boolean     not null,
@@ -61,8 +67,26 @@ create table attempts (
 -- attempted this question" filter in pick_question. Note the filter is on any
 -- attempt, not only a correct one: a set is five questions the student has not
 -- seen, and a miss comes back as weight on its topic rather than as a repeat.
+-- It stays non-unique on purpose: review rows have to be visible to it too, so
+-- it cannot carry the uniqueness the index below does.
 create index attempts_user_level_topic_idx  on attempts (user_id, level, topic);
 create index attempts_user_question_idx     on attempts (user_id, question_id);
+-- One *first encounter* per question per student. A student can hold two live
+-- cards for the same question — a /quizme card left unanswered, then the Monday
+-- push serving it again before they answer the first — and answering both used
+-- to write two rows. That makes the question's latest attempt possibly wrong
+-- (so it re-enters /review), breaks practice_streak, and doubles the question's
+-- weight in db.stats.
+--
+-- Partial, not a plain unique: /review deliberately re-answers a question the
+-- student has already attempted, and a second pass through the pile weeks later
+-- is the point of the command, so review rows must stay unconstrained. The
+-- predicate is `mode <> 'review'` rather than a list of the scoring modes so a
+-- mode added later is covered by default; and mode is deliberately *not* part
+-- of the key, because the reproduced case is one 'practice' row plus one
+-- 'weekly' row for the same question.
+create unique index attempts_one_scoring_answer_idx
+    on attempts (user_id, question_id) where mode <> 'review';
 
 -- ---------------------------------------------------------- tournaments
 create table tournaments (
@@ -73,6 +97,12 @@ create table tournaments (
   check (ends_at > starts_at)
 );
 create index tournaments_active_idx on tournaments (active, ends_at);
+-- At most one tournament open at a time. Two concurrent /admin_tournament_start
+-- taps both passed the handler's "is one running?" check before either inserted,
+-- leaving two live rows and announcing the competition twice. A check in code
+-- cannot fix that; only the database can.
+create unique index tournaments_one_active_idx on tournaments (active)
+    where active;
 
 -- Membership and score. Rows appear automatically: everyone active is entered
 -- when a tournament opens (db.enrol_everyone), and anyone who sends /start while
@@ -128,7 +158,11 @@ create index notes_lookup_idx on notes (level, tier, lower(topic));
 -- makes, so there is no second index to maintain.
 create table note_deliveries (
   user_id  bigint      not null references users (telegram_id) on delete cascade,
-  level    text        not null,
+  -- Checked like every other level column: record_notes_sent('PRECLIN_typo')
+  -- used to be accepted, and the row was then invisible to every level-scoped
+  -- read, so the sheet counted as sent and was never offered again.
+  level    text        not null
+                       check (level in ('preclin', 'clin', 'postmbbs')),
   tier     text        not null check (tier in ('a', 'b')),
   code     text        not null,
   sent_at  timestamptz not null default now(),

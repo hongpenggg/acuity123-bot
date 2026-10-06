@@ -342,12 +342,16 @@ async def test_an_untouched_topic_ranks_between_weak_and_mastered(bank):
 
 
 async def test_review_pile_drops_a_question_once_it_is_got_right(bank):
+    """The re-answer is recorded under `review`, which is the only mode that can
+    re-answer a question: a second scoring answer is refused outright now (see
+    test_a_second_card_for_one_question_is_not_recorded). This used to pass
+    'practice' here, which no /review card ever sends."""
     missed = await answer_next(1, "preclin", correct=False, msg_id=1)
     assert await db.wrong_count(1, "preclin") == 1
     assert [row["id"] for row in await db.wrong_questions(1, "preclin")] == \
         [missed["id"]]
 
-    await db.record_attempt(1, missed, 0, True, "practice", 2)
+    assert await db.record_attempt(1, missed, 0, True, "review", 2) is True
     assert await db.wrong_count(1, "preclin") == 0
     assert await db.wrong_questions(1, "preclin") == []
 
@@ -365,11 +369,15 @@ async def test_review_pile_keeps_a_question_only_ever_missed(bank):
 async def test_a_question_got_right_and_then_missed_comes_back(bank):
     """The semantics worth pinning: the *latest* answer decides, not whether the
     student was ever right. `progress` reads it the other way and still counts
-    the question as done, so the two numbers disagree here on purpose."""
+    the question as done, so the two numbers disagree here on purpose.
+
+    The second answer is a `review` one, the only kind that can re-answer a
+    question - so the pile is still driven by the latest answer whatever mode it
+    arrived in."""
     question = await answer_next(1, "preclin", correct=True, msg_id=1)
     assert await db.wrong_count(1, "preclin") == 0
 
-    await db.record_attempt(1, question, 1, False, "practice", 2)
+    await db.record_attempt(1, question, 1, False, "review", 2)
     assert [row["id"] for row in await db.wrong_questions(1, "preclin")] == \
         [question["id"]]
     fresh, _ = await db.progress(1, "preclin")
@@ -393,6 +401,52 @@ async def test_review_pile_is_level_scoped(bank):
     assert await db.wrong_count(1, "preclin") == 1
     assert await db.wrong_count(1, "clin") == 1
     assert {row["level"] for row in await db.wrong_questions(1, "clin")} == {"clin"}
+
+
+async def test_a_second_card_for_one_question_corrupts_nothing(bank):
+    """Two live cards for one question, which is reachable: a /quizme card left
+    unanswered is invisible to `pick_question`, so the Monday push can serve the
+    same question before the first card is answered.
+
+    Answering both used to write two attempt rows, and all three reads below
+    went wrong at once - the question re-entered /review on the second (wrong)
+    answer, the practice streak reset, and db.stats counted two answers for one
+    question. Only the first card is recorded now, so none of them move.
+    """
+    first = await answer_next(1, "preclin", correct=True, msg_id=1)
+    second = await answer_next(1, "preclin", correct=True, msg_id=2)
+    assert await db.practice_streak(1) == 2
+
+    # The Monday card for `first`, answered wrong, after the /quizme card.
+    assert await db.record_attempt(1, first, 1, False, "weekly", 3) is False
+
+    assert await db.wrong_count(1, "preclin") == 0, \
+        "a question answered right must not re-enter /review"
+    assert await db.practice_streak(1) == 2, "the streak must not reset"
+    assert sum(row["answered"] for row in await db.stats(1, "preclin")) == 2, \
+        "two questions answered, not three attempts"
+    assert await db.answered_count(1, "preclin") == 2
+    assert (await db.current_set(1, "preclin"))["answered_in_set"] == 2
+    assert {row["id"] for row in await db.pool.fetch(
+        "select question_id as id from attempts where user_id = 1")} == \
+        {first["id"], second["id"]}
+
+
+async def test_a_review_answer_still_counts_in_stats_and_moves_the_pile(bank):
+    """What the uniqueness deliberately does *not* change. /review re-answers a
+    question on purpose, those rows are exempt, and both reads treat them as
+    real answers: the pile tracks what the student knows now, and db.stats
+    counts every answer at the level."""
+    missed = await answer_next(1, "preclin", correct=False, msg_id=1)
+    assert await db.wrong_count(1, "preclin") == 1
+    assert sum(row["answered"] for row in await db.stats(1, "preclin")) == 1
+
+    assert await db.record_attempt(1, missed, 0, True, "review", 2) is True
+    assert await db.wrong_count(1, "preclin") == 0, "the pile follows the latest"
+    assert sum(row["answered"] for row in await db.stats(1, "preclin")) == 2
+
+    # And a set is not advanced by it: answered_count counts distinct questions.
+    assert await db.answered_count(1, "preclin") == 1
 
 
 async def test_review_pile_respects_its_limit_and_agrees_with_the_count(bank):

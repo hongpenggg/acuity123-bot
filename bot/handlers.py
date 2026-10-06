@@ -10,15 +10,17 @@ from zoneinfo import ZoneInfo
 from cachetools import TTLCache
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
+from asyncpg.exceptions import UniqueViolationError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from . import commands, db, jobs, llm, resources
 from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVEL_EMOJI, LEVELS, TZ
 from .sender import (ack, card_header, deliver_verdict, drop_buttons, edit_in_place,
+                     forget_outstanding,
                      remaining_buttons, safe_send, send_note, send_question,
                      send_question_for_level)
-from .text import (EXPLANATION_HEADING, TELEGRAM_LIMIT, esc, explanation_block, mask,
-                   parse_options, render, sheets_done, verdict)
+from .text import (EXPLANATION_HEADING, MAX_OPTIONS, TELEGRAM_LIMIT, esc,
+                   explanation_block, mask, parse_options, render, sheets_done, verdict)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -30,6 +32,21 @@ _recent_explain: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 
 # 'review' answers are recorded but never scored - see schema.sql and on_answer.
 MODES = ("practice", "weekly", "review")
+
+# Modes whose answer can close a set of five.
+#
+# A set slot is filled by the first answer to a question whichever door it came
+# through, so a Monday-push answer moves db.answered_count exactly like a /quizme
+# one and can be the fifth of a set. The report fires on the count *crossing* a
+# multiple of five, which happens once, so a set closed by the weekly push and
+# skipped here is never reported at all - the student answers five questions and
+# is told nothing. 'review' is excluded because a re-answer does not advance the
+# count; see _report_set_if_finished.
+SET_CLOSING_MODES = ("practice", "weekly")
+
+#: questions.id is a `serial`, so asyncpg rejects anything wider than int4 with a
+#: DataError rather than simply finding no row.
+_MAX_QUESTION_ID = 2 ** 31 - 1
 
 TAGLINE = (
     "Your high-yield, one-stop ophthalmology hub for medical students and "
@@ -101,6 +118,25 @@ def _level(level: str | None) -> str:
     return level if level in LEVELS else DEFAULT_LEVEL
 
 
+def _digits(raw: str | None, limit: int) -> int | None:
+    """A non-negative integer out of callback data, or None if it is not one.
+
+    Callback data is attacker-controllable and neither obvious test is safe on
+    its own: `str.isdigit()` is true for '²' and other non-decimal digits
+    that `int()` then rejects, while `int()` accepts signs, whitespace and
+    underscores ('1_0' is 10). Both ended as a logged exception and a bare ack,
+    which stops the spinner and tells the student nothing.
+
+    `limit` is the caller's own ceiling, because a value Postgres cannot hold is
+    an error from asyncpg rather than a lookup that misses.
+    """
+    text = raw or ""
+    if not (text.isascii() and text.isdigit()):
+        return None
+    value = int(text)
+    return value if value <= limit else None
+
+
 def _level_kb(current: str | None) -> InlineKeyboardMarkup:
     current = _level(current)
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -134,6 +170,11 @@ def _resources_home_kb(level: str | None) -> InlineKeyboardMarkup:
 # paged. The page number rides in the callback data; the level never does, because
 # it is read from the database each time (see resources_cb).
 _PAGE = 20
+
+#: Highest page number taken from callback data. Four pages hold the 65 post-MBBS
+#: focused sheets, so anything near this is crafted rather than tapped, and is
+#: treated as the first page instead of being parsed into an enormous int.
+_MAX_PAGE = 10_000
 
 
 def _resources_tier_kb(level: str | None, tier: str,
@@ -238,18 +279,35 @@ async def set_level(c: CallbackQuery):
             return await ack(c, "That level doesn't exist.", True)
         uid = c.from_user.id
         await db.upsert_user(uid, c.from_user.username)
+        before = _level(await db.get_level(uid))
         await db.set_level(uid, key)
+        # A push that switched itself off because this student ran out of content
+        # has content again now. See _restore_finished_subs, with the
+        # subscriptions.
+        restored: list[str] = []
+        try:
+            restored = await _restore_finished_subs(uid, before, key)
+        except Exception:
+            # Repairing a subscription must never cost them the confirmation.
+            log.debug("subscription restore failed", exc_info=True)
         answered = True
         await ack(c, f"{LEVEL_EMOJI[key]} You're on {LEVELS[key]} now")
         # The toast disappears, so say what to do next in the chat itself -
         # picking a level used to dead-end here.
+        body = (f"{LEVEL_EMOJI[key]} You're on <b>{LEVELS[key]}</b>. Your "
+                "questions and cheat sheets both follow it.\n\n"
+                "Send /quizme for a set of five, or /notes for a cheat sheet.")
+        if restored:
+            # Say what changed: a subscription that comes back silently is only
+            # marginally better than one that stays dead.
+            names = " and ".join(_SUB_FLAGS[which][1] for which in restored)
+            body += (f"\n\n🔔 Your {names} stopped when you finished "
+                     f"{LEVELS[before]}. They're back on, because there is "
+                     f"{LEVELS[key]} content waiting.")
         with contextlib.suppress(Exception):
             await c.bot.send_message(
-                uid,
-                f"{LEVEL_EMOJI[key]} You're on <b>{LEVELS[key]}</b>. Your "
-                "questions and cheat sheets both follow it.\n\n"
-                "Send /quizme for a set of five, or /notes for a cheat sheet.",
-                parse_mode="HTML")
+                uid, body, parse_mode="HTML",
+                reply_markup=_sub_off_kb(*restored) if restored else None)
         if c.message is not None:
             # Only move the tick. Rewriting the text would wipe the /start welcome
             # when the picker is tapped from there.
@@ -311,6 +369,9 @@ async def _report_set_if_finished(message, uid: int, level: str,
     * `before` is the count taken *before* this answer was recorded. A /review
       answer does not change the count, so passing it through is what stops a
       student on a set boundary being congratulated after every review answer.
+
+    Called for a weekly answer as well as a practice one (SET_CLOSING_MODES):
+    the Monday push consumes set slots too, so it can be what closes a set.
     """
     try:
         answered = await db.answered_count(uid, level)
@@ -356,26 +417,54 @@ async def on_answer(c: CallbackQuery):
             answered = True
             return await ack(c)
         _, qid_raw, idx_raw, mode = parts
-        if not (qid_raw.isdigit() and idx_raw.isdigit()) or mode not in MODES:
+        qid = _digits(qid_raw, _MAX_QUESTION_ID)
+        # An index wider than the widest keyboard the bot can draw is data no card
+        # ever produced, so it is ignored with the rest of the nonsense rather
+        # than explained below as a stale card.
+        idx = _digits(idx_raw, MAX_OPTIONS)
+        if qid is None or idx is None or mode not in MODES:
             # callback_data is attacker-controllable; anything unexpected is ignored.
             answered = True
             return await ack(c)
 
-        question = await db.get_question(int(qid_raw))
+        question = await db.get_question(qid)
         if question is None:
             answered = True
             return await ack(c, "That question is no longer available.", True)
 
-        options = parse_options(question["options"])
-        idx = int(idx_raw)
-        if not 0 <= idx < len(options):
-            answered = True
-            return await ack(c)
-
         message = getattr(c, "message", None)
-        if message is None:
+        try:
+            options = parse_options(question["options"])
+        except ValueError:
+            # The row's option count is outside what a card can render, so this
+            # card can never be answered. Reporting it beats the bare ack this
+            # used to end in, which looked to the student like a dead button.
+            log.exception("question %s is malformed", qid)
             answered = True
-            return await ack(c)
+            await ack(c, "Something is wrong with that question on our side, "
+                         "sorry. Send /quizme for another one.", True)
+            await drop_buttons(message, lambda data: data.startswith("a:"))
+            forget_outstanding(c.from_user.id, qid)
+            return None
+
+        if not 0 <= idx < len(options):
+            # The row has fewer options than the card was drawn with, so a tap
+            # that was in range for the card is out of range for the question.
+            # A bare ack left every button live and the student tapping forever.
+            answered = True
+            await ack(c, "That option is not on this question any more. "
+                         "Send /quizme for a fresh one.", True)
+            await drop_buttons(message, lambda data: data.startswith("a:"))
+            forget_outstanding(c.from_user.id, qid)
+            return None
+
+        if message is None:
+            # Telegram drops `message` for a card too old to act on, and there is
+            # no msg_id to record an attempt against. Say so rather than acking
+            # bare: the student tapped something and deserves an answer.
+            answered = True
+            return await ack(c, "That card is too old to answer. Send /quizme "
+                                "for a fresh one.", True)
 
         correct = idx == question["correct_idx"]
         # Taken before the write: answered_count counts *distinct* questions, so a
@@ -384,6 +473,7 @@ async def on_answer(c: CallbackQuery):
         before = await db.answered_count(c.from_user.id, question["level"])
         scored = await db.record_attempt(
             c.from_user.id, question, idx, correct, mode, message.message_id)
+        forget_outstanding(c.from_user.id, question["id"])
 
         if not scored:
             answered = True
@@ -411,9 +501,10 @@ async def on_answer(c: CallbackQuery):
             f"{body}\n\n{verdict(correct, question['correct_idx'], streak)}",
             InlineKeyboardMarkup(inline_keyboard=[buttons]),
         )
-        if mode == "practice":
+        if mode in SET_CLOSING_MODES:
             # Only a question answered for the first time advances a set, so only
-            # that can close one. Re-answering through /review never does.
+            # that can close one. Re-answering through /review never does, which
+            # is what `before` proves.
             await _report_set_if_finished(message, c.from_user.id,
                                           question["level"], before)
     except Exception:
@@ -429,12 +520,16 @@ async def on_explain(c: CallbackQuery, bot: Bot):
     answered = False
     try:
         parts = c.data.split(":")
-        if len(parts) != 2 or not parts[1].isdigit():
+        # Same parsing as on_answer, and for the same reason: `isdigit()` let
+        # '²' through and int() then raised, so tapping Explain logged an
+        # exception and showed nothing.
+        qid = _digits(parts[1], _MAX_QUESTION_ID) if len(parts) == 2 else None
+        if qid is None:
             answered = True
             return await ack(c)
 
         uid = c.from_user.id
-        question = await db.get_question(int(parts[1]))
+        question = await db.get_question(qid)
         if question is None:
             answered = True
             return await ack(c, "That question is no longer available.", True)
@@ -524,20 +619,85 @@ async def review(m: Message, bot: Bot):
 # ---------------------------------------------------------------- subscriptions
 
 
-def _sub_off_kb(which: str) -> InlineKeyboardMarkup:
+_SUB_FLAGS = {"weekly": ("weekly_sub", "Monday question sets"),
+              "notes": ("notes_sub", "fortnightly cheat sheets")}
+
+
+def _sub_off_kb(*which: str) -> InlineKeyboardMarkup:
     """A turn-off button on the confirmation itself.
 
     The stop commands are not in the menu: a student turns a subscription off
     once, if ever, and the moment they want to is the moment they are reading the
     confirmation. The commands stay registered for anyone who knows them.
+
+    Takes more than one because a stream switch can turn both pushes back on, and
+    two identical "Turn this off" buttons would not say which is which.
     """
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔕 Turn this off",
-                             callback_data=f"sub:off:{which}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("🔕 Turn this off" if len(which) == 1
+                  else f"🔕 Turn off {_SUB_FLAGS[key][1]}"),
+            callback_data=f"sub:off:{key}")]
+        for key in which
+    ])
 
 
-_SUB_FLAGS = {"weekly": ("weekly_sub", "Monday question sets"),
-              "notes": ("notes_sub", "fortnightly cheat sheets")}
+async def _sheets_left(uid: int, level: str) -> int | None:
+    """Sheets this student has not been sent at `level`.
+
+    None when the level has no catalogue at all, which is emphatically not the
+    same as having read everything and must never be read as "finished".
+    """
+    if not resources.all_for(level):
+        return None
+    delivered = await db.notes_delivered(uid, level)
+    return (len(resources.unsent(level, "a", delivered["a"]))
+            + len(resources.unsent(level, "b", delivered["b"])))
+
+
+async def _questions_left(uid: int, level: str) -> int | None:
+    """Questions this student has never attempted at `level`, or None when the
+    bank is empty: a level still being written is not a level finished."""
+    total = await db.level_total(level)
+    if not total:
+        return None
+    return max(0, total - await db.answered_count(uid, level))
+
+
+#: What each push has left to send, so a stream switch can tell "they ran out of
+#: content" from "they turned it off".
+_SUB_CONTENT = {"weekly": _questions_left, "notes": _sheets_left}
+
+
+async def _restore_finished_subs(uid: int, before: str, now: str) -> list[str]:
+    """Turn a push that ran out of content back on after a stream switch.
+
+    Both pushes switch themselves off when a student finishes a level: the
+    fortnightly drop congratulates them and clears `notes_sub`, and the Monday
+    push does the same with `weekly_sub` (jobs.py). That is right, because the
+    alternative is pinging them every week with nothing to send, but nothing ever
+    undid it: /changestreams to a level with 47 unread sheets left the drop dead,
+    with nothing to show the student why. Returns which were restored so the
+    caller can say what changed.
+
+    Only a push whose *old* level was exhausted is restored. A student who sent
+    /stopweekly still has questions left at that level, so their choice stands
+    and switching stream will not quietly re-subscribe them.
+    """
+    restored = []
+    for which, left in _SUB_CONTENT.items():
+        column, _ = _SUB_FLAGS[which]
+        # db has no single-user flag read, and this runs once per stream switch,
+        # so scanning the subscriber list is cheap enough.
+        if uid in await db.subscribers(column):
+            continue                    # still on: there is nothing to repair
+        if await left(uid, before) != 0:
+            continue                    # not a level they had run out of
+        if not await left(uid, now):
+            continue                    # and nothing waiting at the new one
+        await db.set_flag(uid, column, True)
+        restored.append(which)
+    return restored
 
 
 @router.callback_query(F.data.startswith("sub:off:"))
@@ -596,8 +756,17 @@ async def _deliver(bot: Bot, uid: int, level: str | None, note) -> bool:
     /resources, /topicalnotes, /randomnotes and the fortnightly drop - so a sheet
     read once is never pushed at them again, whichever door they came through.
     Recording only on success means a failed upload is retried rather than lost.
+
+    False means `send_note` could neither upload the PDF nor get the GitHub link
+    through, and the apology is sent from here so that every one of those doors
+    says something. /notes used to return on False without replying at all: the
+    student sent a command and got absolute silence.
     """
     if not await send_note(bot, uid, note):
+        await safe_send(
+            bot, uid,
+            f"Could not send {note.code} just now, sorry. It is still in your "
+            "queue, so try again in a moment, or /resources for another sheet.")
         return False
     await db.record_notes_sent(uid, level, [(note.tier, note.code)])
     return True
@@ -660,7 +829,13 @@ async def resources_cb(c: CallbackQuery, bot: Bot):
         elif action in ("tier", "page"):
             await ack(c)
             tier_code = parts[2] if len(parts) > 2 else "a"
-            page = int(parts[3]) if action == "page" and len(parts) > 3 else 0
+            # A bare int() here raised on "res:page:b:abc" and on an empty tail,
+            # which logged an exception, acked a second time and left the tap
+            # doing nothing visible. Anything that is not a plain number lands on
+            # the first page; _resources_tier_kb clamps the rest.
+            page = 0
+            if action == "page" and len(parts) > 3:
+                page = _digits(parts[3], _MAX_PAGE) or 0
             if message is not None:
                 with contextlib.suppress(Exception):
                     await message.edit_text(
@@ -720,6 +895,12 @@ async def notes(m: Message, command: CommandObject, bot: Bot):
     queue = (resources.unsent(level, "a", delivered["a"])
              + resources.unsent(level, "b", delivered["b"]))
     if not queue:
+        # An empty catalogue gives an empty queue too, and "you have completed
+        # the syllabus" to someone who was never sent a single sheet is a lie the
+        # student cannot see through. /topicalnotes and /randomnotes both guard
+        # this already.
+        if not resources.all_for(level):
+            return await m.answer("No cheat sheets on disk for your level yet.")
         return await m.answer(sheets_done(LEVELS[_level(level)]), parse_mode="HTML")
 
     note = queue[0]
@@ -753,6 +934,14 @@ async def subscribenotes(m: Message):
     delivered = await db.notes_delivered(uid, level)
     left = (len(resources.unsent(level, "a", delivered["a"]))
             + len(resources.unsent(level, "b", delivered["b"])))
+    if not resources.all_for(level):
+        # An empty catalogue and a finished one both leave `left` at zero. Saying
+        # "you have already had every sheet" to someone who has had none is the
+        # same lie /notes used to tell.
+        return await m.answer(
+            f"📬 You're in, but there are no {LEVELS[_level(level)]} cheat "
+            "sheets on disk yet. You'll get them as soon as there are.",
+            reply_markup=_sub_off_kb("notes"))
     if left:
         each = ("a cheat sheet" if jobs.SHEETS_PER_DROP == 1
                 else f"{jobs.SHEETS_PER_DROP} cheat sheets")
@@ -995,7 +1184,13 @@ async def admin_tournament_start(m: Message, bot: Bot):
         return
     if await db.active_tournament():
         return await m.answer("There's already a tournament running.")
-    tid = await db.start_tournament(jobs.TOURNAMENT_DAYS)
+    try:
+        tid = await db.start_tournament(jobs.TOURNAMENT_DAYS)
+    except UniqueViolationError:
+        # Two taps can both pass the check above before either inserts, which
+        # used to leave two live tournament rows and announce the thing twice.
+        # The partial unique index in schema.sql is what actually decides it.
+        return await m.answer("There's already a tournament running.")
     entrants = await db.enrol_everyone(tid)
     await m.answer(
         f"🏆 Tournament {tid} is live for {jobs.TOURNAMENT_DAYS} days. "

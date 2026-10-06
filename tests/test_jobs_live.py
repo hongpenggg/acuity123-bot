@@ -14,12 +14,15 @@ the reported numbers mean what they say, and that nothing is ever sent twice.
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramForbiddenError
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("TEST_DATABASE_URL"),
@@ -57,6 +60,23 @@ async def clean(pool):
     for table in TABLES:
         await db.pool.execute(f"truncate {table} cascade")
     yield
+
+
+@pytest.fixture(autouse=True)
+def instant_pacing(monkeypatch):
+    """Pace nothing by default.
+
+    The fan-outs space their sends per chat, and `sender.Pacer` is tested for
+    that directly in tests/test_sender.py. Left at its real setting, a header
+    plus five cards is three seconds per student here, which would add a minute
+    to this module and tell us nothing these tests are about. The two tests that
+    care about pacing install their own pacer over this one.
+    """
+    from bot import sender
+
+    monkeypatch.setattr(sender, "PACER",
+                        sender.Pacer(burst=1, interval=0.0,
+                                     stream_burst=1, stream_interval=0.0))
 
 
 class FakeBot:
@@ -319,3 +339,238 @@ async def test_a_subscriber_who_has_had_everything_is_congratulated_and_unsubscr
     still_on = await db.pool.fetchval(
         "select notes_sub from users where telegram_id = 1")
     assert still_on is False, "they would be pinged forever otherwise"
+
+
+# ------------------------------------------------------- one run at a time
+
+
+async def test_two_drops_at_once_send_one_sheet():
+    """aiogram polls with handle_as_tasks=True, so /admin_notes_now landing on
+    top of the 10:00 cron fire ran the whole fan-out twice. Both runs read
+    db.notes_delivered before either reached db.record_notes_sent, so the
+    subscriber got the same PDF twice."""
+    from bot import db, jobs
+
+    await _subscriber(1, "preclin", notes=True)
+
+    bot = FakeBot()
+    first, second = await asyncio.gather(jobs.fortnightly_notes(bot),
+                                         jobs.fortnightly_notes(bot))
+
+    assert len(bot.docs(1)) == 1, bot.docs(1)
+    assert len(bot.msgs(1)) == 1, "one header, not two"
+    assert await db.notes_delivered(1, "preclin") == {"a": {"01"}, "b": set()}
+    # The second caller joins the run in flight and is handed its summary, so the
+    # admin who tapped is told what actually went out. A zeroed result would read
+    # as "nothing happened" and invite them to tap again.
+    assert first == second == {"sent": 1, "reached": 1, "subscribers": 1,
+                              "finished": 0}
+
+
+async def test_two_monday_pushes_at_once_send_one_set():
+    from bot import db, jobs
+
+    await _add_questions("preclin", ["P1", "P2"])
+    await _subscriber(1, "preclin", weekly=True)
+
+    bot = FakeBot()
+    first, second = await asyncio.gather(jobs.weekly_quiz(bot),
+                                         jobs.weekly_quiz(bot))
+
+    assert len(bot.msgs(1)) == jobs.SET_PER_PUSH + 1, bot.msgs(1)
+    assert first == second
+    assert first["sent"] == jobs.SET_PER_PUSH
+    served = await db.pool.fetch(
+        "select question_id from attempts where user_id = 1 and mode = 'weekly' "
+        "group by question_id having count(*) > 1")
+    assert served == []
+
+
+async def test_two_closes_of_one_tournament_send_one_award_dm():
+    """The 30-minute close_tournaments sweep and /admin_tournament_end are two
+    call sites for the same close, and running both at once DM'd every winner
+    twice and told the admins the table twice."""
+    from bot import db, jobs
+
+    await db.upsert_user(7, "winner")
+    tid = await db.start_tournament(14)
+    await db.enrol_everyone(tid)
+    await db.pool.execute(
+        "update tournament_points set points = 9 "
+        "where tournament_id = $1 and user_id = 7", tid)
+
+    bot = FakeBot()
+    first, second = await asyncio.gather(jobs.finish_tournament(bot, tid),
+                                         jobs.finish_tournament(bot, tid))
+
+    assert len(bot.msgs(7)) == 1, bot.msgs(7)
+    assert "finished #1" in bot.msgs(7)[0]
+    assert len(bot.msgs(42)) == 1, "the admin table went out twice"
+    assert first == second
+
+
+async def test_a_later_run_is_a_real_run_not_a_refusal():
+    """The guard is for overlap, not a lock: once the first run is finished the
+    next tap must do its own work."""
+    from bot import jobs
+
+    await _subscriber(1, "preclin", notes=True)
+
+    first = await jobs.fortnightly_notes(FakeBot())
+    bot = FakeBot()
+    second = await jobs.fortnightly_notes(bot)
+
+    assert first["sent"] == 1
+    assert second["sent"] == 1
+    assert len(bot.docs(1)) == 1
+    assert bot.docs(1)[0].startswith("02_"), "it moved on to the next sheet"
+
+
+async def test_drain_lets_a_drop_in_flight_finish():
+    """APScheduler's AsyncIOExecutor cancels running jobs on shutdown whatever
+    `wait` says, so main.py drains first. Without it a deploy during the drop
+    lands between the upload and db.record_notes_sent, and the student is sent
+    the same sheet again next fortnight."""
+    from bot import db, jobs
+
+    class Slow(FakeBot):
+        async def send_document(self, uid, document, **kw):
+            await asyncio.sleep(0.05)
+            return await super().send_document(uid, document, **kw)
+
+    await _subscriber(1, "preclin", notes=True)
+
+    bot = Slow()
+    running = asyncio.ensure_future(jobs.fortnightly_notes(bot))
+    await asyncio.sleep(0.01)          # part-way through the upload
+    assert not running.done()
+
+    await jobs.drain(timeout=5)
+
+    assert running.done()
+    assert len(bot.docs(1)) == 1
+    assert await db.notes_delivered(1, "preclin") == {"a": {"01"}, "b": set()}
+    assert await jobs.drain(timeout=0.01) is None, "nothing left to wait for"
+
+
+# ------------------------------------------------- a subscriber who is gone
+
+
+class Counting(FakeBot):
+    """Blocked the bot, and counting how many times we find that out."""
+
+    def __init__(self):
+        super().__init__()
+        self.trips = 0
+
+    async def send_message(self, uid, text, **kw):
+        self.trips += 1
+        raise TelegramForbiddenError(SimpleNamespace(), "bot was blocked")
+
+    async def send_document(self, uid, document, **kw):
+        self.trips += 1
+        raise TelegramForbiddenError(SimpleNamespace(), "bot was blocked")
+
+
+async def test_a_blocked_student_costs_the_monday_push_one_round_trip():
+    """_send_once deactivates them on the first Forbidden. Pushing the rest of
+    the set at them was five more Forbidden round trips and five more redundant
+    UPDATEs, every Monday."""
+    from bot import db, jobs
+
+    await _add_questions("preclin", ["P1", "P2"])
+    await _subscriber(1, "preclin", weekly=True)
+
+    bot = Counting()
+    result = await jobs.weekly_quiz(bot)
+
+    assert bot.trips == 1, "the lead message already told us the chat is gone"
+    assert result == {"sent": 0, "reached": 0, "subscribers": 1, "finished": 0}
+    assert await db.pool.fetchval(
+        "select active from users where telegram_id = 1") is False
+
+
+async def test_a_blocked_student_costs_the_drop_one_round_trip():
+    from bot import db, jobs
+
+    await _subscriber(1, "preclin", notes=True)
+
+    bot = Counting()
+    result = await jobs.fortnightly_notes(bot)
+
+    assert bot.trips == 1, "the header already told us the chat is gone"
+    assert result == {"sent": 0, "reached": 0, "subscribers": 1, "finished": 0}
+    assert await db.notes_delivered(1, "preclin") == {"a": set(), "b": set()}
+
+
+# ------------------------------------------------------------- the fan-out
+
+
+async def test_the_monday_push_overlaps_students_rather_than_queueing_them(
+        monkeypatch):
+    """Per-chat pacing is only free if another student can be served while this
+    one waits out their gap. One student at a time, N students cost N times one
+    student's pacing, which is the fan-out this replaced."""
+    from bot import jobs, sender
+
+    monkeypatch.setattr(sender, "PACER",
+                        sender.Pacer(burst=1, interval=0.1,
+                                     stream_burst=1000, stream_interval=0.0))
+    await _add_questions("preclin", ["P1", "P2"])
+    students = 6
+    assert students <= jobs.FANOUT_CONCURRENCY
+    for uid in range(1, students + 1):
+        await _subscriber(uid, "preclin", weekly=True)
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    result = await jobs.weekly_quiz(FakeBot())
+    elapsed = loop.time() - start
+
+    assert result["reached"] == students
+    one_student = jobs.SET_PER_PUSH * 0.1       # 6 messages, the first free
+    assert elapsed >= one_student * 0.9, elapsed
+    assert elapsed < one_student * 2, f"{elapsed:.2f}s looks like one at a time"
+
+
+async def test_one_students_failure_does_not_take_down_the_drop():
+    """A row, a level or a send going wrong for one subscriber must not stop
+    everybody behind them in the list."""
+    from bot import db, jobs
+
+    await _subscriber(1, "preclin", notes=True)
+    await _subscriber(2, "clin", notes=True)
+
+    real = db.notes_delivered
+
+    async def explode(uid, level):
+        if uid == 1:
+            raise RuntimeError("bad row")
+        return await real(uid, level)
+
+    db.notes_delivered = explode
+    try:
+        result = await jobs.fortnightly_notes(FakeBot())
+    finally:
+        db.notes_delivered = real
+
+    assert result == {"sent": 1, "reached": 1, "subscribers": 2, "finished": 0}
+
+
+async def test_the_jobs_return_the_summary_their_annotation_promises():
+    """fortnightly_notes was annotated `-> int` and returned a dict. The dict is
+    right, because handlers.py indexes four keys out of it; the annotation was
+    the thing that had drifted."""
+    from bot import jobs
+
+    await _add_questions("preclin", ["P1"])
+    await _subscriber(1, "preclin", weekly=True, notes=True)
+
+    for result in (await jobs.fortnightly_notes(FakeBot()),
+                   await jobs.weekly_quiz(FakeBot())):
+        assert set(result) == {"sent", "reached", "subscribers", "finished"}
+        assert all(isinstance(value, int) for value in result.values())
+
+    assert (inspect.signature(jobs.fortnightly_notes).return_annotation
+            == inspect.signature(jobs.weekly_quiz).return_annotation
+            == "dict[str, int]")
