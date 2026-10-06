@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from . import db, resources
+from . import db, resources, throttle
 from .config import ADMIN_IDS, DEFAULT_LEVEL, LEVELS, TZ
 from .sender import safe_send, send_note, send_question
 from .text import sheets_done
@@ -122,6 +122,9 @@ async def _fan_out(subscribers: list[int],
     gate = asyncio.Semaphore(FANOUT_CONCURRENCY)
 
     async def one(uid: int) -> dict[str, int]:
+        # Each gathered call runs as its own task, so this marks only the
+        # fan-out's sends: they wait behind replies to students (bot/throttle.py).
+        throttle.BULK.set(True)
         async with gate:
             try:
                 return await serve(uid)
@@ -307,16 +310,22 @@ async def announce_tournament(bot) -> int:
         return 0
     ends = t["ends_at"].astimezone(ZoneInfo(TZ)).strftime("%d %b")
     sent = 0
-    for uid in await db.all_users():
-        if await safe_send(
-            bot, uid,
-            "🏆 <b>A tournament has started and you're in it.</b>\n\n"
-            f"Runs until {ends}. Every question you get right in /quizme is a "
-            "point, and each question counts once.\n\n"
-            "/leaderboard to see where you stand, /stats for your weak topics.",
-            parse_mode="HTML", pace=True,
-        ):
-            sent += 1
+    # This runs inside the admin's command handler, so it is marked bulk only for
+    # the loop: the admin's confirmation afterwards is an ordinary reply.
+    bulk = throttle.BULK.set(True)
+    try:
+        for uid in await db.all_users():
+            if await safe_send(
+                bot, uid,
+                "🏆 <b>A tournament has started and you're in it.</b>\n\n"
+                f"Runs until {ends}. Every question you get right in /quizme is a "
+                "point, and each question counts once.\n\n"
+                "/leaderboard to see where you stand, /stats for your weak topics.",
+                parse_mode="HTML", pace=True,
+            ):
+                sent += 1
+    finally:
+        throttle.BULK.reset(bulk)
     log.info("tournament announcement reached %s user(s)", sent)
     return sent
 
