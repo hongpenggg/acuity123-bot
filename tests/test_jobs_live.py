@@ -251,7 +251,7 @@ async def test_the_drop_serves_each_subscribers_own_level():
     await jobs.fortnightly_notes(bot)
 
     assert bot.docs(1)[0].startswith("01_")
-    assert bot.docs(2)[0].startswith("C01_")
+    assert bot.docs(2)[0].startswith("A01_")
     assert bot.docs(3)[0].startswith("A01_")
 
 

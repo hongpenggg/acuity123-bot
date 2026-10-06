@@ -57,9 +57,9 @@ TABLES = ("note_deliveries", "tournament_answers", "tournament_points",
 # the .docx sources, so a regeneration that quietly changes the split has to get
 # past two independent copies of it.
 #
-# The clinical bank is 103, not the 120 cases in its documents: seventeen are
-# built around an embedded fundus photograph and the bot sends text-only cards,
-# so SKIP_FIGURE_QUESTIONS holds them back.
+# The clinical bank is 152, not the 170 questions in its document: eighteen are
+# built around an embedded fundus or slit-lamp photograph and the bot sends
+# text-only cards, so SKIP_FIGURE_QUESTIONS holds them back.
 TOPICS: dict[str, dict[str, int]] = {
     "preclin": {
         "Development and ocular histology": 21,
@@ -70,13 +70,12 @@ TOPICS: dict[str, dict[str, int]] = {
         "Retinal and anterior segment pathology": 22,
     },
     "clin": {
-        "Neuro ophthalmology and orbit": 20,
-        "Red eye cornea and uveitis": 19,
-        "Lens lids and paediatric eye": 17,
-        "Clinical assessment and vision loss": 14,
-        "Glaucoma": 12,
-        "Retinal vascular disease": 11,
-        "Macular and vitreoretinal disease": 10,
+        "Assessment refraction and vision loss": 28,
+        "Red eye cornea and uveitis": 28,
+        "Retina macula and vitreous": 26,
+        "Neuro ophthalmology and orbit": 26,
+        "Glaucoma": 24,
+        "Lens lids lacrimal and paediatric eye": 20,
     },
     "postmbbs": {
         "Physiology and biochemistry": 17,
@@ -161,9 +160,10 @@ async def test_overview_sheets_cover_the_same_topics_as_the_bank(bank, level):
     same list. Renaming one without the other fails here, not in front of
     students.
 
-    The clinical sheets arrived prefixed ("C02_Clinical_Red_eye_cornea...") and
-    were renamed on import to the bank's own topic names, which is what makes
-    this hold for `clin` as well as `preclin`.
+    The clinical sheets arrived prefixed and were renamed to the bank's own topic
+    names, and the M3 bank's "Topic: T1 ..." group labels are stripped when the
+    seed is generated, which is what keeps this holding for `clin` as well as
+    `preclin`.
     """
     from bot import resources
 
@@ -255,12 +255,12 @@ async def test_known_question_is_intact(bank):
     assert options[1].startswith("Failure of the embryonic optic fissure")
 
     row = first["clin"]
-    assert row["topic"] == "Clinical assessment and vision loss"
-    assert row["text"].startswith("A 76-year-old woman presents with two hours")
+    assert row["topic"] == "Assessment refraction and vision loss"
+    assert row["text"].startswith("At a six-metre Snellen chart, Zay reads")
     options = json.loads(row["options"])
-    assert len(options) == 5
-    assert row["correct_idx"] == 2  # option c)
-    assert options[2].startswith("Start urgent systemic glucocorticoids")
+    assert len(options) == 4
+    assert row["correct_idx"] == 2  # option C)
+    assert options[2].startswith("6/15+2")
 
     # The FRCOphth documents letter their options A)-D). The generator lowercases
     # the answer letter before indexing, so C) has to land on index 2 - getting

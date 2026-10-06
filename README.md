@@ -74,7 +74,7 @@ copy**, so Telegram receives the actual document and nothing needs hosting. If a
 sheet is missing locally, or is too large for the Bot API to upload, the bot falls
 back to the GitHub link rather than failing.
 
-**153 sheets, scoped per audience level** exactly like the question banks, so a
+**148 sheets, scoped per audience level** exactly like the question banks, so a
 Post-MBBS student is never handed a preclinical sheet:
 
 ```
@@ -82,8 +82,8 @@ resources/
   questions/                    the .docx MCQ sources
   notes/preclin/tier_a/    6    one broad sheet per topic       01–06
   notes/preclin/tier_b/   20    deeper sheets on single points  B01–B20
-  notes/clin/tier_a/       7    C01–C07
-  notes/clin/tier_b/      40    B01–B40
+  notes/clin/tier_a/       6    A01–A06
+  notes/clin/tier_b/      36    B01–B36
   notes/postmbbs/tier_a/  15    A01–A15
   notes/postmbbs/tier_b/  65    B01–B65
 ```
@@ -102,8 +102,10 @@ its level fails CI.
 To students these are "Overview" and "Focused" sheets, never "Tier A" and
 "Tier B" — that is internal shorthand for the content team. The clinical sheets
 arrived named `B01_Clinical_Type_B_...`; that shorthand was stripped on import,
-and the clinical overview sheets were renamed to the seven clinical question
-topics so the sheets and the bank describe the same seven things.
+and the clinical overview sheets carry the six clinical question topics, so the
+sheets and the bank describe the same six things. The bank's own "Topic: T1 ..."
+group labels are stripped when the seed is generated, which is what keeps those
+two lists identical.
 
 **Every question points at the sheet for its own topic.** The button under the
 options comes from `resources.for_topic(level, question["topic"])`, resolved from
@@ -145,27 +147,27 @@ straight to a sheet, by code or by phrase (`/resources b14`,
 
 ## The question bank
 
-**393 single best answer questions** across all three audience levels, every one
+**442 single best answer questions** across all three audience levels, every one
 of them with a written explanation. One seed file per level, loaded in order:
 
 ```
 seeds/01_preclin_mcqs.sql    120 questions    6 topics
-seeds/02_clin_mcqs.sql       103 questions    7 topics
+seeds/02_clin_mcqs.sql       152 questions    6 topics
 seeds/03_postmbbs_mcqs.sql   170 questions   18 topics
 ```
 
 <details>
 <summary><b>Topic split per bank</b> (the generator asserts these, so a bad regeneration fails CI)</summary>
 
-| Pre-Clinical — 120 | | Clinical — 103 | |
+| Pre-Clinical — 120 | | Clinical — 152 | |
 |---|--:|---|--:|
-| Retinal and anterior segment pathology | 22 | Neuro ophthalmology and orbit | 20 |
-| Development and ocular histology | 21 | Red eye cornea and uveitis | 19 |
-| Orbit and eye movements | 21 | Lens lids and paediatric eye | 17 |
-| Optics and visual transduction | 20 | Clinical assessment and vision loss | 14 |
-| Visual pathways and pupil reflexes | 20 | Glaucoma | 12 |
-| Aqueous humour and glaucoma mechanisms | 16 | Retinal vascular disease | 11 |
-| | | Macular and vitreoretinal disease | 10 |
+| Retinal and anterior segment pathology | 22 | Assessment refraction and vision loss | 28 |
+| Development and ocular histology | 21 | Red eye cornea and uveitis | 28 |
+| Orbit and eye movements | 21 | Retina macula and vitreous | 26 |
+| Optics and visual transduction | 20 | Neuro ophthalmology and orbit | 26 |
+| Visual pathways and pupil reflexes | 20 | Glaucoma | 24 |
+| Aqueous humour and glaucoma mechanisms | 16 | Lens lids lacrimal and paediatric eye | 20 |
+| | | | |
 
 | Post-MBBS — 170 | | | |
 |---|--:|---|--:|
@@ -183,19 +185,17 @@ seeds/03_postmbbs_mcqs.sql   170 questions   18 topics
 
 </details>
 
-**Seventeen clinical cases are deliberately not loaded.** Their documents hold
-120 cases, but seventeen are built around an embedded fundus or lid photograph
-("the fundus photograph is shown") and the bot sends text-only question cards, so
-they cannot be answered as delivered. The generator parses and validates them
-like any other question and then holds them back — `SKIP_FIGURE_QUESTIONS` in
-`tools/build_question_seed.py`, one line to reverse once `sender.send_question`
-can upload the figure first.
-
-Four of the seventeen carry only a caption and look answerable as written, so
-they are the quick way to 107. The full list, which thirteen genuinely need the
-picture, both routes to finishing them, and the copyright position on the images
-are all in
-[docs/HANDOVER.md §2.6](docs/HANDOVER.md#26-the-seventeen-clinical-cases-that-are-held-back).
+**Eighteen clinical questions are deliberately not loaded.** The M3 document
+holds 170 questions, and eighteen of them are built around an embedded clinical
+photograph ("Clinical photograph of...", "The fundus photograph is shown") while
+the bot sends text-only question cards, so they cannot be answered as delivered.
+The generator parses and validates them like any other question and then holds
+them back - `SKIP_FIGURE_QUESTIONS` in `tools/build_question_seed.py`, one line to
+reverse once `sender.send_question` can upload the figure first. Every one of the
+eighteen names the picture in its own stem, so none can be salvaged as text. The
+full list, both routes to finishing them, and the copyright position on the
+images are all in
+[docs/HANDOVER.md §2.6](docs/HANDOVER.md#26-the-eighteen-clinical-questions-that-are-held-back).
 
 Because every question carries an explanation, the bot serves them from the
 database and **never calls the LLM for these banks** — you can run the whole

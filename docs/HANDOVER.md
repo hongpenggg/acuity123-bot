@@ -10,13 +10,13 @@ written explanation and none of them needing the LLM.
 adding a fourth level. Everything else is either working or listed as still open
 in [§7](#7-what-was-built-and-what-is-still-open).
 
-> **One caveat, and it is the easiest thing here to forget.** The clinical
-> documents hold 120 cases but only **103** are loaded. Seventeen are built
-> around an embedded photograph and the bot sends text-only question cards, so
-> the generator holds them back. Four of the seventeen look answerable as written
-> and are a quick win; thirteen need the image uploaded or the stem rewritten.
-> Full list and both routes:
-> [§2.6](#26-the-seventeen-clinical-cases-that-are-held-back).
+> **One caveat, and it is the easiest thing here to forget.** The M3 document
+> holds 170 questions but only **152** are loaded. Eighteen are built around an
+> embedded clinical photograph and the bot sends text-only question cards, so the
+> generator holds them back. All eighteen name the picture in their own stem, so
+> none is answerable as written: each needs the image uploaded or the stem
+> rewritten. Full list and both routes:
+> [§2.6](#26-the-eighteen-clinical-questions-that-are-held-back).
 
 ---
 
@@ -104,7 +104,7 @@ match any one of them exactly:
 One thing it will not accept silently: a question whose block contains an
 **inline image**. Those are flagged and held back from the seed, because the bot
 sends text-only question cards — see
-[§2.6](#26-the-seventeen-clinical-cases-that-are-held-back).
+[§2.6](#26-the-eighteen-clinical-questions-that-are-held-back).
 
 ### 2.2 Put the file in the repo
 
@@ -184,60 +184,53 @@ by itself once the tier has questions.
 > `provision.sh` also loads every `seeds/*.sql` automatically, but only for tiers
 > that have nothing in them yet — so a fresh server needs no manual step.
 
-### 2.6 The seventeen clinical cases that are held back
+### 2.6 The eighteen clinical questions that are held back
 
 **This is the one piece of loaded content that is deliberately incomplete, so it
-is the thing most likely to be forgotten.** The two clinical documents hold 120
-cases. Seventeen of them are built around an embedded fundus, OCT or lid
-photograph, and `bot/sender.py` sends question cards as **text messages** — there
-is no code path that uploads an image with a question. A student would be asked
-to interpret a photograph that never arrives, so the generator holds them back
-and the loaded clinical bank is **103, not 120**.
+is the thing most likely to be forgotten.** The M3 document holds 170 questions.
+Eighteen of them are built around an embedded clinical photograph, and
+`bot/sender.py` sends question cards as **text messages** — there is no code path
+that uploads an image with a question. A student would be asked to interpret a
+photograph that never arrives, so the generator holds them back and the loaded
+clinical bank is **152, not 170**.
 
 They are not dropped silently. `parse_document` flags any question whose block
 contains an inline image (`graphicData` in the paragraph XML — the detection is
-structural, so it cannot drift out of step with the documents), validates it like
+structural, so it cannot drift out of step with the document), validates it like
 every other question, and then `build_level` removes it and prints exactly which:
 
 ```
-held back 17 figure-dependent question(s): Q9, Q10, Q11, Q12, Q13, Q14, Q52,
-Q53, Q56, Q59, Q61, Q64, Q66, Q74, Q78, Q102, Q107
+held back 18 figure-dependent question(s): Q39, Q44, Q63, Q81, Q86, Q94, Q95,
+Q96, Q101, Q102, Q107, Q113, Q124, Q130, Q148, Q156, Q168, Q169
 ```
 
-| # | Topic | Image in the source | Stem depends on it |
-|---|---|---|---|
-| Q9 | Retinal vascular disease | `Mamalis_retina_9.jpg` | **yes** |
-| Q10 | Retinal vascular disease | `big_55590ee180e14.jpg` | **yes** |
-| Q11 | Retinal vascular disease | `big_6…6.82258709.jpg` | **yes** |
-| Q12 | Macular and vitreoretinal disease | `IMG_4065.jpg` | caption only |
-| Q13 | Macular and vitreoretinal disease | `Rhegm…chment-HST.jpg` | **yes** |
-| Q14 | Macular and vitreoretinal disease | `paste…b3a5a453fc.jpg` | **yes** |
-| Q52 | Retinal vascular disease | `QuizSeries_p3_img0_X13.png` | caption only |
-| Q53 | Retinal vascular disease | `macular oedema.jpeg` | **yes** |
-| Q56 | Retinal vascular disease | `big_631b0e824e4a35.14412017.jpg` | **yes** |
-| Q59 | Retinal vascular disease | `big_55590ee180e14.jpg` | **yes** |
-| Q61 | Retinal vascular disease | `7EetI4r7HfXCMv…BRx3TroQ9L.png` | **yes** |
-| Q64 | Retinal vascular disease | `Mamalis_retina_11.jpg` | **yes** |
-| Q66 | Macular and vitreoretinal disease | `big_5081d9424a0cd.jpg` | caption only |
-| Q74 | Macular and vitreoretinal disease | `600px-ASRS-RIB-Image-170.jpg` | **yes** |
-| Q78 | Retinal vascular disease | `paste-0da49873…045fd9a01a.jpg` | **yes** |
-| Q102 | Lens lids and paediatric eye | `paste-7780e3e6…d26d06e4b0.jpg` | **yes** |
-| Q107 | Clinical assessment and vision loss | `paste-52ba7000…23f11ab0f9.jpg` | caption only |
+| # | Topic | How the stem refers to it |
+|---|---|---|
+| Q39 | Red eye cornea and uveitis | "Clinical photograph from the ophthalmology Anki collection" |
+| Q44 | Red eye cornea and uveitis | "Clinical photograph from the ophthalmology Anki collection" |
+| Q63 | Glaucoma | "Clinical photograph from the ophthalmology Anki collection" |
+| Q81 | Glaucoma | "Clinical photograph from the ophthalmology Anki collection" |
+| Q86 | Retina macula and vitreous | "The attached photograph shows a dark collection of blood..." |
+| Q94 | Retina macula and vitreous | "photograph shows sharply defined yellow deposits" |
+| Q95 | Retina macula and vitreous | "The fundus photograph is shown" |
+| Q96 | Retina macula and vitreous | "Fundus photograph" |
+| Q101 | Retina macula and vitreous | "The fundus photograph shows widespread retinal pallor..." |
+| Q102 | Retina macula and vitreous | "The attached photograph shows a sharply regional area of retinal whitening" |
+| Q107 | Retina macula and vitreous | "The attached photograph shows yellow macular drusen" |
+| Q113 | Retina macula and vitreous | "as shown in the photograph" |
+| Q124 | Neuro ophthalmology and orbit | "the attached photograph shows a radial arrangement of hard exudates" |
+| Q130 | Neuro ophthalmology and orbit | "fundus photograph shows both optic discs" |
+| Q148 | Lens lids lacrimal and paediatric eye | "in the figure" |
+| Q156 | Lens lids lacrimal and paediatric eye | "The figure shows a central ulcer with a raised, pearly rolled edge" |
+| Q168 | Lens lids lacrimal and paediatric eye | "the family notices a white pupil in photographs" |
+| Q169 | Lens lids lacrimal and paediatric eye | "Figure for this question" |
 
-"Stem depends on it" is the column that matters:
+**All eighteen name the picture in their own stem**, so unlike the bank this
+replaced there is no caption-only group to rescue: each one needs the image
+uploaded or its stem rewritten. The quick win that the old bank offered is not
+there, and the honest figure is 152 of 170.
 
-- **13 genuinely need the picture** (Q9, Q10, Q11, Q13, Q14, Q53, Q56, Q59, Q61, Q64, Q74, Q78, Q102). Their stems say
-  things like *"the photographed diffuse haemorrhagic pattern"* or *"the fundus
-  appearance shown"*. Q10 asks the student to separate BRVO from CRVO, and the
-  only evidence for that is the image. These cannot be fixed by editing text.
-- **4 carry only a caption** (Q12, Q52, Q66, Q107). The photograph sits
-  next to the stem but nothing in the question refers to it — Q66 is *"bilateral
-  intermediate AMD with large drusen … which recommendation matches her stage and
-  smoking history?"*, which is answerable as written. **These four are the cheap
-  win**: confirm with the content team that the picture is decorative, and they
-  can ship as text-only questions, taking the clinical bank to 107.
-
-#### Two ways to finish the other thirteen
+#### Two ways to finish them
 
 1. **Upload the figure with the card.** Extract the images to
    `resources/questions/figures/`, carry the reference through the seed (a
@@ -246,18 +239,20 @@ Q53, Q56, Q59, Q61, Q64, Q66, Q74, Q78, Q102, Q107
    photo caption at 1024 characters and these cards routinely exceed that, so it
    has to be photo-then-text, and the answer buttons must stay attached to the
    text message.
-2. **Rewrite the thirteen stems** so the finding is described in words
+2. **Rewrite the eighteen stems** so the finding is described in words
    ("diffuse haemorrhage in all four quadrants with a swollen disc"). Cheaper,
    loses the image-interpretation skill the cases were written to test.
 
-> **Copyright, before either route.** The source appendix lists these images as
-> coming from an M3 Anki deck, a supplied quiz PDF and senior notes, and one
-> caption reads *"image unmodified"*. The content policy in the README and
-> `schema.sql` keeps iRAT/tRAT, AMBOSS, PassMedicine and school or senior
-> material out of this repo until it has been rewritten — rewritten prose is
-> fine, an unmodified photograph is not. Clear the images with the content team
-> before shipping them, whichever route you take. The prose cases themselves are
-> newly written and are not affected.
+> **Copyright, before either route.** The document's own source appendix lists
+> what its material is drawn from: a senior "Eye" document credited as *largely
+> adapted from Jin Wei*, `Mega-WITI (M3 20_21)`, an `Eye M3 EOP Quiz 1 Stream`
+> PDF, and an Anki deck. The content policy in the README and `schema.sql` keeps
+> iRAT/tRAT, AMBOSS, PassMedicine and school or senior material out of this repo
+> until it has been rewritten — rewritten prose is fine, an unmodified photograph
+> is not. The four questions captioned *"Clinical photograph from the
+> ophthalmology Anki collection"* are the clearest example. Clear the images with
+> the content team before shipping them, whichever route you take. The stems and
+> explanations are the society's own written work and are not affected.
 
 #### Re-enabling them
 
@@ -269,8 +264,8 @@ SKIP_FIGURE_QUESTIONS = False
 
 Then `python tools/build_question_seed.py --level clin`, and update the
 `EXPECTED["clin"]` count and topic split in the same file plus `TOPICS["clin"]`
-in `tests/test_seed_data.py` — both assert 103 today and will fail loudly, which
-is the intended behaviour rather than something to work around.
+in `tests/test_seed_data.py` — all three assert 152 today and will fail loudly,
+which is the intended behaviour rather than something to work around.
 
 ---
 
@@ -287,7 +282,7 @@ resources/notes/<level>/tier_b/   deeper sheets on single points   B01_<Topic>.p
 
                          tier_a   tier_b   codes
   preclin                     6       20   01-06      / B01-B20
-  clin                        7       40   C01-C07    / B01-B40
+  clin                        6       36   A01-A06    / B01-B36
   postmbbs                   15       65   A01-A15    / B01-B65
 ```
 
@@ -301,7 +296,7 @@ Two things to know before you touch this:
 - **Codes repeat across levels.** `B01` exists three times. Every lookup in
   `bot/resources.py` takes a level for that reason, and a bare number like `14`
   only matches within the student's own level. A code spelled with its letter
-  (`C01`) is taken literally, so it will not fall through to another level's `01`.
+  (`A01`) is taken literally, so it will not fall through to another level's `01`.
 - **The filename is the student-facing title.** `B01_Clinical_Type_B_Vision_...`
   would have been shown as "Clinical Type B Vision ...", so that shorthand was
   stripped when the clinical sheets were imported. Students see **"Overview"**
@@ -474,7 +469,7 @@ Still open, and nothing here is blocked by anything else:
 | Open | Notes |
 |---|---|
 | **Content is shipped by git, not by the content team** | The biggest architectural limitation here: every question, sheet and line of copy is baked into the deploy artifact, so changing any of it is a developer task. Three incremental steps out of it, and the traps to avoid, in [§11](#11-the-content-pipeline-needs-to-stop-being-the-git-repo) |
-| **Seventeen clinical cases need their photographs** | The clinical bank is 103 of 120 cases: the rest are built around an embedded photograph the bot cannot send. Four of them probably stand alone as text and are a quick win; thirteen need `sender.send_question` to upload a figure, or a rewritten stem. The images are unmodified M3 Anki and quiz-PDF material, so the README's content policy has to be cleared first. Everything — the list, both routes, and the one-line switch — is in [§2.6](#26-the-seventeen-clinical-cases-that-are-held-back) |
+| **Eighteen clinical questions need their photographs** | The clinical bank is 152 of 170 questions: the rest are built around an embedded photograph the bot cannot send, and every one of them names it in the stem, so none stands alone as text. Each needs `sender.send_question` to upload a figure, or a rewritten stem. The images are drawn from M3 Anki, quiz-PDF and senior-note material, so the README's content policy has to be cleared first. Everything — the list, both routes, and the one-line switch — is in [§2.6](#26-the-eighteen-clinical-questions-that-are-held-back) |
 | **Dropping the old command names** | `/practice`, `/subscribe`, `/unsubscribe`, `/notes_sub`, `/notes_unsub` and `/level` still work as aliases so nothing in a student's existing chat breaks. They are the extra names on each `Command(...)` decorator |
 | **Nothing shows a student their question history** | Intentional for marker B: other students cannot see anyone's activity. Every answer is in `attempts` if a per-question view is ever wanted |
 | **A restart can skip a weekly push** | APScheduler computes `next_run_time` from boot with the default in-memory job store, so a restart at 09:05 on a Monday schedules the push for the *following* Monday, silently. Both fixes are costed in the comment at `jobs.register`; neither looked worth the dependency |
@@ -521,7 +516,7 @@ bot/main.py         wiring, the error handler, graceful shutdown and drain
 schema.sql          a fresh database
 migrations/         bringing an existing one forward, 001 to 006
 seeds/              the question banks, one file per level
-resources/          the .docx sources and 153 note PDFs, per level
+resources/          the .docx sources and 148 note PDFs, per level
 tools/              regenerates the seeds from the .docx files
 scripts/check_sql.py  parses every statement with the real PostgreSQL grammar
 docs/SETUP.md       full server runbook, troubleshooting table, event-day checklist
@@ -599,7 +594,7 @@ Every piece of content is baked into the deploy artifact:
 | Content | Where it lives | To change it |
 |---|---|---|
 | Question banks | `.docx` in `resources/questions/` → `tools/build_question_seed.py` → `seeds/*.sql` | edit the .docx, regenerate, commit, `git pull` on the server, `psql -f` the seed |
-| Revision sheets | 153 PDFs in `resources/notes/<level>/tier_<a\|b>/` | commit the PDF, `git pull` on the server |
+| Revision sheets | 148 PDFs in `resources/notes/<level>/tier_<a\|b>/` | commit the PDF, `git pull` on the server |
 | Bot copy | string constants in `bot/config.py` and `bot/handlers.py` | commit, `git pull`, `systemctl restart studybot` |
 
 `sender.send_note` uploads the file straight from the deployed working copy, and
@@ -614,8 +609,8 @@ falls back to a `raw.githubusercontent.com` link built from `REPO_SLUG` /
 - **Content changes need a deploy.** A question bank reload is a manual `psql`
   against production. There is no way to preview, stage or roll back one sheet.
 - **The repo carries the payload.** It is roughly 17 MB of PDFs and `.docx`
-  already, and the clinical documents alone are 2.8 MB of embedded images for
-  seventeen questions that are not even loaded (§2.6). This only grows.
+  already, and the M3 document alone is 1.4 MB of embedded images, for eighteen
+  questions that are not even loaded (§2.6). This only grows.
 - **The fallback links assume a public repo.** If `acuity123-bot` is ever made
   private, every `raw.githubusercontent.com` fallback silently 404s for students,
   and nothing in the code notices.

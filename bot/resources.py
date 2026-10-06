@@ -6,7 +6,7 @@ Post-MBBS student is never handed a preclinical sheet:
 ```
 resources/notes/
   preclin/tier_a/   01-06     preclin/tier_b/   B01-B20
-  clin/tier_a/      C01-C07   clin/tier_b/      B01-B40
+  clin/tier_a/      A01-A06   clin/tier_b/      B01-B36
   postmbbs/tier_a/  A01-A15   postmbbs/tier_b/  B01-B65
 ```
 
@@ -71,7 +71,7 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # Student-facing names. Never "Tier A"/"Tier B" - that is internal shorthand.
 TIERS: dict[str, str] = {"a": "Overview", "b": "Focused"}
 
-# "01_Development_and_ocular_histology", "C03_Glaucoma", "B14_Saccades_and_the_VOR"
+# "01_Development_and_ocular_histology", "A01_Assessment_refraction_and_vision_loss"
 _CODE_RE = re.compile(r"^(?P<code>[A-Z]{0,2}\d{1,2})_(?P<topic>.+)$")
 
 
@@ -81,7 +81,7 @@ class Note:
 
     level: str         # "preclin", "clin" or "postmbbs"
     tier: str          # "a" or "b"
-    code: str          # "03", "C03" or "B14"
+    code: str          # "03", "A01" or "B14"
     topic: str         # "Optics and visual transduction"
     path: Path
 
@@ -269,8 +269,9 @@ def find(level: str | None, code: str) -> Note | None:
         if note.code.lower() == wanted:
             return note
     # A bare number matches whichever code carries it, so "14" still finds "B14".
-    # A query that spells out a letter prefix is taken literally: "C01" is a
-    # clinical code and must not fall through to the preclinical "01".
+    # A query that spells out a letter prefix is taken literally: "A01" is a
+    # clinical (and post-MBBS) code and must not fall through to the
+    # preclinical "01".
     if not wanted.isdigit():
         return None
     loose = wanted.lstrip("0")

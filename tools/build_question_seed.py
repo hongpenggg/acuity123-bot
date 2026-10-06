@@ -50,8 +50,7 @@ LEVELS: dict[str, tuple[str, list[Path]]] = {
     "clin": (
         "02",
         [
-            ROOT / "resources" / "questions" / "Clinical_Ophthalmology_M3_M5_20_Case_MCQs.docx",
-            ROOT / "resources" / "questions" / "Clinical_Ophthalmology_M3_M5_100_Additional_Cases_Q21_Q120.docx",
+            ROOT / "resources" / "questions" / "M3_Ophthalmology_170_MCQ_One_Per_Page.docx",
         ],
     ),
     "postmbbs": (
@@ -63,11 +62,12 @@ LEVELS: dict[str, tuple[str, list[Path]]] = {
     ),
 }
 
-# Seventeen of the clinical cases are built around an embedded fundus or lid
-# photograph ("The fundus photograph is shown"), and the bot sends text-only
-# question cards - so they cannot be answered as delivered. They are parsed and
-# validated like every other question, then held back from the seed. Flip this to
-# False to emit them, once sender.send_question can upload the figure first.
+# Eighteen of the M3 bank's questions are built around an embedded photograph (a
+# fundus or slit-lamp image sits in the question's own block), and the bot sends
+# text-only question cards - so they cannot be answered as delivered. They are
+# parsed and validated like every other question, then held back from the seed.
+# Flip this to False to emit them, once sender.send_question can upload the
+# figure first.
 SKIP_FIGURE_QUESTIONS = True
 
 TEXT_TAG = "$q$"
@@ -89,16 +89,18 @@ EXPECTED: dict[str, dict] = {
             "Retinal and anterior segment pathology": 22,
         },
     },
+    # The M3 bank is 170 questions across six topic groups; eighteen are held
+    # back by SKIP_FIGURE_QUESTIONS, so 152 are emitted. These are counts of what
+    # is emitted.
     "clin": {
-        "count": 103,
+        "count": 152,
         "topics": {
-            "Neuro ophthalmology and orbit": 20,
-            "Red eye cornea and uveitis": 19,
-            "Lens lids and paediatric eye": 17,
-            "Clinical assessment and vision loss": 14,
-            "Glaucoma": 12,
-            "Retinal vascular disease": 11,
-            "Macular and vitreoretinal disease": 10,
+            "Assessment refraction and vision loss": 28,
+            "Red eye cornea and uveitis": 28,
+            "Retina macula and vitreous": 26,
+            "Neuro ophthalmology and orbit": 26,
+            "Glaucoma": 24,
+            "Lens lids lacrimal and paediatric eye": 20,
         },
     },
     "postmbbs": {
@@ -131,9 +133,26 @@ EXPECTED: dict[str, dict] = {
 QUESTION_RE = re.compile(r"^(?:Sample\s+question|Question)\s+(\d+)\s*$")
 TYPE_RE = re.compile(r"^Question type\s*:?\s*(.+)$")
 TOPIC_RE = re.compile(r"^Topic\s*:?\s*(.+)$")
+# The M3 bank adds a focused sub-topic per question, which is the subject of one
+# tier B sheet ("Visual acuity and pinhole" -> B01). It is read here rather than
+# left to the stem fall-through below, which would otherwise prefix every stem
+# with "Subtopic: ...". SUBTAG_RE must stay after TYPE_RE: "Question type" and
+# "Subtopic" are different labels and neither is a prefix of the other, but the
+# topic pattern is anchored, so order only matters for clarity.
+SUBTAG_RE = re.compile(r"^Subtopic\s*:?\s*(.+)$")
+# The M3 bank groups its topics ("Topic: T1 Assessment refraction and vision
+# loss") while the note sheets are named without the group label. Stripping it
+# keeps the bank's topics and the sheet titles identical, which is what the
+# Notes button under each question matches on, and keeps the group label out of
+# the card header students read.
+TOPIC_GROUP_RE = re.compile(r"^T\d+\s+")
 # The preclinical banks write "Options:", the clinical ones "Options", and the
 # FRCOphth ones omit the header entirely - see parse_document.
 OPTIONS_RE = re.compile(r"^Options\s*:?\s*$")
+# The M3 bank labels its explanation line ("Explanation: The 6/15 line is...");
+# the preclinical and FRCOphth banks do not. Dropped so a card reads the same
+# whichever bank the question came from, since the bot supplies its own heading.
+EXPLANATION_PREFIX_RE = re.compile(r"^Explanation\s*:?\s*")
 # Preclinical and clinical letter their options a)-e); FRCOphth uses A)-D).
 OPTION_RE = re.compile(r"^([a-eA-E])\)\s*(.+)$")
 CORRECT_RE = re.compile(r"^Correct option\s*:?\s*([a-eA-E])\)\s*(.+)$")
@@ -175,6 +194,13 @@ def parse_document(path: Path) -> tuple[list[dict], list[str]]:
     def finish(q: dict | None) -> None:
         if q is None:
             return
+        # Join the type and the sub-topic into the project's "domain | specific"
+        # tag shape, the same shape the preclinical bank uses. The sub-topic is
+        # what a student can actually act on, because it names one focused sheet,
+        # so it is kept rather than dropped. Documents that already carry their
+        # own piped tag (the FRCOphth ones) are left alone.
+        if q.get("subtopic") and "|" not in q.get("tag", ""):
+            q["tag"] = f"{q['tag']} | {q['subtopic']}"
         missing = [k for k in ("number", "tag", "topic", "stem", "options",
                                "correct_idx", "explanation") if k not in q]
         if missing:
@@ -215,7 +241,9 @@ def parse_document(path: Path) -> tuple[list[dict], list[str]]:
         if (match := TYPE_RE.match(line)):
             current["tag"] = match.group(1).strip()
         elif (match := TOPIC_RE.match(line)):
-            current["topic"] = match.group(1).strip()
+            current["topic"] = TOPIC_GROUP_RE.sub("", match.group(1).strip())
+        elif (match := SUBTAG_RE.match(line)):
+            current["subtopic"] = match.group(1).strip()
         elif OPTIONS_RE.match(line):
             section = "options"
         elif (match := CORRECT_RE.match(line)):
@@ -234,7 +262,7 @@ def parse_document(path: Path) -> tuple[list[dict], list[str]]:
             if "explanation" in current:
                 current.setdefault("references", []).append(line)
             else:
-                current["explanation"] = line
+                current["explanation"] = EXPLANATION_PREFIX_RE.sub("", line)
         elif section == "options":
             problems.append(f"Q{current['number']}: stray line in options: {line[:60]!r}")
         elif "|" in line and not {"tag", "topic", "stem"} & current.keys():

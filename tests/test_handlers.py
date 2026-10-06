@@ -1596,10 +1596,10 @@ async def test_randomnotes_serves_the_students_own_level(fake, level, prefix):
 @pytest.mark.asyncio
 async def test_topicalnotes_lists_the_students_own_level(fake):
     """The overview picker is built from the student's level, so the clinical
-    student sees C01-C07 and the post-MBBS student A01-A15."""
+    student sees A01-A06 and the post-MBBS student A01-A15."""
     from bot import resources
 
-    for level, expected in (("preclin", "01"), ("clin", "C01"),
+    for level, expected in (("preclin", "01"), ("clin", "A01"),
                             ("postmbbs", "A01")):
         fake.users[1] = level
         msg = _chat_message()

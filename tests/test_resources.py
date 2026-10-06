@@ -19,7 +19,7 @@ LEVELS = ("preclin", "clin", "postmbbs")
 #: added PDF has to be acknowledged here.
 COUNTS = {
     "preclin": (6, 20),
-    "clin": (7, 40),
+    "clin": (6, 36),
     "postmbbs": (15, 65),
 }
 
@@ -27,8 +27,8 @@ COUNTS = {
 CODE_RANGE = {
     ("preclin", "a"): ("01", "06"),
     ("preclin", "b"): ("B01", "B20"),
-    ("clin", "a"): ("C01", "C07"),
-    ("clin", "b"): ("B01", "B40"),
+    ("clin", "a"): ("A01", "A06"),
+    ("clin", "b"): ("B01", "B36"),
     ("postmbbs", "a"): ("A01", "A15"),
     ("postmbbs", "b"): ("B01", "B65"),
 }
@@ -47,13 +47,12 @@ OVERVIEW_TOPICS = {
         "Retinal and anterior segment pathology",
     },
     "clin": {
-        "Clinical assessment and vision loss",
+        "Assessment refraction and vision loss",
         "Red eye cornea and uveitis",
         "Glaucoma",
-        "Retinal vascular disease",
-        "Macular and vitreoretinal disease",
+        "Retina macula and vitreous",
         "Neuro ophthalmology and orbit",
-        "Lens lids and paediatric eye",
+        "Lens lids lacrimal and paediatric eye",
     },
     "postmbbs": {
         "Applied ocular anatomy and development",
@@ -217,21 +216,21 @@ def test_lookup_by_code():
     assert resources.find("preclin", "B14").code == "B14"
     assert resources.find("preclin", "14").code == "B14"
     assert resources.find("preclin", "03").code == "03"
-    assert resources.find("clin", "c03").code == "C03"
+    assert resources.find("clin", "a03").code == "A03"
     assert resources.find("postmbbs", "a15").code == "A15"
     assert resources.find("preclin", "") is None
     assert resources.find("preclin", "nope") is None
     # Real codes, but not at this level.
     assert resources.find("preclin", "B65") is None
-    assert resources.find("preclin", "C01") is None
+    assert resources.find("preclin", "A01") is None
 
 
 def test_exact_lookup_within_a_level_and_tier():
     assert resources.get("preclin", "b", "B07").topic == "Horizontal gaze VI and MLF"
     assert resources.get("preclin", "a", "03").topic == "Optics and visual transduction"
-    assert resources.get("clin", "a", "C03").topic == "Glaucoma"
+    assert resources.get("clin", "a", "A03").topic == "Glaucoma"
     assert resources.get("preclin", "a", "B07") is None   # right code, wrong kind
-    assert resources.get("preclin", "a", "C01") is None   # right kind, wrong level
+    assert resources.get("preclin", "a", "A01") is None   # right kind, wrong level
 
 
 def test_an_unknown_level_falls_back_rather_than_raising():
@@ -260,8 +259,8 @@ def test_a_preclinical_topic_resolves_to_its_overview_sheet():
 
 
 @pytest.mark.parametrize("topic,code", [
-    ("Clinical assessment and vision loss", "C01"),
-    ("Lens lids and paediatric eye", "C07"),
+    ("Assessment refraction and vision loss", "A01"),
+    ("Lens lids lacrimal and paediatric eye", "A06"),
 ])
 def test_clinical_topics_resolve(topic, code):
     note = resources.for_topic("clin", topic)

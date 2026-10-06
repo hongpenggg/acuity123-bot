@@ -515,12 +515,12 @@ psql "$DATABASE_URL" -f seeds/01_preclin_mcqs.sql
 
 ### 4.4 Notes
 
-The sheets are **153 PDFs in the repo**, not database rows, and they are per
+The sheets are **148 PDFs in the repo**, not database rows, and they are per
 level. Nothing needs seeding:
 
 ```
 resources/notes/preclin/tier_a/    6     tier_b/   20      01-06   / B01-B20
-resources/notes/clin/tier_a/       7     tier_b/   40      C01-C07 / B01-B40
+resources/notes/clin/tier_a/       6     tier_b/   36      A01-A06 / B01-B36
 resources/notes/postmbbs/tier_a/  15     tier_b/   65      A01-A15 / B01-B65
 ```
 

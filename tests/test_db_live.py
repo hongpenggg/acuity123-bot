@@ -507,11 +507,11 @@ async def test_reset_notes_clears_one_level_and_counts_what_it_cleared(pool):
 
     await db.upsert_user(1, None)
     await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B01")])
-    await db.record_notes_sent(1, "clin", [("a", "C01")])
+    await db.record_notes_sent(1, "clin", [("a", "A01")])
 
     assert await db.reset_notes(1, "preclin") == 2
     assert await db.notes_delivered(1, "preclin") == {"a": set(), "b": set()}
-    assert await db.notes_delivered(1, "clin") == {"a": {"C01"}, "b": set()}
+    assert await db.notes_delivered(1, "clin") == {"a": {"A01"}, "b": set()}
     # Nothing left to clear, and asking again is not an error.
     assert await db.reset_notes(1, "preclin") == 0
 
