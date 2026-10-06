@@ -1,4 +1,4 @@
-"""Validate the real preclinical question bank.
+"""Validate the real question banks: preclinical, clinical and post-MBBS.
 
 This is the test that would have caught the original bot's hardcoded "ABCD"
 crash: every question in the bank is rendered through the same code path the
@@ -48,19 +48,59 @@ ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = (ROOT / "schema.sql").read_text()
 # Loaded in file order, exactly as the setup instructions do.
 SEEDS = [(p.name, p.read_text()) for p in sorted((ROOT / "seeds").glob("*.sql"))]
-SEED = dict(SEEDS)["01_preclin_mcqs.sql"]
 
-TABLES = ("tournament_answers", "tournament_points", "attempts", "tournaments",
-          "notes", "questions", "users")
+TABLES = ("note_deliveries", "tournament_answers", "tournament_points",
+          "attempts", "tournaments", "notes", "questions", "users")
 
-EXPECTED_TOPICS = {
-    "Development and ocular histology": 21,
-    "Orbit and eye movements": 21,
-    "Optics and visual transduction": 20,
-    "Visual pathways and pupil reflexes": 20,
-    "Aqueous humour and glaucoma mechanisms": 16,
-    "Retinal and anterior segment pathology": 22,
+# Each bank's coverage table, written out by hand here rather than imported from
+# tools/build_question_seed.py: the generator asserts the same numbers against
+# the .docx sources, so a regeneration that quietly changes the split has to get
+# past two independent copies of it.
+#
+# The clinical bank is 103, not the 120 cases in its documents: seventeen are
+# built around an embedded fundus photograph and the bot sends text-only cards,
+# so SKIP_FIGURE_QUESTIONS holds them back.
+TOPICS: dict[str, dict[str, int]] = {
+    "preclin": {
+        "Development and ocular histology": 21,
+        "Orbit and eye movements": 21,
+        "Optics and visual transduction": 20,
+        "Visual pathways and pupil reflexes": 20,
+        "Aqueous humour and glaucoma mechanisms": 16,
+        "Retinal and anterior segment pathology": 22,
+    },
+    "clin": {
+        "Neuro ophthalmology and orbit": 20,
+        "Red eye cornea and uveitis": 19,
+        "Lens lids and paediatric eye": 17,
+        "Clinical assessment and vision loss": 14,
+        "Glaucoma": 12,
+        "Retinal vascular disease": 11,
+        "Macular and vitreoretinal disease": 10,
+    },
+    "postmbbs": {
+        "Physiology and biochemistry": 17,
+        "Cornea and ocular surface": 15,
+        "Optics and refraction": 14,
+        "Medical retina and macular decisions": 13,
+        "Optics and refractive surgery": 12,
+        "Cataract and lens surgery": 12,
+        "Vitreoretinal surgery and trauma": 12,
+        "Orbit lids and lacrimal selection": 12,
+        "Advanced neuro ophthalmology": 10,
+        "Uveitis and inflammatory medicine": 9,
+        "Glaucoma": 9,
+        "Paediatric ophthalmology and strabismus": 9,
+        "Anatomy and embryology": 7,
+        "Biostatistics and evidence": 5,
+        "Genetics": 4,
+        "Microbiology and immunology": 4,
+        "Pharmacology": 4,
+        "Pathology": 2,
+    },
 }
+SIZES = {level: sum(topics.values()) for level, topics in TOPICS.items()}
+TOTAL = sum(SIZES.values())
 
 
 @pytest.fixture(scope="module")
@@ -91,43 +131,82 @@ def bank(seeded):
 
 async def test_bank_is_complete(bank):
     rows = await bank.pool.fetch("select * from questions order by id")
-    assert len(rows) == 120
-    assert {r["level"] for r in rows} == {"preclin"}
+    assert len(rows) == TOTAL
+    assert {r["level"] for r in rows} == set(TOPICS)
 
 
-async def test_every_seed_file_loads_and_only_preclinical_has_content(bank):
-    """The Clinical and Post-MBBS seeds are placeholders that load cleanly and
-    add nothing — so loading every seed in order is always safe, and adding
-    those banks later needs no change to the loader."""
-    levels = await bank.levels_with_questions()
-    assert levels == ["preclin"]
+async def test_every_seed_file_loads_and_each_level_has_its_bank(bank):
+    """All three levels carry content now. Each seed guards its own level, so
+    loading every file in order stays a single pass and the loader is unchanged
+    from when two of the three were empty placeholders."""
+    assert await bank.levels_with_questions() == sorted(TOPICS)
 
     counts = await bank.pool.fetch(
         "select level, count(*) as n from questions group by level")
-    assert {r["level"]: r["n"] for r in counts} == {"preclin": 120}
+    assert {r["level"]: r["n"] for r in counts} == SIZES
 
 
 async def test_topic_distribution_matches_the_source_document(bank):
     rows = await bank.pool.fetch(
-        "select topic, count(*) as n from questions group by topic")
-    counts = {r["topic"]: r["n"] for r in rows}
-    assert counts == EXPECTED_TOPICS
+        "select level, topic, count(*) as n from questions group by level, topic")
+    counts: dict[str, dict[str, int]] = {}
+    for row in rows:
+        counts.setdefault(row["level"], {})[row["topic"]] = row["n"]
+    assert counts == TOPICS
 
 
-async def test_overview_sheets_cover_the_same_topics_as_the_bank(bank):
-    """The six overview sheets and the six question topics are the same six
-    things. Renaming one without the other fails here, not in front of students."""
+@pytest.mark.parametrize("level", ["preclin", "clin"])
+async def test_overview_sheets_cover_the_same_topics_as_the_bank(bank, level):
+    """At these two levels the overview sheets and the question topics are the
+    same list. Renaming one without the other fails here, not in front of
+    students.
+
+    The clinical sheets arrived prefixed ("C02_Clinical_Red_eye_cornea...") and
+    were renamed on import to the bank's own topic names, which is what makes
+    this hold for `clin` as well as `preclin`.
+    """
     from bot import resources
 
     rows = await bank.pool.fetch(
-        "select distinct topic from questions where level = 'preclin'")
-    assert {r["topic"] for r in rows} == set(resources.TIER_A_TOPICS)
+        "select distinct topic from questions where level = $1", level)
+    assert {r["topic"] for r in rows} == set(resources.topics(level))
+
+
+async def test_post_mbbs_sheets_do_not_line_up_with_its_topics(bank):
+    """Deliberately a weaker claim than the test above, because it is the truth:
+    the post-MBBS bank has eighteen question topics and fifteen overview sheets,
+    organised differently (A05 "Therapeutics investigations and quantitative
+    evidence" spans the Pharmacology and Biostatistics topics, for instance).
+
+    Every level still has to have overview sheets, and some of them do match, so
+    this pins what is actually there rather than asserting a mapping that does
+    not exist. If the content team ever aligns them, fold this into the test
+    above and delete it.
+    """
+    from bot import resources
+
+    rows = await bank.pool.fetch(
+        "select distinct topic from questions where level = 'postmbbs'")
+    topics = {r["topic"] for r in rows}
+    sheets = set(resources.topics("postmbbs"))
+
+    assert len(topics) == 18
+    assert len(sheets) == 15
+    assert topics != sheets
+    # The five that do line up exactly, so a rename on either side is noticed.
+    assert topics & sheets == {
+        "Medical retina and macular decisions",
+        "Vitreoretinal surgery and trauma",
+        "Advanced neuro ophthalmology",
+        "Orbit lids and lacrimal selection",
+        "Paediatric ophthalmology and strabismus",
+    }
 
 
 async def test_every_question_is_renderable(bank):
-    """The whole bank goes through the handler's render path. 118 questions have
-    five options, which the original `LETTERS = "ABCD"` implementation could not
-    handle at all."""
+    """Every bank goes through the handler's render path. 128 questions have five
+    options, which the original `LETTERS = "ABCD"` implementation could not handle
+    at all, and the FRCOphth bank letters its four A)-D) rather than a)-d)."""
     rows = await bank.pool.fetch("select * from questions order by id")
     sizes = Counter()
     for row in rows:
@@ -142,8 +221,10 @@ async def test_every_question_is_renderable(bank):
         for html_body in (body, f"{answered}\n\n{explanation_block(row['explanation'])}"):
             assert _balanced_telegram_html(html_body), row["id"]
 
-    assert sizes[5] == 118
-    assert sizes[4] == 2
+    # 118 preclinical and 10 clinical have five options; the rest have four.
+    assert sizes[5] == 128
+    assert sizes[4] == 265
+    assert sum(sizes.values()) == TOTAL
 
 
 async def test_correct_index_matches_a_real_option_and_the_explanation_exists(bank):
@@ -158,10 +239,14 @@ async def test_correct_index_matches_a_real_option_and_the_explanation_exists(ba
 
 
 async def test_known_question_is_intact(bank):
-    """A content-level check: if the bank is ever regenerated and the answer
+    """One content anchor per bank: if a bank is ever regenerated and the answer
     letters shift, this fails loudly instead of shipping wrong answers."""
-    row = await bank.pool.fetchrow(
-        "select * from questions where level = 'preclin' order by id limit 1")
+    first = {}
+    for level in TOPICS:
+        first[level] = await bank.pool.fetchrow(
+            "select * from questions where level = $1 order by id limit 1", level)
+
+    row = first["preclin"]
     assert row["topic"] == "Development and ocular histology"
     assert row["text"].startswith("During examination of a newborn, Dara")
     options = json.loads(row["options"])
@@ -169,33 +254,70 @@ async def test_known_question_is_intact(bank):
     assert row["correct_idx"] == 1  # option b)
     assert options[1].startswith("Failure of the embryonic optic fissure")
 
+    row = first["clin"]
+    assert row["topic"] == "Clinical assessment and vision loss"
+    assert row["text"].startswith("A 76-year-old woman presents with two hours")
+    options = json.loads(row["options"])
+    assert len(options) == 5
+    assert row["correct_idx"] == 2  # option c)
+    assert options[2].startswith("Start urgent systemic glucocorticoids")
 
-async def test_a_preclinical_set_is_served_from_the_real_bank(bank):
-    """The sets are built from the loaded bank, at the student's level only."""
+    # The FRCOphth documents letter their options A)-D). The generator lowercases
+    # the answer letter before indexing, so C) has to land on index 2 - getting
+    # that wrong would mis-key all 170 questions at once.
+    row = first["postmbbs"]
+    assert row["topic"] == "Optics and refraction"
+    assert row["text"].startswith("Two monochromatic sources each emit 1 mW")
+    options = json.loads(row["options"])
+    assert len(options) == 4
+    assert row["correct_idx"] == 2  # option C)
+    assert options[2].startswith("The first gives 0.683 lumen")
+
+
+async def test_a_set_is_served_from_every_real_bank(bank):
+    """Sets are no longer fixed blocks of five in id order, so this no longer
+    asserts *which* five: it asserts that every real bank can fill a set, that
+    the selector stays inside the student's own level, and that it spreads the
+    five across topics rather than walking one. Pre-clinical is the tight case
+    with six topics to five picks."""
     await bank.upsert_user(1, None)
-    current = await bank.quiz_set(1, "preclin")
+    for level in TOPICS:
+        current = await bank.current_set(1, level)
+        assert current is not None, level
+        assert current["number"] == 1
+        assert current["size"] == bank.SET_SIZE
+        assert current["answered_in_set"] == 0
 
-    assert current is not None
-    assert current["number"] == 1
-    assert current["size"] == bank.SET_SIZE
-    assert {q["level"] for q in current["questions"]} == {"preclin"}
+        served = []
+        for _ in range(bank.SET_SIZE):
+            question = await bank.pick_question(1, level)
+            assert question is not None, level
+            assert question["level"] == level
+            served.append(question)
+            # The question id doubles as the message id: unique per user, which
+            # is all the double-tap index needs.
+            await bank.record_attempt(1, question, 0, True, "practice",
+                                      question["id"])
 
-    # No clinical or post-MBBS content exists yet, and the bot must cope.
-    assert await bank.quiz_set(1, "clin") is None
-    assert await bank.quiz_set(1, "postmbbs") is None
+        assert len({q["id"] for q in served}) == bank.SET_SIZE, level
+        assert len({q["topic"] for q in served}) == bank.SET_SIZE, (
+            level, [q["topic"] for q in served])
+        assert (await bank.current_set(1, level))["number"] == 2, level
 
 
-async def test_the_bank_covers_all_six_topics(bank):
-    assert await bank.topics("preclin") == sorted(EXPECTED_TOPICS)
+async def test_every_bank_covers_its_own_topics(bank):
+    for level, topics in TOPICS.items():
+        assert await bank.topics(level) == sorted(topics), level
 
 
 async def test_seed_refuses_to_load_twice(bank):
-    """The guard in the seed file, so a fumbled re-run cannot duplicate the bank."""
+    """The guard in each seed file, so a fumbled re-run cannot duplicate a bank."""
     import asyncpg
 
-    with pytest.raises(asyncpg.exceptions.RaiseError) as excinfo:
-        await bank.pool.execute(SEED)
-    assert "already present" in str(excinfo.value)
+    for name, sql in SEEDS:
+        with pytest.raises(asyncpg.exceptions.RaiseError) as excinfo:
+            await bank.pool.execute(sql)
+        assert "already present" in str(excinfo.value), name
 
     remaining = await bank.pool.fetchval("select count(*) from questions")
-    assert remaining == 120
+    assert remaining == TOTAL

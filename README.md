@@ -36,24 +36,35 @@ Built by the **Acuity Team** — Zhong Han, Hongpeng, Rahul, Jeromy.
 
 | Area | Behaviour |
 |---|---|
-| `/quizme` | A **set of five** questions, options numbered 1–5. The set is a fixed block of five in id order, so every student's set 1 is the same five questions: the scores mean the same thing for everyone. The score is reported when the fifth is answered |
-| Sets, softly | Stop whenever you like; the set resumes where you left off. The blocks are derived from the database rather than stored, so there is no session state to go stale |
+| `/quizme` | A **set of five** questions, options numbered 1–5, picked for you: spread across topics first, then weighted toward the topics you keep getting wrong. The score is reported when the fifth is answered |
+| Sets, softly | Stop whenever you like and pick up where you left off. A set is simply your next five answers, derived from the `attempts` table rather than stored, so there is no session state to go stale |
+| `/weeklyquiz` scoring | The Monday push answers count toward your sets, but **never** toward the tournament |
 | `/stats` | Marker A: the running total, then accuracy broken down by **topic** and by **question type** (`questions.tag`), weakest first |
-| `/topicalnotes` | An overview sheet, one per topic, sent as a real PDF |
-| `/randomnotes` | A focused sheet at random, excluding the six the monthly drop holds back |
+| `/notes` | Your next unseen cheat sheet: overview sheets first, then focused, then "syllabus complete" |
+| `/review` | Re-serves the questions you got wrong, with their explanations |
 | `/resources` | Browse every sheet, or fetch one by code (`/resources b14`) |
 | `/changestreams` | Pre-Clinical / Clinical / Post-MBBS. Questions *and* sheets follow it |
-| `/weeklyquiz` | The Monday set of five. Deliberately does **not** score for the tournament |
-| `/monthlynotes` | On the 1st: all six overview sheets plus the six reserved focused ones, as PDFs |
+| `/weeklyquiz` | Five questions every Monday, picked the same way. Deliberately does **not** score for the tournament |
+| `/subscribenotes` | On the 1st and 15th: the next few sheets you have not had, as PDFs |
 | Tournament | An admin switches it on and **everyone who has used `/start` is entered automatically**; only `/quizme` scores, once per question; `/leaderboard` shows the top 3 with the last two characters of each username hidden |
 | Marker B | Tournament points, shown as standings only. Question and activity counts are never shown to students |
 | 💡 Explain | Serves the written explanation stored with the question; the LLM is only a fallback and is optional |
 | Menu | Telegram keeps a command list per chat. The default shows only `/start`; sending `/start` sets that chat's full menu, which is what makes `/quizme` and the rest appear |
 
-Fixed sets replaced per-student adaptive weighting. The point of a benchmark is
-that everyone answers the same five questions, so the scores are comparable; the
-adaptive selector is in git history (the commit before the sets landed) if that
-trade-off is ever worth revisiting.
+**Sets are adaptive, and that is a deliberate trade.** An earlier version served
+a fixed block of five in id order so every student's set 1 was identical and the
+scores were directly comparable. Variety and revisiting weak topics were judged
+worth more than that comparability, so `db.pick_question` now ranks every
+unattempted question by: a topic not already in the set being built, then an
+unused question type, then the topics the student is weakest on, then random. An
+untouched topic sits exactly between weak and mastered, so new material still
+comes round.
+
+Two students therefore do not walk the same path, and set numbers are **not**
+comparable between students. Compare them with `/stats` or the tournament
+instead. `/review` exists because of this too: `pick_question` only ever serves
+questions a student has never attempted, so without it a missed question would
+never come back.
 
 ## Revision notes
 
@@ -62,67 +73,118 @@ copy**, so Telegram receives the actual document and nothing needs hosting. If a
 sheet is missing locally, or is too large for the Bot API to upload, the bot falls
 back to the GitHub link rather than failing.
 
+**153 sheets, scoped per audience level** exactly like the question banks, so a
+Post-MBBS student is never handed a preclinical sheet:
+
 ```
 resources/
-  questions/          the .docx MCQ sources
-  notes/tier_a/       one broad sheet per topic       01–06   ("Overview" to students)
-  notes/tier_b/       deeper sheets on single points  B01–B20 ("Focused" to students)
+  questions/                    the .docx MCQ sources
+  notes/preclin/tier_a/    6    one broad sheet per topic       01–06
+  notes/preclin/tier_b/   20    deeper sheets on single points  B01–B20
+  notes/clin/tier_a/       7    C01–C07
+  notes/clin/tier_b/      40    B01–B40
+  notes/postmbbs/tier_a/  15    A01–A15
+  notes/postmbbs/tier_b/  65    B01–B65
 ```
 
+A bare code is only unique **within** a level — `B01` exists in all three — so
+every lookup in `bot/resources.py` takes a level, and there is no level-free
+accessor left in the module. `/notes`, `/resources` and the fortnightly drop all
+resolve the student's stream first.
+
 The catalogue is built by **scanning the directory**, not hard-coded — adding a
-sheet is: drop the PDF in, commit it. No code change, no database row.
-`tests/test_resources.py` asserts the catalogue matches what is on disk, and that
-the six overview sheets cover exactly the six topics the question bank is built
-around, so a rename on either side fails CI.
+sheet is: drop the PDF in the right level folder, commit it. No code change, no
+database row. `tests/test_resources.py` asserts the catalogue matches what is on
+disk, and that `B01` resolves to three different sheets, so a lookup that forgets
+its level fails CI.
 
 To students these are "Overview" and "Focused" sheets, never "Tier A" and
-"Tier B" — that is internal shorthand for the content team.
+"Tier B" — that is internal shorthand for the content team. The clinical sheets
+arrived named `B01_Clinical_Type_B_...`; that shorthand was stripped on import,
+and the clinical overview sheets were renamed to the seven clinical question
+topics so the sheets and the bank describe the same seven things.
 
-**Six focused sheets are reserved for the monthly drop** (`resources.MONTHLY_CODES`
-— one per overview topic). `/monthlynotes` sends all six overview sheets plus
-those six; `/randomnotes` draws from the other fourteen, so the monthly bundle is
-not made up of sheets students have already been handed at random.
-`/topicalnotes` is the overview picker. Only the code list is in the repo, so
-changing which six are reserved is a one-line edit.
+**`/notes` is a progression, not a picker.** It hands over the next sheet the
+student has not had — overview sheets first, then focused ones — and when they
+have had every sheet at their level it tells them they have finished the
+syllabus. Deliveries are recorded per student in `note_deliveries`, so nothing is
+ever sent twice, a student can stop and resume, and the fortnightly drop
+(`/subscribenotes`, the 1st and 15th) works through the focused catalogue rather
+than resending a fixed bundle.
+
+That replaced a scheme where six focused sheets per level were reserved for a
+monthly drop and random draws came from the rest. Tracking deliveries properly
+makes a reserved subset unnecessary and removes the per-level curation it would
+have needed. `/resources` remains the browser for anyone who wants to jump
+straight to a sheet, by code or by phrase (`/resources b14`,
+`/resources glaucoma`).
 
 ## The question bank
 
-`seeds/01_preclin_mcqs.sql` loads **120 single best answer questions** across
-six topics, every one of them with a written explanation:
-
-| Topic | Questions |
-|---|---|
-| Development and ocular histology | 21 |
-| Orbit and eye movements | 21 |
-| Optics and visual transduction | 20 |
-| Visual pathways and pupil reflexes | 20 |
-| Aqueous humour and glaucoma mechanisms | 16 |
-| Retinal and anterior segment pathology | 22 |
-
-There is **one seed file per audience level**, loaded in order:
+**393 single best answer questions** across all three audience levels, every one
+of them with a written explanation. One seed file per level, loaded in order:
 
 ```
-seeds/01_preclin_mcqs.sql    120 questions   (loaded)
-seeds/02_clin_mcqs.sql       Clinical        (placeholder — loads nothing yet)
-seeds/03_postmbbs_mcqs.sql   Post-MBBS       (placeholder — loads nothing yet)
+seeds/01_preclin_mcqs.sql    120 questions    6 topics
+seeds/02_clin_mcqs.sql       103 questions    7 topics
+seeds/03_postmbbs_mcqs.sql   170 questions   18 topics
 ```
 
-The Clinical and Post-MBBS files are valid, load cleanly and add nothing, so
-running all three against a fresh database is always safe. Adding a tier later
-is: drop the `.docx` into `resources/questions/`, add it to `LEVELS` in
-`tools/build_question_seed.py`, re-run the generator, load the file. The
-`questions.level` column and the bot's `/changestreams` command already handle
-all three. [docs/HANDOVER.md](docs/HANDOVER.md) is the step-by-step version of
-that, written for whoever picks it up next.
+<details>
+<summary><b>Topic split per bank</b> (the generator asserts these, so a bad regeneration fails CI)</summary>
+
+| Pre-Clinical — 120 | | Clinical — 103 | |
+|---|--:|---|--:|
+| Retinal and anterior segment pathology | 22 | Neuro ophthalmology and orbit | 20 |
+| Development and ocular histology | 21 | Red eye cornea and uveitis | 19 |
+| Orbit and eye movements | 21 | Lens lids and paediatric eye | 17 |
+| Optics and visual transduction | 20 | Clinical assessment and vision loss | 14 |
+| Visual pathways and pupil reflexes | 20 | Glaucoma | 12 |
+| Aqueous humour and glaucoma mechanisms | 16 | Retinal vascular disease | 11 |
+| | | Macular and vitreoretinal disease | 10 |
+
+| Post-MBBS — 170 | | | |
+|---|--:|---|--:|
+| Physiology and biochemistry | 17 | Paediatric ophthalmology and strabismus | 9 |
+| Cornea and ocular surface | 15 | Anatomy and embryology | 7 |
+| Optics and refraction | 14 | Biostatistics and evidence | 5 |
+| Medical retina and macular decisions | 13 | Genetics | 4 |
+| Cataract and lens surgery | 12 | Microbiology and immunology | 4 |
+| Optics and refractive surgery | 12 | Pharmacology | 4 |
+| Vitreoretinal surgery and trauma | 12 | Pathology | 2 |
+| Orbit lids and lacrimal selection | 12 | | |
+| Advanced neuro ophthalmology | 10 | | |
+| Uveitis and inflammatory medicine | 9 | | |
+| Glaucoma | 9 | | |
+
+</details>
+
+**Seventeen clinical cases are deliberately not loaded.** Their documents hold
+120 cases, but seventeen are built around an embedded fundus or lid photograph
+("the fundus photograph is shown") and the bot sends text-only question cards, so
+they cannot be answered as delivered. The generator parses and validates them
+like any other question and then holds them back — `SKIP_FIGURE_QUESTIONS` in
+`tools/build_question_seed.py`, one line to reverse once `sender.send_question`
+can upload the figure first.
+
+Four of the seventeen carry only a caption and look answerable as written, so
+they are the quick way to 107. The full list, which thirteen genuinely need the
+picture, both routes to finishing them, and the copyright position on the images
+are all in
+[docs/HANDOVER.md §2.6](docs/HANDOVER.md#26-the-seventeen-clinical-cases-that-are-held-back).
 
 Because every question carries an explanation, the bot serves them from the
-database and **never calls the LLM for this bank** — you can run the whole event
-with no API key and zero spend.
+database and **never calls the LLM for these banks** — you can run the whole
+event with no API key and zero spend.
 
-The bank is generated from the `.docx` sources in `resources/questions/`. Editing those
-documents does not change the database; regenerate the seeds instead
-(`tools/build_question_seed.py`). `tests/test_seed_data.py` verifies the loaded
-bank — 120 rows, the topic split above, and that every question renders — so a
+The banks are generated from the `.docx` sources in `resources/questions/`.
+Editing those documents does not change the database; regenerate the seeds
+instead (`tools/build_question_seed.py`). The three source formats disagree on
+punctuation, option lettering (`a)`–`e)` versus `A)`–`D)`), whether there is an
+`Options:` header at all, and whether the question type is labelled — the parser
+tolerates all of it and refuses to emit anything it cannot fully account for.
+`tests/test_seed_data.py` verifies the loaded banks — the row counts, the topic
+splits above, one content anchor per bank, and that every question renders — so a
 bad regeneration fails CI rather than shipping.
 
 Options are rendered **1–5**, not A–E, matching how the society writes its
@@ -164,15 +226,19 @@ Everything comes from the environment; nothing needs editing to deploy.
 
 ## Commands
 
-**Students** — `/start` `/help` `/quizme` `/stats` `/topicalnotes` `/randomnotes`
-`/resources` `/changestreams` `/weeklyquiz` `/stopweekly` `/monthlynotes`
-`/stopmonthly` `/tournament` `/leaderboard`
+**Students**, in the order Telegram shows them — `/quizme` `/notes` `/review`
+`/stats` `/resources` `/weeklyquiz` `/subscribenotes` `/tournament`
+`/leaderboard` `/changestreams` `/help`
+
+Unlisted but working: `/start`, `/topicalnotes`, `/randomnotes`, `/stopweekly`,
+`/stopmonthly`. The two subscriptions each carry an inline **Turn off** button on
+their confirmation, which is why the stop commands do not take up a menu slot.
 
 Older names still work as aliases, so nothing already sitting in a student's chat
 breaks:
 
 `/practice` = `/quizme` · `/subscribe` = `/weeklyquiz` · `/unsubscribe` =
-`/stopweekly` · `/notes_sub` = `/monthlynotes` · `/notes_unsub` = `/stopmonthly` ·
+`/stopweekly` · `/notes_sub` = `/subscribenotes` · `/notes_unsub` = `/stopmonthly` ·
 `/level` = `/changestreams`
 
 **Admins** (`ADMIN_IDS`) — `/admin_tournament_start` `/admin_tournament_end`
@@ -193,7 +259,7 @@ bot/
   db.py        every SQL statement
   llm.py       explanation fallback (optional)
   handlers.py  commands and callbacks
-  jobs.py      weekly quiz / monthly sheets / tournament-close cron entries
+  jobs.py      weekly quiz / fortnightly sheets / tournament-close cron entries
   main.py      wiring, error handler, graceful shutdown
 schema.sql                 structure only, nothing seeded
 migrations/                upgrade path for an existing database

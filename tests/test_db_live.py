@@ -38,8 +38,8 @@ async def pool(dsn):
     from bot.db import init, close
 
     admin = await asyncpg.connect(dsn)
-    for table in ("tournament_answers", "tournament_points", "attempts",
-                  "tournaments", "notes", "questions", "users"):
+    for table in ("note_deliveries", "tournament_answers", "tournament_points",
+                  "attempts", "tournaments", "notes", "questions", "users"):
         await admin.execute(f"drop table if exists {table} cascade")
     await admin.execute(SCHEMA)
     await admin.close()
@@ -53,8 +53,8 @@ async def pool(dsn):
 async def clean(pool):
     from bot import db
 
-    for table in ("tournament_answers", "tournament_points", "attempts",
-                  "tournaments", "notes", "questions", "users"):
+    for table in ("note_deliveries", "tournament_answers", "tournament_points",
+                  "attempts", "tournaments", "notes", "questions", "users"):
         await db.pool.execute(f"truncate {table} cascade")
     yield
 
@@ -142,18 +142,86 @@ async def test_same_message_id_from_two_users_both_count(pool):
     assert await db.record_attempt(2, q, 0, True, "practice", 500) is True
 
 
-async def test_practice_streak_counts_back_to_the_last_miss(pool):
+async def test_a_second_card_for_one_question_is_not_recorded(pool):
+    """`unique (user_id, msg_id)` only dedupes a *card*. A student can hold two
+    live cards for one question - a /quizme card left unanswered, then the Monday
+    push serving the same question - and answering both used to write two rows.
+    """
     from bot import db
 
     await db.upsert_user(1, None)
     q = await db.get_question(await add_question(db))
+
+    assert await db.record_attempt(1, q, 0, True, "practice", 100) is True
+    assert await db.record_attempt(1, q, 1, False, "weekly", 200) is False, \
+        "the Monday card for a question already answered must not record"
+    # Two /quizme cards in a row do it too: pick_question reads `attempts`, so
+    # a card left unanswered is invisible to it and the question comes again.
+    assert await db.record_attempt(1, q, 1, False, "practice", 300) is False
+
+    rows = await db.pool.fetch(
+        "select chosen_idx, mode from attempts where user_id = 1 order by id")
+    assert [(r["chosen_idx"], r["mode"]) for r in rows] == [(0, "practice")], \
+        "the answer to the first card is the one that stands"
+
+
+async def test_a_review_answer_may_re_answer_a_question(pool):
+    """The uniqueness above is partial for this reason: /review exists to
+    re-answer a question the student already attempted, and a second pass
+    through the pile weeks later is the whole point of the command."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    q = await db.get_question(await add_question(db))
+
+    assert await db.record_attempt(1, q, 1, False, "practice", 100) is True
+    assert await db.record_attempt(1, q, 0, True, "review", 101) is True
+    assert await db.record_attempt(1, q, 1, False, "review", 102) is True
+    # A review card is still one card: a double tap on it is refused like any
+    # other, by the msg_id key.
+    assert await db.record_attempt(1, q, 0, True, "review", 102) is False
+
+    assert await db.pool.fetchval(
+        "select count(*) from attempts where user_id = 1") == 3
+
+
+async def test_the_attempts_level_check_rejects_an_unknown_level(pool):
+    """Defence in depth, matching users/questions/notes. A mistyped level is
+    accepted by every column it is not checked on, and the row is then invisible
+    to every level-scoped read."""
+    import asyncpg
+
+    from bot import db
+
+    await db.upsert_user(1, None)
+    qid = await add_question(db)
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await db.pool.execute(
+            """insert into attempts (user_id, question_id, level, topic,
+                                     chosen_idx, correct, mode, msg_id)
+               values (1, $1, 'PRECLIN_typo', 'Sample', 0, true, 'practice', 1)""",
+            qid,
+        )
+
+
+async def test_practice_streak_counts_back_to_the_last_miss(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
     assert await db.practice_streak(1) == 0
 
+    # One question per answer. This used to re-answer a single question five
+    # times, which no answer path can actually do - pick_question never
+    # re-serves a question, and attempts_one_scoring_answer_idx now refuses the
+    # second scoring answer to one - so a real streak is five distinct
+    # questions.
     results = [True, False, True, True, True]
     for msg_id, correct in enumerate(results, start=600):
+        q = await db.get_question(await add_question(db))
         await db.record_attempt(1, q, 0, correct, "practice", msg_id)
     # Weekly answers don't break or extend a practice streak.
-    await db.record_attempt(1, q, 1, False, "weekly", 700)
+    weekly = await db.get_question(await add_question(db))
+    await db.record_attempt(1, weekly, 1, False, "weekly", 700)
 
     assert await db.practice_streak(1) == 3
 
@@ -183,6 +251,35 @@ async def test_award_point_without_a_joined_tournament_does_nothing(pool):
     await db.upsert_user(1, None)
     qid = await add_question(db)
     assert await db.award_point(1, qid) is False
+    assert await db.pool.fetchval("select count(*) from tournament_answers") == 0
+
+
+async def test_award_point_leaves_no_dedup_row_when_it_cannot_score(pool):
+    """The dedup row and the point are one statement, so they cannot disagree.
+
+    The insert used to fire whenever a tournament was open, while the update
+    matched nothing without a tournament_points row - so answering anything
+    while un-enrolled burned the dedup row and a later join could never score
+    that question again. Every question answered between a leave and a rejoin
+    was permanently unscorable.
+    """
+    from bot import db
+
+    await db.upsert_user(1, None)
+    qid = await add_question(db)
+    await db.start_tournament()
+    await db.join_tournament(1)
+    await db.leave_tournament(1)
+
+    assert await db.award_point(1, qid) is False
+    assert await db.pool.fetchval(
+        "select count(*) from tournament_answers") == 0, "the row was burnt"
+
+    # Rejoining and answering it again must score, and only once.
+    await db.join_tournament(1)
+    assert await db.award_point(1, qid) is True
+    assert await db.award_point(1, qid) is False
+    assert (await db.my_rank(1))["points"] == 1
 
 
 async def test_leaderboard_ranks_and_breaks_ties_by_join_order(pool):
@@ -285,3 +382,145 @@ async def test_save_explanation_is_single_writer(pool):
     await db.save_explanation(qid, "first")
     await db.save_explanation(qid, "second")
     assert (await db.get_question(qid))["explanation"] == "first"
+
+
+# ------------------------------------------------------- note deliveries
+
+
+async def test_recording_the_same_sheet_twice_is_a_no_op(pool):
+    """A student can land on /notes twice before the first reply arrives, and the
+    monthly drop can overlap a manual send, so the insert has to absorb both."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B14")])
+    await db.record_notes_sent(1, "preclin", [("a", "01")])
+    # The same pair twice inside one call, which reads as if it should trip the
+    # key: `on conflict do nothing` absorbs it, and this is the assertion that
+    # says so rather than leaving the next reader to wonder.
+    await db.record_notes_sent(1, "preclin", [("b", "B14"), ("b", "B14")])
+
+    assert await db.sent_note_codes(1, "preclin", "a") == {"01"}
+    assert await db.sent_note_codes(1, "preclin", "b") == {"B14"}
+    assert await db.pool.fetchval("select count(*) from note_deliveries") == 2
+
+
+async def test_recording_nothing_is_allowed(pool):
+    """The monthly drop builds its list from the catalogue, and a level with no
+    reserved sheets yields an empty one."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [])
+    assert await db.notes_delivered(1, "preclin") == {"a": set(), "b": set()}
+
+
+async def test_notes_delivered_returns_both_kinds_in_one_query(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin",
+                               [("a", "01"), ("a", "02"), ("b", "B07")])
+
+    assert await db.notes_delivered(1, "preclin") == {
+        "a": {"01", "02"}, "b": {"B07"}}
+    # Both keys are always present, so a handler can index straight in.
+    assert await db.notes_delivered(1, "clin") == {"a": set(), "b": set()}
+
+
+async def test_deliveries_are_scoped_by_student_level_and_kind(pool):
+    """A code is only unique within a level: B01 exists at all three, so the row
+    the clinical student got must not hide the preclinical sheet."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.upsert_user(2, None)
+    await db.record_notes_sent(1, "preclin", [("b", "B01")])
+    await db.record_notes_sent(1, "clin", [("b", "B01")])
+    await db.record_notes_sent(2, "preclin", [("a", "01")])
+
+    assert await db.sent_note_codes(1, "preclin", "b") == {"B01"}
+    assert await db.sent_note_codes(1, "preclin", "a") == set()
+    assert await db.sent_note_codes(1, "clin", "b") == {"B01"}
+    assert await db.sent_note_codes(2, "preclin", "a") == {"01"}
+    assert await db.sent_note_codes(2, "clin", "b") == set()
+
+
+async def test_reset_notes_clears_one_level_and_counts_what_it_cleared(pool):
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B01")])
+    await db.record_notes_sent(1, "clin", [("a", "C01")])
+
+    assert await db.reset_notes(1, "preclin") == 2
+    assert await db.notes_delivered(1, "preclin") == {"a": set(), "b": set()}
+    assert await db.notes_delivered(1, "clin") == {"a": {"C01"}, "b": set()}
+    # Nothing left to clear, and asking again is not an error.
+    assert await db.reset_notes(1, "preclin") == 0
+
+
+async def test_a_deleted_user_takes_their_deliveries_with_them(pool):
+    """PDPA: deleting the user row has to leave nothing behind, which is what the
+    cascade on the foreign key is for."""
+    from bot import db
+
+    await db.upsert_user(1, None)
+    await db.record_notes_sent(1, "preclin", [("a", "01"), ("b", "B01")])
+
+    await db.pool.execute("delete from users where telegram_id = 1")
+    assert await db.pool.fetchval("select count(*) from note_deliveries") == 0
+
+
+async def test_the_tier_check_rejects_anything_but_a_or_b(pool):
+    """The `notes` table spells the same idea 'A'/'B'. Copying a tier across
+    without folding the case has to fail here rather than quietly recording a
+    delivery nothing will ever match."""
+    import asyncpg
+
+    from bot import db
+
+    await db.upsert_user(1, None)
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await db.record_notes_sent(1, "preclin", [("A", "01")])
+
+
+async def test_the_level_check_rejects_an_unknown_level(pool):
+    """Same argument as the tier check, one column over. A mistyped level was
+    accepted and the row was then invisible to every level-scoped read, so the
+    sheet counted as sent and was never offered to the student again."""
+    import asyncpg
+
+    from bot import db
+
+    await db.upsert_user(1, None)
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await db.record_notes_sent(1, "PRECLIN_typo", [("a", "01")])
+    assert await db.pool.fetchval("select count(*) from note_deliveries") == 0
+
+
+async def test_only_one_tournament_can_be_active_at_a_time(pool):
+    """Two concurrent /admin_tournament_start taps both passed the handler's
+    "is one running?" check before either inserted, leaving two live rows and
+    announcing the competition twice. Only the database can decide this."""
+    import asyncio
+
+    import asyncpg
+
+    from bot import db
+
+    results = await asyncio.gather(
+        *(db.start_tournament(14) for _ in range(5)), return_exceptions=True)
+    created = [r for r in results if isinstance(r, int)]
+    refused = [r for r in results
+               if isinstance(r, asyncpg.exceptions.UniqueViolationError)]
+
+    assert len(created) == 1, f"{len(created)} tournaments opened at once"
+    assert len(refused) == 4
+    assert await db.pool.fetchval(
+        "select count(*) from tournaments where active") == 1
+
+    # and closing it frees the slot for the next one
+    await db.end_tournament(created[0])
+    assert isinstance(await db.start_tournament(14), int)
+

@@ -37,8 +37,8 @@ import docx
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# level -> (order prefix, source documents). Add the Clinical and Post-MBBS
-# .docx files here when they arrive; nothing else needs changing.
+# level -> (order prefix, source documents). Adding a level is: drop the .docx
+# into resources/questions/ and add it here; nothing else needs changing.
 LEVELS: dict[str, tuple[str, list[Path]]] = {
     "preclin": (
         "01",
@@ -47,15 +47,36 @@ LEVELS: dict[str, tuple[str, list[Path]]] = {
             ROOT / "resources" / "questions" / "Preclinical_Ophthalmology_100_Additional_MCQs.docx",
         ],
     ),
-    "clin": ("02", []),
-    "postmbbs": ("03", []),
+    "clin": (
+        "02",
+        [
+            ROOT / "resources" / "questions" / "Clinical_Ophthalmology_M3_M5_20_Case_MCQs.docx",
+            ROOT / "resources" / "questions" / "Clinical_Ophthalmology_M3_M5_100_Additional_Cases_Q21_Q120.docx",
+        ],
+    ),
+    "postmbbs": (
+        "03",
+        [
+            ROOT / "resources" / "questions" / "FRCOphth_Post_MBBS_20_Sample_MCQ.docx",
+            ROOT / "resources" / "questions" / "FRCOphth_Post_MBBS_150_Additional_MCQ_Q21_Q170.docx",
+        ],
+    ),
 }
+
+# Seventeen of the clinical cases are built around an embedded fundus or lid
+# photograph ("The fundus photograph is shown"), and the bot sends text-only
+# question cards - so they cannot be answered as delivered. They are parsed and
+# validated like every other question, then held back from the seed. Flip this to
+# False to emit them, once sender.send_question can upload the figure first.
+SKIP_FIGURE_QUESTIONS = True
 
 TEXT_TAG = "$q$"
 JSON_TAG = "$o$"
 
-# The preprint bank's own coverage table, asserted so a bad regeneration fails
-# here rather than in front of students.
+# Each bank's own coverage table, asserted so a bad regeneration fails here
+# rather than in front of students. These are counts of what is *emitted*, so
+# the clinical figures are the 120 parsed cases less the 17 held back by
+# SKIP_FIGURE_QUESTIONS.
 EXPECTED: dict[str, dict] = {
     "preclin": {
         "count": 120,
@@ -68,24 +89,84 @@ EXPECTED: dict[str, dict] = {
             "Retinal and anterior segment pathology": 22,
         },
     },
+    "clin": {
+        "count": 103,
+        "topics": {
+            "Neuro ophthalmology and orbit": 20,
+            "Red eye cornea and uveitis": 19,
+            "Lens lids and paediatric eye": 17,
+            "Clinical assessment and vision loss": 14,
+            "Glaucoma": 12,
+            "Retinal vascular disease": 11,
+            "Macular and vitreoretinal disease": 10,
+        },
+    },
+    "postmbbs": {
+        "count": 170,
+        "topics": {
+            "Physiology and biochemistry": 17,
+            "Cornea and ocular surface": 15,
+            "Optics and refraction": 14,
+            "Medical retina and macular decisions": 13,
+            "Optics and refractive surgery": 12,
+            "Cataract and lens surgery": 12,
+            "Vitreoretinal surgery and trauma": 12,
+            "Orbit lids and lacrimal selection": 12,
+            "Advanced neuro ophthalmology": 10,
+            "Uveitis and inflammatory medicine": 9,
+            "Glaucoma": 9,
+            "Paediatric ophthalmology and strabismus": 9,
+            "Anatomy and embryology": 7,
+            "Biostatistics and evidence": 5,
+            "Genetics": 4,
+            "Microbiology and immunology": 4,
+            "Pharmacology": 4,
+            "Pathology": 2,
+        },
+    },
 }
 
-QUESTION_RE = re.compile(r"^Question\s+(\d+)\s*$")
+# "Question 1", the clinical banks' zero-padded "Question 01", and the FRCOphth
+# sample document's "Sample question 01".
+QUESTION_RE = re.compile(r"^(?:Sample\s+question|Question)\s+(\d+)\s*$")
 TYPE_RE = re.compile(r"^Question type\s*:?\s*(.+)$")
 TOPIC_RE = re.compile(r"^Topic\s*:?\s*(.+)$")
-OPTION_RE = re.compile(r"^([a-e])\)\s*(.+)$")
-CORRECT_RE = re.compile(r"^Correct option\s*:?\s*([a-e])\)\s*(.+)$")
+# The preclinical banks write "Options:", the clinical ones "Options", and the
+# FRCOphth ones omit the header entirely - see parse_document.
+OPTIONS_RE = re.compile(r"^Options\s*:?\s*$")
+# Preclinical and clinical letter their options a)-e); FRCOphth uses A)-D).
+OPTION_RE = re.compile(r"^([a-eA-E])\)\s*(.+)$")
+CORRECT_RE = re.compile(r"^Correct option\s*:?\s*([a-eA-E])\)\s*(.+)$")
 # Anything after the last question is appendix, not content.
 STOP_RE = re.compile(
     r"^(Resource Guide|Coverage and Resources|Teaching Resources"
-    r"|Supplied resources|Supplemental references)\s*$"
+    r"|Supplied resources|Supplemental references"
+    r"|Clinical Sources and References)\s*$"
 )
 
 
 def parse_document(path: Path) -> tuple[list[dict], list[str]]:
-    """Parse one .docx. The two sources differ only in punctuation ("Topic  X"
-    vs "Topic: X"), so every field separator tolerates an optional colon."""
-    lines = [p.text.strip() for p in docx.Document(str(path)).paragraphs]
+    """Parse one .docx into question dicts.
+
+    The six source documents agree on shape but not on punctuation, so every
+    separator here is deliberately loose:
+
+    * headers read ``Question 1``, ``Question 01`` or ``Sample question 01``
+    * ``Topic  X`` and ``Topic: X`` both occur, as do ``Options`` and ``Options:``
+    * the FRCOphth documents omit the options header altogether, so the first
+      ``a)``/``A)`` line opens the list instead
+    * preclinical and clinical options are lettered ``a)``-``e)``, FRCOphth
+      ``A)``-``D)``
+    * the FRCOphth documents carry no ``Question type:`` label - the tag is a
+      bare ``FRCOphth Part 1 | Anatomy | applied inference`` line under the
+      header, which is why an unlabelled line containing a pipe is read as one
+    * only the *first* paragraph after the answer is the explanation; the
+      FRCOphth documents then list one to three reading references, which are
+      not part of it and are dropped
+
+    A question whose block contains an inline image is flagged ``figure``, since
+    a card the bot can only render as text cannot carry a fundus photograph.
+    """
     questions: list[dict] = []
     problems: list[str] = []
     current: dict | None = None
@@ -113,11 +194,16 @@ def parse_document(path: Path) -> tuple[list[dict], list[str]]:
             problems.append(f"Q{q['number']}: empty explanation")
         questions.append(q)
 
-    for line in lines:
+    for para in docx.Document(str(path)).paragraphs:
+        line = para.text.strip()
+        if STOP_RE.match(line):
+            break           # the appendix, and the figure map that follows it
+        # The drawing lives in its own paragraph next to the stem, so this has to
+        # be checked before the empty-line skip below.
+        if current is not None and "graphicData" in para._p.xml:
+            current["figure"] = True
         if not line:
             continue
-        if STOP_RE.match(line):
-            break
 
         if (match := QUESTION_RE.match(line)):
             finish(current)
@@ -130,18 +216,29 @@ def parse_document(path: Path) -> tuple[list[dict], list[str]]:
             current["tag"] = match.group(1).strip()
         elif (match := TOPIC_RE.match(line)):
             current["topic"] = match.group(1).strip()
-        elif line == "Options:":
+        elif OPTIONS_RE.match(line):
             section = "options"
         elif (match := CORRECT_RE.match(line)):
-            current["correct_idx"] = ord(match.group(1)) - ord("a")
+            current["correct_idx"] = ord(match.group(1).lower()) - ord("a")
             current["correct_text"] = match.group(2).strip()
             section = "explanation"
-        elif section == "options" and (match := OPTION_RE.match(line)):
+        elif (match := OPTION_RE.match(line)) and (
+                section == "options"
+                or ("options" not in current and match.group(1).lower() == "a")):
+            # No "Options" header in the FRCOphth documents: the first a)/A) line
+            # opens the list. Anchoring on "a" keeps a stem that happens to start
+            # "b) ..." from being mistaken for one.
+            section = "options"
             current.setdefault("options", []).append(match.group(2).strip())
         elif section == "explanation":
-            current["explanation"] = (current.get("explanation", "") + " " + line).strip()
+            if "explanation" in current:
+                current.setdefault("references", []).append(line)
+            else:
+                current["explanation"] = line
         elif section == "options":
             problems.append(f"Q{current['number']}: stray line in options: {line[:60]!r}")
+        elif "|" in line and not {"tag", "topic", "stem"} & current.keys():
+            current["tag"] = line           # FRCOphth's unlabelled tag line
         else:
             current["stem"] = (current.get("stem", "") + " " + line).strip()
 
@@ -256,6 +353,15 @@ def build_level(level: str, sources: list[Path], check: bool) -> tuple[bool, str
         numbers = [q["number"] for q in questions]
         if numbers != list(range(1, len(numbers) + 1)):
             problems.append(f"question numbering is not 1..{len(numbers)}: {numbers[:5]}...")
+
+        # Held back only after the checks above, so the source documents are
+        # still validated as a complete 1..N bank.
+        if SKIP_FIGURE_QUESTIONS:
+            figures = [q["number"] for q in questions if q.get("figure")]
+            if figures:
+                questions = [q for q in questions if not q.get("figure")]
+                print(f"  held back {len(figures)} figure-dependent question(s): "
+                      + ", ".join(f"Q{n}" for n in figures))
 
         expected = EXPECTED.get(level)
         if expected:

@@ -1,9 +1,9 @@
 """Unit tests for the pure presentation helpers."""
 import json
+import random
+import re
 
 import pytest
-
-import random
 
 from bot.text import (MAX_OPTIONS, WEEKLY_HEADER, chunks, explanation_block, letter,
                       mask, parse_options, render, verdict)
@@ -122,3 +122,86 @@ def test_chunks_ignores_empty_input():
     assert chunks("") == []
     assert chunks(None) == []
     assert chunks("   ") == []
+
+
+# ---------------------------------------------------- splitting HTML safely
+
+
+def _visible(text):
+    """What the student actually reads: tags and whitespace stripped out."""
+    return re.sub(r"<[^>]*>", "", text).replace(" ", "").replace("\n", "")
+
+
+def test_chunks_keeps_a_tag_balanced_across_the_cut():
+    """Telegram rejects *both* halves of a split that leaves "<b>" in one part
+    and "</b>" in the other, and `sender._send_once` logs the rejection and
+    returns, so the student is left with silence rather than a mangled card."""
+    body = "<b>" + "word " * 300 + "</b>"
+    parts = chunks(body, limit=200)
+
+    assert len(parts) > 1
+    for part in parts:
+        assert part.count("<b>") == part.count("</b>") == 1, part
+    assert parts[0].endswith("</b>") and parts[1].startswith("<b>")
+    assert _visible("".join(parts)) == _visible(body), "text went missing"
+
+
+def test_chunks_reopens_nested_tags_in_the_right_order():
+    parts = chunks("<b><i>" + "z" * 500 + "</i></b>", limit=120)
+
+    assert len(parts) > 1
+    assert parts[0].startswith("<b><i>") and parts[0].endswith("</i></b>")
+    assert parts[1].startswith("<b><i>")
+
+
+def test_chunks_reopens_a_tag_with_its_attributes():
+    """Reopening "<a>" without the href would strip the link from everything
+    after the cut."""
+    opener = '<a href="https://example.test/sheet">'
+    parts = chunks("q" * 80 + opener + "link text " * 20 + "</a>", limit=120)
+
+    assert len(parts) > 1
+    assert parts[1].startswith(opener)
+
+
+@pytest.mark.parametrize("limit", range(60, 140, 7))
+def test_chunks_never_cuts_through_a_tag(limit):
+    for part in chunks("a" * 99 + "<b>bold</b>" + "c" * 200, limit=limit):
+        assert re.search(r"<[^>]*$", part) is None, part[-12:]
+        assert not re.match(r"^[a-z]*>", part), part[:12]
+
+
+@pytest.mark.parametrize("limit", range(40, 130, 7))
+def test_chunks_never_cuts_through_a_character_reference(limit):
+    """`esc()` emits "&amp;" and "&lt;". A cut inside one leaves "&a" in one part
+    and "mp;" in the next, and Telegram refuses both."""
+    for part in chunks("x" * 98 + "&amp;" + "y" * 200, limit=limit):
+        assert re.search(r"&[^;\s]*$", part) is None, part[-8:]
+        assert not re.match(r"^[a-z]+;", part), part[:8]
+
+
+@pytest.mark.parametrize("limit", [80, 200, 1000])
+def test_chunks_pays_for_its_own_tags_out_of_the_limit(limit):
+    """The reopened prefix and the closers come out of the budget, rather than
+    being discovered by Telegram after the fact."""
+    body = "<b>" + " ".join("w" * 9 for _ in range(400)) + "</b>"
+    assert all(len(p) <= limit for p in chunks(body, limit=limit))
+
+
+def test_chunks_leaves_unbalanced_input_unbalanced():
+    """This splits text, it does not repair it. The single-part fast path cannot
+    repair anything either, so repairing only long messages would hide a
+    caller's bug on exactly the inputs hardest to reproduce."""
+    parts = chunks("<b>" + "k" * 300, limit=100)
+
+    assert len(parts) > 1
+    assert "</b>" not in parts[-1], "the input's own tag was closed for it"
+
+
+def test_chunks_prefers_a_paragraph_break_to_a_mid_sentence_cut():
+    """Two of these paragraphs do not fit in 200 characters and one does, so
+    every part should be exactly one paragraph."""
+    paragraph = "sentence " * 12
+    parts = chunks("\n\n".join(paragraph for _ in range(6)), limit=200)
+
+    assert parts == [paragraph.strip()] * 6

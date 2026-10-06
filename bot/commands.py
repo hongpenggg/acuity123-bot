@@ -28,20 +28,28 @@ BEFORE_START = [
 ]
 
 #: The student-facing menu, set for a chat once they send /start.
+#
+# Telegram shows one flat list per chat and it is the main discovery surface, so
+# this is ordered by how often a student needs it, not by how the code is laid
+# out. Descriptions stay short because the client truncates them.
+#
+# Deliberately NOT listed, though they still work: /topicalnotes and
+# /randomnotes (both are doors into /resources, and /notes now walks the
+# catalogue for you), /stopweekly and /stopmonthly (a student turns a
+# subscription off once if ever, and both confirmations carry an inline "Turn
+# off" button), and every legacy alias.
 PUBLIC = [
-    BotCommand(command="quizme", description="A set of five questions"),
-    BotCommand(command="stats", description="Your scores and weak topics"),
-    BotCommand(command="topicalnotes", description="Overview sheet by topic"),
-    BotCommand(command="randomnotes", description="A focused sheet, at random"),
-    BotCommand(command="resources", description="Revision sheets as PDFs"),
-    BotCommand(command="changestreams", description="Pre-Clinical / Clinical / Post-MBBS"),
-    BotCommand(command="weeklyquiz", description="A set of five every Monday"),
-    BotCommand(command="stopweekly", description="Stop the Monday set"),
-    BotCommand(command="monthlynotes", description="The monthly sheet drop"),
-    BotCommand(command="stopmonthly", description="Stop the monthly sheets"),
+    BotCommand(command="quizme", description="Five questions, picked for you"),
+    BotCommand(command="notes", description="Your next revision sheet"),
+    BotCommand(command="review", description="Redo the ones you got wrong"),
+    BotCommand(command="stats", description="Your scores and weakest topics"),
+    BotCommand(command="resources", description="Browse or search all sheets"),
+    BotCommand(command="weeklyquiz", description="Monday quiz: on or off"),
+    BotCommand(command="subscribenotes", description="Sheets every 2 weeks: on or off"),
+    BotCommand(command="tournament", description="Tournament status and your score"),
     BotCommand(command="leaderboard", description="Top 3 and your rank"),
-    BotCommand(command="tournament", description="Tournament status"),
-    BotCommand(command="help", description="What this bot can do"),
+    BotCommand(command="changestreams", description="Switch Pre-Clinical / Clinical / Post"),
+    BotCommand(command="help", description="Everything this bot can do"),
 ]
 
 #: Added on top of PUBLIC for chats in ADMIN_IDS.
@@ -49,7 +57,7 @@ ADMIN = [
     BotCommand(command="admin_tournament_start", description="Start a tournament"),
     BotCommand(command="admin_tournament_end", description="Close it and announce winners"),
     BotCommand(command="admin_weekly_now", description="Send the Monday sets now"),
-    BotCommand(command="admin_notes_now", description="Send the monthly sheets now"),
+    BotCommand(command="admin_notes_now", description="Send the fortnightly sheets now"),
 ]
 
 

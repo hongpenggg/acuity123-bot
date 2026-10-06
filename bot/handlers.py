@@ -10,15 +10,17 @@ from zoneinfo import ZoneInfo
 from cachetools import TTLCache
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
+from asyncpg.exceptions import UniqueViolationError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from . import commands, db, jobs, llm, resources
 from .config import ADMIN_IDS, CREDIT, DEFAULT_LEVEL, DISCLAIMER, LEVEL_EMOJI, LEVELS, TZ
 from .sender import (ack, card_header, deliver_verdict, drop_buttons, edit_in_place,
-                     remaining_buttons, safe_send, send_note,
+                     forget_outstanding,
+                     remaining_buttons, safe_send, send_note, send_question,
                      send_question_for_level)
-from .text import (EXPLANATION_HEADING, TELEGRAM_LIMIT, esc, explanation_block, mask,
-                   parse_options, render, verdict)
+from .text import (EXPLANATION_HEADING, MAX_OPTIONS, TELEGRAM_LIMIT, esc,
+                   explanation_block, mask, parse_options, render, sheets_done, verdict)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -28,38 +30,80 @@ _EXPLAIN_COOLDOWN = 10.0
 # with stale timestamps.
 _recent_explain: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 
-MODES = ("practice", "weekly")
+# 'review' answers are recorded but never scored - see schema.sql and on_answer.
+MODES = ("practice", "weekly", "review")
 
-FEATURES = (
-    "WHAT THIS BOT DOES\n"
-    "1. Practice: sets of five questions. The same five for everyone, so your\n"
-    "   scores are comparable, and you get a score at the end of each set.\n"
-    "2. Compete: a two-week tournament, a set every Monday, and a top-3 board.\n"
-    "3. What is inside:\n"
-    "   3a. Quiz: a 120-question Pre-Clinical bank across 6 topics, with Clinical\n"
-    "       and Post-MBBS banks on the way.\n"
-    "   3b. Notes: overview sheets, one per topic, plus focused sheets on single\n"
-    "       points. /stats shows how you are doing."
+# Modes whose answer can close a set of five.
+#
+# A set slot is filled by the first answer to a question whichever door it came
+# through, so a Monday-push answer moves db.answered_count exactly like a /quizme
+# one and can be the fifth of a set. The report fires on the count *crossing* a
+# multiple of five, which happens once, so a set closed by the weekly push and
+# skipped here is never reported at all - the student answers five questions and
+# is told nothing. 'review' is excluded because a re-answer does not advance the
+# count; see _report_set_if_finished.
+SET_CLOSING_MODES = ("practice", "weekly")
+
+#: questions.id is a `serial`, so asyncpg rejects anything wider than int4 with a
+#: DataError rather than simply finding no row.
+_MAX_QUESTION_ID = 2 ** 31 - 1
+
+TAGLINE = (
+    "Your high-yield, one-stop ophthalmology hub for medical students and "
+    "residents, anytime, anywhere. 🤩"
+)
+
+# The welcome's numbered list.
+#
+# Every claim here has to be something the code actually does, and every command
+# named has to be one of the canonical names in commands.PUBLIC, so the welcome
+# and Telegram's own command menu read as one vocabulary. Two tests enforce that
+# (test_welcome_only_names_commands_that_exist) and the no-em-dash copy rule.
+#
+# The older aliases (/practice, /subscribe, /notes_sub, /topicalnotes ...) still
+# work for anyone who has them in their chat history; they are just not
+# advertised here or in the menu.
+FUNCTIONS = (
+    "<b>Functions</b>\n"
+    "<b>1. 🧠 Adaptive MCQs</b>\n"
+    "Sets of five, spread across topics and weighted towards the ones you keep "
+    "getting wrong. /quizme\n"
+    "Redo your wrong answers: /review\n"
+    "Your weakest topics, ranked: /stats\n"
+    "<b>2. 🗒 High-Yield Cheat Sheets</b>\n"
+    "Quick summaries, flowcharts, clinical approaches, one at a time. /notes\n"
+    "Jump to any sheet by code or topic: /resources\n"
+    "<b>3. 📬 Be Consistent Automatically</b>\n"
+    "A question set every Monday -> /weeklyquiz\n"
+    "Cheat sheets every fortnight -> /subscribenotes\n\n"
+    "<b>🏆 Annual Eye Trivia Tournament</b>\n"
+    "Compete for prizes! /tournament /leaderboard\n\n"
+    "<b>Start now!</b> /quizme"
 )
 
 HELP = (
-    "📝 /quizme for a set of five questions\n"
-    "📊 /stats for your scores and weak topics\n"
-    "📘 /topicalnotes for an overview sheet by topic\n"
-    "📄 /randomnotes for a focused sheet, at random\n"
-    "📚 /resources to browse every sheet\n"
-    "🎓 /changestreams to switch level\n"
-    "📅 /weeklyquiz for a set every Monday\n"
-    "🗓 /monthlynotes for the monthly sheet drop\n"
-    "🏆 /tournament for the competition status\n"
-    "🥇 /leaderboard for the top 3\n\n"
-    "/stopweekly and /stopmonthly stop those two."
+    "📝 /quizme a set of five, picked for you\n"
+    "🔁 /review the questions you got wrong\n"
+    "📊 /stats your scores, weakest topics first\n"
+    "🗒 /notes your next cheat sheet\n"
+    "📚 /resources browse, or fetch one by code or topic\n"
+    "🎓 /changestreams switch Pre-Clinical / Clinical / Post-MBBS\n"
+    "📅 /weeklyquiz a set every Monday\n"
+    "🗓 /subscribenotes cheat sheets every fortnight\n"
+    "🏆 /tournament the competition status\n"
+    "🥇 /leaderboard the top 3 and your rank\n\n"
+    "Turn the two subscriptions off with /stopweekly and /stopmonthly, or with "
+    "the button on their confirmation.\n"
+    "/topicalnotes and /randomnotes still work if you prefer them."
 )
 
 RESOURCES_INTRO = (
-    "📚 Revision sheets\n"
-    "Overview sheets cover a whole topic; focused sheets go deep on one point.\n"
-    "Pick one and it arrives here as a PDF."
+    "📚 <b>Revision sheets</b>\n"
+    "Overview sheets cover a whole topic; focused sheets go deep on one point. "
+    "Pick one and it arrives here as a PDF.\n\n"
+    "Know what you want? <code>/resources b14</code> or "
+    "<code>/resources glaucoma</code> fetches it straight away.\n"
+    "Or send /notes and I'll just hand you the next one you have not read."
 )
 
 OVERVIEW_INTRO = (
@@ -72,6 +116,25 @@ MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 def _level(level: str | None) -> str:
     return level if level in LEVELS else DEFAULT_LEVEL
+
+
+def _digits(raw: str | None, limit: int) -> int | None:
+    """A non-negative integer out of callback data, or None if it is not one.
+
+    Callback data is attacker-controllable and neither obvious test is safe on
+    its own: `str.isdigit()` is true for '²' and other non-decimal digits
+    that `int()` then rejects, while `int()` accepts signs, whitespace and
+    underscores ('1_0' is 10). Both ended as a logged exception and a bare ack,
+    which stops the spinner and tells the student nothing.
+
+    `limit` is the caller's own ceiling, because a value Postgres cannot hold is
+    an error from asyncpg rather than a lookup that misses.
+    """
+    text = raw or ""
+    if not (text.isascii() and text.isdigit()):
+        return None
+    value = int(text)
+    return value if value <= limit else None
 
 
 def _level_kb(current: str | None) -> InlineKeyboardMarkup:
@@ -89,27 +152,59 @@ def _pts(n: int) -> str:
     return f"{n} pt" if n == 1 else f"{n} pts"
 
 
-def _resources_home_kb() -> InlineKeyboardMarkup:
+def _resources_home_kb(level: str | None) -> InlineKeyboardMarkup:
     rows = []
-    if resources.TIER_A:
+    if (overview := resources.overview(level)):
         rows.append([InlineKeyboardButton(
-            text=f"📘 Overview sheets: all {len(resources.TIER_A)} topics",
+            text=f"📘 Overview sheets · {len(overview)}",
             callback_data="res:tier:a")])
-    if resources.TIER_B:
+    if (focused := resources.focused(level)):
         rows.append([InlineKeyboardButton(
-            text=f"📄 Focused sheets: {len(resources.TIER_B)} deep-dives",
+            text=f"📄 Focused sheets · {len(focused)}",
             callback_data="res:tier:b")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _resources_tier_kb(tier: str) -> InlineKeyboardMarkup:
-    notes = resources.tier(tier)
+# Post-MBBS has 65 focused sheets. One button each is a wall a student has to
+# scroll past, and Telegram starts rejecting very large keyboards, so the list is
+# paged. The page number rides in the callback data; the level never does, because
+# it is read from the database each time (see resources_cb).
+_PAGE = 20
+
+#: Highest page number taken from callback data. Four pages hold the 65 post-MBBS
+#: focused sheets, so anything near this is crafted rather than tapped, and is
+#: treated as the first page instead of being parsed into an enormous int.
+_MAX_PAGE = 10_000
+
+
+def _resources_tier_kb(level: str | None, tier: str,
+                       page: int = 0) -> InlineKeyboardMarkup:
+    notes = resources.tier(level, tier)
+    pages = max(1, -(-len(notes) // _PAGE))
+    page = max(0, min(page, pages - 1))
+    window = notes[page * _PAGE:(page + 1) * _PAGE]
+    # The level rides along. Without it a student who opens the browser, then
+    # switches stream, then taps a still-visible button gets whichever sheet
+    # happens to carry that code at the new level - silently, and it is then
+    # marked delivered so /notes skips it.
     buttons = [
-        InlineKeyboardButton(text=note.label,
-                             callback_data=f"res:get:{note.tier}:{note.code}")
-        for note in notes
+        InlineKeyboardButton(
+            text=note.label,
+            callback_data=f"res:get:{note.level}:{note.tier}:{note.code}")
+        for note in window
     ]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if pages > 1:
+        nav = []
+        if page:
+            nav.append(InlineKeyboardButton(
+                text="◀", callback_data=f"res:page:{tier}:{page - 1}"))
+        nav.append(InlineKeyboardButton(
+            text=f"{page + 1}/{pages}", callback_data="res:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(
+                text="▶", callback_data=f"res:page:{tier}:{page + 1}"))
+        rows.append(nav)
     rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="res:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -124,13 +219,29 @@ def _local(when: datetime | None) -> str:
 # ------------------------------------------------------------------ onboarding
 
 
+def welcome(user, level: str | None) -> str:
+    """The /start screen. Greets by the sender's own first name, which Telegram
+    supplies on every message, and falls back to a bare hello when it does not."""
+    name = getattr(user, "first_name", None)
+    hello = (f"👋 <b>Hi {esc(name)}!</b> This is the <b>LKC OphSoc Bot</b>."
+             if name else "👋 <b>Hi! This is the LKC OphSoc Bot.</b>")
+    lv = _level(level)
+    return (
+        f"{hello}\n"
+        f"{TAGLINE}\n\n"
+        f"{FUNCTIONS}\n\n"
+        f"Level: {LEVEL_EMOJI[lv]} <b>{LEVELS[lv]}</b>\n"
+        "Choose below 👇 or use /changestreams. Your questions and sheets both "
+        "follow it.\n\n"
+        f"<i>{esc(CREDIT)} {esc(DISCLAIMER)}</i>"
+    )
+
+
 @router.message(Command("start", "help"))
-async def start(m: Message, bot: Bot):
+async def start(m: Message, bot: Bot, command: CommandObject | None = None):
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = await db.get_level(uid)
-    name = getattr(m.from_user, "first_name", None)
-    hello = f"👋 <b>Hi {esc(name)}!</b>" if name else "👋 <b>Hi!</b>"
     # Automatic entry to a running tournament: a student who has started the bot
     # should not have to remember to opt in to a competition they are already
     # answering questions for. Costs one cheap query, and does nothing when no
@@ -139,17 +250,12 @@ async def start(m: Message, bot: Bot):
     # Give this chat its full menu. Telegram keeps the command list per chat, so
     # this is also what refreshes a client still showing only /start.
     await commands.sync_chat(bot, m.chat.id, is_admin=uid in ADMIN_IDS)
-    await m.answer(
-        f"{hello}\n\n"
-        f"{FEATURES}\n\n"
-        f"{HELP}\n\n"
-        f"Your level: {LEVEL_EMOJI[_level(level)]} <b>{LEVELS[_level(level)]}</b>\n"
-        "<b>Pick your level below</b> 👇 or send /changestreams. Your questions "
-        "and sheets both follow it.\n\n"
-        f"<i>{esc(CREDIT)}\n{esc(DISCLAIMER)}</i>",
-        parse_mode="HTML",
-        reply_markup=_level_kb(level),
-    )
+    body = welcome(m.from_user, level)
+    # The welcome names the headline commands only. /help adds the full list, so
+    # /stats and the sheet browsers stay one message away.
+    if command is not None and command.command == "help":
+        body += f"\n\n<b>All commands</b>\n{HELP}"
+    await m.answer(body, parse_mode="HTML", reply_markup=_level_kb(level))
 
 
 @router.message(Command("changestreams", "level"))
@@ -173,9 +279,35 @@ async def set_level(c: CallbackQuery):
             return await ack(c, "That level doesn't exist.", True)
         uid = c.from_user.id
         await db.upsert_user(uid, c.from_user.username)
+        before = _level(await db.get_level(uid))
         await db.set_level(uid, key)
+        # A push that switched itself off because this student ran out of content
+        # has content again now. See _restore_finished_subs, with the
+        # subscriptions.
+        restored: list[str] = []
+        try:
+            restored = await _restore_finished_subs(uid, before, key)
+        except Exception:
+            # Repairing a subscription must never cost them the confirmation.
+            log.debug("subscription restore failed", exc_info=True)
         answered = True
         await ack(c, f"{LEVEL_EMOJI[key]} You're on {LEVELS[key]} now")
+        # The toast disappears, so say what to do next in the chat itself -
+        # picking a level used to dead-end here.
+        body = (f"{LEVEL_EMOJI[key]} You're on <b>{LEVELS[key]}</b>. Your "
+                "questions and cheat sheets both follow it.\n\n"
+                "Send /quizme for a set of five, or /notes for a cheat sheet.")
+        if restored:
+            # Say what changed: a subscription that comes back silently is only
+            # marginally better than one that stays dead.
+            names = " and ".join(_SUB_FLAGS[which][1] for which in restored)
+            body += (f"\n\n🔔 Your {names} stopped when you finished "
+                     f"{LEVELS[before]}. They're back on, because there is "
+                     f"{LEVELS[key]} content waiting.")
+        with contextlib.suppress(Exception):
+            await c.bot.send_message(
+                uid, body, parse_mode="HTML",
+                reply_markup=_sub_off_kb(*restored) if restored else None)
         if c.message is not None:
             # Only move the tick. Rewriting the text would wipe the /start welcome
             # when the picker is tapped from there.
@@ -223,36 +355,57 @@ async def next_question(c: CallbackQuery, bot: Bot):
             await ack(c)
 
 
-async def _report_set_if_finished(message, uid: int, level: str, qid: int) -> None:
-    """If that answer completed a set of five, say how the set went.
+async def _report_set_if_finished(message, uid: int, level: str,
+                                  before: int) -> None:
+    """Say how the set went, once a set of five is complete.
 
-    A set is complete once all five of its questions have been attempted, so this
-    fires exactly once per set and never for a partial one. Only practice sets are
-    scored this way: the Monday set is a separate flow that does not count toward
-    the tournament.
+    Sets are rolling blocks of five answers rather than fixed blocks of five
+    question ids, so "complete" is simply "the distinct answer count is a
+    multiple of five". Two consequences worth knowing:
+
+    * The last set at a level can be short (103 clinical questions is twenty
+      sets of five and then one of three), which never hits the multiple, so
+      finishing the level is reported on its own branch instead.
+    * `before` is the count taken *before* this answer was recorded. A /review
+      answer does not change the count, so passing it through is what stops a
+      student on a set boundary being congratulated after every review answer.
+
+    Called for a weekly answer as well as a practice one (SET_CLOSING_MODES):
+    the Monday push consumes set slots too, so it can be what closes a set.
     """
     try:
-        set_no = await db.set_no_for(level, qid)
-        score = await db.set_score(uid, level, set_no)
+        answered = await db.answered_count(uid, level)
+        if answered == before:
+            return          # a re-answer, not a new question: no set advanced
+        total = await db.level_total(level)
+        score = await db.last_set_score(uid, level)
     except Exception:
         log.debug("set score lookup failed", exc_info=True)
         return
-    if score is None or score["answered"] < score["size"]:
+
+    exhausted = bool(total) and answered >= total
+    finished_a_set = score is not None and answered % db.SET_SIZE == 0
+    if not (finished_a_set or exhausted):
         return
 
-    done = set_no + 1
-    left = score["total_sets"] - done
-    if left <= 0:
-        tail = ("That is every set in the bank. 🎉 /stats has the full breakdown, "
-                "and /resources has the sheets.")
+    total_sets = -(-total // db.SET_SIZE) if total else 0
+    if finished_a_set:
+        head = (f"📊 <b>Set {score['number']} of {total_sets}</b> done · "
+                f"score <b>{score['correct']}/{score['size']}</b>")
     else:
-        tail = (f"{left} set{'s' if left != 1 else ''} to go. "
-                "Send /quizme for the next five.")
+        head = f"📊 <b>{answered} of {total}</b> answered"
 
-    await message.answer(
-        f"📊 <b>Set {done} of {score['total_sets']}</b> done · "
-        f"score <b>{score['correct']}/{score['size']}</b>\n{tail}",
-        parse_mode="HTML")
+    if exhausted:
+        tail = ("That is every question at this level. 🎉 /review the ones you "
+                "missed, /stats for the full breakdown, or /changestreams to "
+                "switch level.")
+    else:
+        left = total - answered
+        nxt = min(db.SET_SIZE, left)
+        tail = (f"{left} question{'s' if left != 1 else ''} left at this level. "
+                f"Send /quizme for the next {nxt}.")
+
+    await message.answer(f"{head}\n{tail}", parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("a:"))
@@ -264,30 +417,63 @@ async def on_answer(c: CallbackQuery):
             answered = True
             return await ack(c)
         _, qid_raw, idx_raw, mode = parts
-        if not (qid_raw.isdigit() and idx_raw.isdigit()) or mode not in MODES:
+        qid = _digits(qid_raw, _MAX_QUESTION_ID)
+        # An index wider than the widest keyboard the bot can draw is data no card
+        # ever produced, so it is ignored with the rest of the nonsense rather
+        # than explained below as a stale card.
+        idx = _digits(idx_raw, MAX_OPTIONS)
+        if qid is None or idx is None or mode not in MODES:
             # callback_data is attacker-controllable; anything unexpected is ignored.
             answered = True
             return await ack(c)
 
-        question = await db.get_question(int(qid_raw))
+        question = await db.get_question(qid)
         if question is None:
             answered = True
             return await ack(c, "That question is no longer available.", True)
 
-        options = parse_options(question["options"])
-        idx = int(idx_raw)
-        if not 0 <= idx < len(options):
-            answered = True
-            return await ack(c)
-
         message = getattr(c, "message", None)
-        if message is None:
+        try:
+            options = parse_options(question["options"])
+        except ValueError:
+            # The row's option count is outside what a card can render, so this
+            # card can never be answered. Reporting it beats the bare ack this
+            # used to end in, which looked to the student like a dead button.
+            log.exception("question %s is malformed", qid)
             answered = True
-            return await ack(c)
+            await ack(c, "Something is wrong with that question on our side, "
+                         "sorry. Send /quizme for another one.", True)
+            await drop_buttons(message, lambda data: data.startswith("a:"))
+            forget_outstanding(c.from_user.id, qid)
+            return None
+
+        if not 0 <= idx < len(options):
+            # The row has fewer options than the card was drawn with, so a tap
+            # that was in range for the card is out of range for the question.
+            # A bare ack left every button live and the student tapping forever.
+            answered = True
+            await ack(c, "That option is not on this question any more. "
+                         "Send /quizme for a fresh one.", True)
+            await drop_buttons(message, lambda data: data.startswith("a:"))
+            forget_outstanding(c.from_user.id, qid)
+            return None
+
+        if message is None:
+            # Telegram drops `message` for a card too old to act on, and there is
+            # no msg_id to record an attempt against. Say so rather than acking
+            # bare: the student tapped something and deserves an answer.
+            answered = True
+            return await ack(c, "That card is too old to answer. Send /quizme "
+                                "for a fresh one.", True)
 
         correct = idx == question["correct_idx"]
+        # Taken before the write: answered_count counts *distinct* questions, so a
+        # /review answer leaves it unchanged. Without this, a student sitting on a
+        # set boundary was told "Set N done" again after every review answer.
+        before = await db.answered_count(c.from_user.id, question["level"])
         scored = await db.record_attempt(
             c.from_user.id, question, idx, correct, mode, message.message_id)
+        forget_outstanding(c.from_user.id, question["id"])
 
         if not scored:
             answered = True
@@ -315,11 +501,12 @@ async def on_answer(c: CallbackQuery):
             f"{body}\n\n{verdict(correct, question['correct_idx'], streak)}",
             InlineKeyboardMarkup(inline_keyboard=[buttons]),
         )
-        if mode == "practice":
-            # Scored straight off the attempts table, so the set boundaries are the
-            # same fixed blocks of five for everyone.
+        if mode in SET_CLOSING_MODES:
+            # Only a question answered for the first time advances a set, so only
+            # that can close one. Re-answering through /review never does, which
+            # is what `before` proves.
             await _report_set_if_finished(message, c.from_user.id,
-                                          question["level"], question["id"])
+                                          question["level"], before)
     except Exception:
         log.exception("on_answer failed")
     finally:
@@ -333,12 +520,16 @@ async def on_explain(c: CallbackQuery, bot: Bot):
     answered = False
     try:
         parts = c.data.split(":")
-        if len(parts) != 2 or not parts[1].isdigit():
+        # Same parsing as on_answer, and for the same reason: `isdigit()` let
+        # '²' through and int() then raised, so tapping Explain logged an
+        # exception and showed nothing.
+        qid = _digits(parts[1], _MAX_QUESTION_ID) if len(parts) == 2 else None
+        if qid is None:
             answered = True
             return await ack(c)
 
         uid = c.from_user.id
-        question = await db.get_question(int(parts[1]))
+        question = await db.get_question(qid)
         if question is None:
             answered = True
             return await ack(c, "That question is no longer available.", True)
@@ -388,7 +579,149 @@ async def on_explain(c: CallbackQuery, bot: Bot):
             await ack(c)
 
 
+@router.message(Command("review"))
+async def review(m: Message, bot: Bot):
+    """Re-serve the questions this student got wrong, with their explanations.
+
+    Deliberately separate from /quizme: `pick_question` only ever serves
+    unattempted questions, so without this a missed question never comes back.
+
+    Served under its own `review` mode, which is what stops it scoring. A wrong
+    answer in /quizme shows the student the correct option, so a re-answer that
+    awarded a tournament point would let anyone reach full marks without knowing
+    anything. Set progress is safe for a different reason: it counts *distinct*
+    questions, so a re-answer cannot advance it.
+    """
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    level = _level(await db.get_level(uid))
+
+    waiting = await db.wrong_count(uid, level)
+    if not waiting:
+        return await m.answer(
+            f"🎯 Nothing to review yet: you have not got a "
+            f"{LEVELS[level]} question wrong.\n"
+            "Send /quizme for a set of five.")
+
+    pile = await db.wrong_questions(uid, level)
+    shown = len(pile)
+    more = waiting - shown
+    head = ("🔁 <b>Review</b> · the one you most recently missed."
+            if shown == 1
+            else f"🔁 <b>Review</b> · the {shown} you most recently missed.")
+    if more > 0:
+        head += f" {more} more after these."
+    await m.answer(head, parse_mode="HTML")
+    for question in pile:
+        await send_question(bot, uid, question, "review")
+
+
 # ---------------------------------------------------------------- subscriptions
+
+
+_SUB_FLAGS = {"weekly": ("weekly_sub", "Monday question sets"),
+              "notes": ("notes_sub", "fortnightly cheat sheets")}
+
+
+def _sub_off_kb(*which: str) -> InlineKeyboardMarkup:
+    """A turn-off button on the confirmation itself.
+
+    The stop commands are not in the menu: a student turns a subscription off
+    once, if ever, and the moment they want to is the moment they are reading the
+    confirmation. The commands stay registered for anyone who knows them.
+
+    Takes more than one because a stream switch can turn both pushes back on, and
+    two identical "Turn this off" buttons would not say which is which.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("🔕 Turn this off" if len(which) == 1
+                  else f"🔕 Turn off {_SUB_FLAGS[key][1]}"),
+            callback_data=f"sub:off:{key}")]
+        for key in which
+    ])
+
+
+async def _sheets_left(uid: int, level: str) -> int | None:
+    """Sheets this student has not been sent at `level`.
+
+    None when the level has no catalogue at all, which is emphatically not the
+    same as having read everything and must never be read as "finished".
+    """
+    if not resources.all_for(level):
+        return None
+    delivered = await db.notes_delivered(uid, level)
+    return (len(resources.unsent(level, "a", delivered["a"]))
+            + len(resources.unsent(level, "b", delivered["b"])))
+
+
+async def _questions_left(uid: int, level: str) -> int | None:
+    """Questions this student has never attempted at `level`, or None when the
+    bank is empty: a level still being written is not a level finished."""
+    total = await db.level_total(level)
+    if not total:
+        return None
+    return max(0, total - await db.answered_count(uid, level))
+
+
+#: What each push has left to send, so a stream switch can tell "they ran out of
+#: content" from "they turned it off".
+_SUB_CONTENT = {"weekly": _questions_left, "notes": _sheets_left}
+
+
+async def _restore_finished_subs(uid: int, before: str, now: str) -> list[str]:
+    """Turn a push that ran out of content back on after a stream switch.
+
+    Both pushes switch themselves off when a student finishes a level: the
+    fortnightly drop congratulates them and clears `notes_sub`, and the Monday
+    push does the same with `weekly_sub` (jobs.py). That is right, because the
+    alternative is pinging them every week with nothing to send, but nothing ever
+    undid it: /changestreams to a level with 47 unread sheets left the drop dead,
+    with nothing to show the student why. Returns which were restored so the
+    caller can say what changed.
+
+    Only a push whose *old* level was exhausted is restored. A student who sent
+    /stopweekly still has questions left at that level, so their choice stands
+    and switching stream will not quietly re-subscribe them.
+    """
+    restored = []
+    for which, left in _SUB_CONTENT.items():
+        column, _ = _SUB_FLAGS[which]
+        # db has no single-user flag read, and this runs once per stream switch,
+        # so scanning the subscriber list is cheap enough.
+        if uid in await db.subscribers(column):
+            continue                    # still on: there is nothing to repair
+        if await left(uid, before) != 0:
+            continue                    # not a level they had run out of
+        if not await left(uid, now):
+            continue                    # and nothing waiting at the new one
+        await db.set_flag(uid, column, True)
+        restored.append(which)
+    return restored
+
+
+@router.callback_query(F.data.startswith("sub:off:"))
+async def sub_off(c: CallbackQuery):
+    answered = False
+    try:
+        which = (c.data or "").split(":")[-1]
+        if which not in _SUB_FLAGS:
+            answered = True
+            return await ack(c, "Unknown option.", True)
+        column, label = _SUB_FLAGS[which]
+        uid = c.from_user.id
+        await db.upsert_user(uid, c.from_user.username)
+        await db.set_flag(uid, column, False)
+        answered = True
+        await ack(c, "Turned off")
+        await drop_buttons(c.message, lambda data: data.startswith("sub:off:"))
+        if c.message is not None:
+            await c.message.answer(f"🔕 No more {label}.")
+    except Exception:
+        log.exception("sub_off failed")
+    finally:
+        if not answered:
+            await ack(c)
 
 
 @router.message(Command("weeklyquiz", "subscribe"))
@@ -401,9 +734,10 @@ async def weeklyquiz(m: Message):
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "weekly_sub", True)
     await m.answer(
-        "📅 You're in. Every Monday at 9am you'll get your current set of five.\n\n"
-        "Only questions you answer through /quizme score for the tournament, so the "
-        "Monday set is pure practice. /stopweekly to stop."
+        "📅 You're in. Every Monday at 9am you'll get a set of five.\n\n"
+        "Only questions you answer through /quizme score for the tournament, so "
+        "the Monday set is pure practice.",
+        reply_markup=_sub_off_kb("weekly"),
     )
 
 
@@ -415,15 +749,42 @@ async def stopweekly(m: Message):
     await m.answer("Done, no more Monday sets. /weeklyquiz if you change your mind.")
 
 
-def _find_note(text: str) -> resources.Note | None:
-    """A sheet by code ('b14'), or by any distinctive part of its topic name."""
-    note = resources.find(text)
+async def _deliver(bot: Bot, uid: int, level: str | None, note) -> bool:
+    """Send one sheet and record it as delivered.
+
+    Every path that hands a student a sheet goes through here - /notes,
+    /resources, /topicalnotes, /randomnotes and the fortnightly drop - so a sheet
+    read once is never pushed at them again, whichever door they came through.
+    Recording only on success means a failed upload is retried rather than lost.
+
+    False means `send_note` could neither upload the PDF nor get the GitHub link
+    through, and the apology is sent from here so that every one of those doors
+    says something. /notes used to return on False without replying at all: the
+    student sent a command and got absolute silence.
+    """
+    if not await send_note(bot, uid, note):
+        await safe_send(
+            bot, uid,
+            f"Could not send {note.code} just now, sorry. It is still in your "
+            "queue, so try again in a moment, or /resources for another sheet.")
+        return False
+    await db.record_notes_sent(uid, level, [(note.tier, note.code)])
+    return True
+
+
+def _find_note(level: str | None, text: str) -> resources.Note | None:
+    """A sheet by code ('b14'), or by any distinctive part of its topic name.
+
+    Scoped to one level: the codes repeat across levels, so a level-free search
+    would hand a clinical student a preclinical sheet.
+    """
+    note = resources.find(level, text)
     if note is not None:
         return note
     needle = text.strip().lower()
     if not needle:
         return None
-    for candidate in resources.ALL:
+    for candidate in resources.all_for(level):
         if needle in candidate.topic.lower():
             return candidate
     return None
@@ -434,12 +795,15 @@ async def resources_cmd(m: Message, command: CommandObject, bot: Bot):
     """The revision sheets. Sends the actual PDF, not a description of it."""
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
+    level = await db.get_level(uid)
     if command.args:
-        note = _find_note(command.args)
+        note = _find_note(level, command.args)
         if note is None:
             return await m.answer("No sheet matches that. Send /resources to browse.")
-        return await send_note(bot, uid, note)
-    await m.answer(RESOURCES_INTRO, reply_markup=_resources_home_kb())
+        await _deliver(bot, uid, level, note)
+        return None
+    await m.answer(RESOURCES_INTRO, parse_mode="HTML",
+                          reply_markup=_resources_home_kb(level))
 
 
 @router.callback_query(F.data.startswith("res:"))
@@ -450,28 +814,48 @@ async def resources_cb(c: CallbackQuery, bot: Bot):
         parts = (c.data or "").split(":")
         action = parts[1] if len(parts) > 1 else ""
         message = getattr(c, "message", None)
+        # The level is read here rather than carried in the callback data, so the
+        # buttons always serve the student's *current* stream even if they
+        # switched it after the message was sent.
+        level = await db.get_level(c.from_user.id)
 
         if action == "home":
             await ack(c)
             if message is not None:
                 with contextlib.suppress(Exception):
-                    await message.edit_text(RESOURCES_INTRO,
-                                            reply_markup=_resources_home_kb())
-        elif action == "tier":
+                    await message.edit_text(
+                        RESOURCES_INTRO, parse_mode="HTML",
+                        reply_markup=_resources_home_kb(level))
+        elif action in ("tier", "page"):
             await ack(c)
             tier_code = parts[2] if len(parts) > 2 else "a"
+            # A bare int() here raised on "res:page:b:abc" and on an empty tail,
+            # which logged an exception, acked a second time and left the tap
+            # doing nothing visible. Anything that is not a plain number lands on
+            # the first page; _resources_tier_kb clamps the rest.
+            page = 0
+            if action == "page" and len(parts) > 3:
+                page = _digits(parts[3], _MAX_PAGE) or 0
             if message is not None:
                 with contextlib.suppress(Exception):
                     await message.edit_text(
                         f"{resources.TIERS.get(tier_code, 'Notes')} sheets, pick one:",
-                        reply_markup=_resources_tier_kb(tier_code))
-        elif action == "get" and len(parts) > 3:
-            note = resources.get(parts[2], parts[3])
-            if note is None:
-                await ack(c, "That sheet has moved. Try /resources again.", True)
+                        reply_markup=_resources_tier_kb(level, tier_code, page))
+        elif action == "get" and len(parts) > 4:
+            from_level, tier_code, code = parts[2], parts[3], parts[4]
+            if from_level != _level(level):
+                # They changed stream after this keyboard was drawn.
+                await ack(c, "You've switched stream since then. "
+                             "Send /resources for your current sheets.", True)
             else:
-                await ack(c)
-                await send_note(bot, c.from_user.id, note)
+                note = resources.get(level, tier_code, code)
+                if note is None:
+                    await ack(c, "That sheet has moved. Try /resources again.", True)
+                else:
+                    await ack(c)
+                    await _deliver(bot, c.from_user.id, level, note)
+        elif action == "noop":
+            await ack(c)          # the page counter is a label, not a button
         else:
             await ack(c, "Unknown option.", True)
         answered = True
@@ -484,58 +868,98 @@ async def resources_cb(c: CallbackQuery, bot: Bot):
 
 @router.message(Command("notes"))
 async def notes(m: Message, command: CommandObject, bot: Bot):
-    """Sheets by topic: the database if it has any, otherwise the PDFs.
+    """The next cheat sheet this student has not been sent.
 
-    The notes table is empty today — the society's sheets live in resources/notes
-    as PDFs — so this must not dead-end on "nothing up yet".
+    A progression, not a picker: overview sheets first, then focused ones, then
+    the syllabus-complete message. `note_deliveries` is what makes it resumable
+    and stops a sheet going out twice, and it is shared with the fortnightly drop
+    so a sheet pulled by hand is never pushed at them later.
+
+    An argument still short-circuits the queue (`/notes glaucoma`), because
+    someone revising one topic should not have to walk to it.
     """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
-    level = _level(await db.get_level(uid))
+    level = await db.get_level(uid)
 
     if command.args:
-        wanted = command.args.strip()
-        rows = await db.get_notes(wanted, level, "B")
-        if rows:
-            for row in rows:
-                # safe_send splits anything over Telegram's 4096-char limit instead
-                # of slicing the tail off.
-                await safe_send(bot, uid, f"📝 {row['title']}\n\n{row['body']}")
-            return
-        note = _find_note(wanted)
-        if note is not None:
-            return await send_note(bot, uid, note)
-        return await m.answer("Couldn't find that topic. Send /resources to browse.")
+        note = _find_note(level, command.args)
+        if note is None:
+            return await m.answer(
+                "Couldn't find that sheet. Send /resources to browse, or /notes "
+                "on its own for your next one.")
+        await _deliver(bot, uid, level, note)
+        return None
 
-    topics = await db.note_topics(level, "B")
-    if topics:
-        listing = "\n".join(f"• {t}" for t in topics)
+    delivered = await db.notes_delivered(uid, level)
+    queue = (resources.unsent(level, "a", delivered["a"])
+             + resources.unsent(level, "b", delivered["b"]))
+    if not queue:
+        # An empty catalogue gives an empty queue too, and "you have completed
+        # the syllabus" to someone who was never sent a single sheet is a lie the
+        # student cannot see through. /topicalnotes and /randomnotes both guard
+        # this already.
+        if not resources.all_for(level):
+            return await m.answer("No cheat sheets on disk for your level yet.")
+        return await m.answer(sheets_done(LEVELS[_level(level)]), parse_mode="HTML")
+
+    note = queue[0]
+    if not await _deliver(bot, uid, level, note):
+        return None
+
+    left = len(queue) - 1
+    kind = resources.TIERS[note.tier].lower()
+    if left:
+        tail = (f"{left} sheet{'s' if left != 1 else ''} to go. "
+                "/notes for the next one.")
+    else:
+        tail = "That was the last one. Send /notes again for the good news."
+    await m.answer(f"🗒 Your next {kind} sheet. {tail}")
+    return None
+
+
+@router.message(Command("subscribenotes", "monthlynotes", "notes_sub"))
+async def subscribenotes(m: Message):
+    """The fortnightly sheet drop.
+
+    `/monthlynotes` and `/notes_sub` stay as aliases: the cadence changed, and a
+    message already sitting in a student's chat should still do something sane.
+    The reply counts what is left for *this* student, because the drop walks their
+    own delivery history rather than resending a fixed bundle.
+    """
+    uid = m.from_user.id
+    await db.upsert_user(uid, m.from_user.username)
+    await db.set_flag(uid, "notes_sub", True)
+    level = await db.get_level(uid)
+    delivered = await db.notes_delivered(uid, level)
+    left = (len(resources.unsent(level, "a", delivered["a"]))
+            + len(resources.unsent(level, "b", delivered["b"])))
+    if not resources.all_for(level):
+        # An empty catalogue and a finished one both leave `left` at zero. Saying
+        # "you have already had every sheet" to someone who has had none is the
+        # same lie /notes used to tell.
         return await m.answer(
-            f"🗒 Sheets for {LEVELS[level]}:\n{listing}\n\n"
-            f"Send /notes with a topic name, like:\n/notes {topics[0]}"
-        )
-
-    return await m.answer(RESOURCES_INTRO, reply_markup=_resources_home_kb())
-
-
-@router.message(Command("monthlynotes", "notes_sub"))
-async def monthlynotes(m: Message):
-    """The monthly drop: six overview sheets plus the six reserved focused ones."""
-    await db.upsert_user(m.from_user.id, m.from_user.username)
-    await db.set_flag(m.from_user.id, "notes_sub", True)
-    await m.answer(
-        f"📚 You're in. On the 1st of each month you'll get all "
-        f"{len(resources.TIER_A)} overview sheets plus {len(resources.MONTHLY)} "
-        "focused ones.\n\nWant one now? /topicalnotes or /randomnotes."
-        "\n/stopmonthly to stop."
-    )
+            f"📬 You're in, but there are no {LEVELS[_level(level)]} cheat "
+            "sheets on disk yet. You'll get them as soon as there are.",
+            reply_markup=_sub_off_kb("notes"))
+    if left:
+        each = ("a cheat sheet" if jobs.SHEETS_PER_DROP == 1
+                else f"{jobs.SHEETS_PER_DROP} cheat sheets")
+        body = (f"📬 You're in. On the 1st and the 15th you'll get {each} for "
+                f"{LEVELS[_level(level)]}, picking up where you left off. "
+                f"{left} to go.\n\nWant one right now? /notes")
+    else:
+        body = (f"📬 You're in, but you have already had every "
+                f"{LEVELS[_level(level)]} sheet. Nothing will be sent until there "
+                "is new content, and /resources still has them all.")
+    await m.answer(body, reply_markup=_sub_off_kb("notes"))
 
 
-@router.message(Command("stopmonthly", "notes_unsub"))
-async def monthlynotes_off(m: Message):
+@router.message(Command("stopmonthly", "notes_unsub", "unsubscribenotes"))
+async def subscribenotes_off(m: Message):
     await db.upsert_user(m.from_user.id, m.from_user.username)
     await db.set_flag(m.from_user.id, "notes_sub", False)
-    await m.answer("Done, no more monthly sheets. /monthlynotes to start again.")
+    await m.answer("Done, no more cheat sheets. /subscribenotes to start again.")
 
 
 @router.message(Command("topicalnotes"))
@@ -543,36 +967,68 @@ async def topicalnotes(m: Message, command: CommandObject, bot: Bot):
     """Pick an overview sheet: one broad sheet per topic."""
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
+    level = await db.get_level(uid)
     if command.args:
-        note = _find_note(command.args)
+        note = _find_note(level, command.args)
         if note is None or note.tier != "a":
             return await m.answer(
                 "No overview sheet matches that. Send /topicalnotes to see them.")
-        return await send_note(bot, uid, note)
-    if not resources.TIER_A:
-        return await m.answer("No overview sheets on disk yet.")
-    await m.answer(OVERVIEW_INTRO, reply_markup=_resources_tier_kb("a"))
+        await _deliver(bot, uid, level, note)
+        return None
+    if not resources.overview(level):
+        return await m.answer("No overview sheets on disk for your level yet.")
+    await m.answer(OVERVIEW_INTRO, reply_markup=_resources_tier_kb(level, "a"))
 
 
 @router.message(Command("randomnotes"))
 async def randomnotes(m: Message, command: CommandObject, bot: Bot):
-    """One focused sheet at random, from the ones the monthly drop holds back.
+    """One focused sheet at random that this student has not had.
 
-    The reserved six are excluded so the monthly bundle is not made up of sheets
-    students have already been handed at random.
+    Kept as an unlisted alternative to /notes for anyone who wants the shuffle
+    rather than the queue. It draws only from sheets they have not been sent, so
+    it cannot repeat itself and it runs out at the same point /notes does.
     """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
+    level = await db.get_level(uid)
     if command.args:
-        note = _find_note(command.args)
+        note = _find_note(level, command.args)
         if note is None or note.tier != "b":
             return await m.answer(
                 "No focused sheet matches that. Send /randomnotes for a random one.")
-        return await send_note(bot, uid, note)
-    note = resources.random_focused()
+        await _deliver(bot, uid, level, note)
+        return None
+
+    delivered = await db.notes_delivered(uid, level)
+    note = resources.random_focused(level, delivered["b"])
     if note is None:
-        return await m.answer("No focused sheets on disk yet.")
-    await send_note(bot, uid, note)
+        if not resources.focused(level):
+            return await m.answer("No focused sheets on disk for your level yet.")
+        return await m.answer(sheets_done(LEVELS[_level(level)]), parse_mode="HTML")
+    await _deliver(bot, uid, level, note)
+    return None
+
+
+def _ranked(rows, key) -> list[tuple[str, int, int]]:
+    """(name, correct, answered) grouped by `key`, weakest first."""
+    out: dict[str, list[int]] = {}
+    for row in rows:
+        name = key(row) or "(not labelled)"
+        bucket = out.setdefault(name, [0, 0])
+        bucket[0] += row["answered"]
+        bucket[1] += row["correct"]
+    ranked = sorted(out.items(), key=lambda kv: (kv[1][1] / kv[1][0], kv[0]))
+    return [(name, c, n) for name, (n, c) in ranked]
+
+
+def _score_line(name: str, correct: int, answered: int) -> str:
+    return f"{esc(name)} · {correct}/{answered} ({round(100 * correct / answered)}%)"
+
+
+#: How many question types /stats names. Each level has 71 to 92 of them and some
+#: run to 62 characters, so the full list runs to thousands of characters and
+#: Telegram would split it into a two-message wall.
+_TYPES_SHOWN = 5
 
 
 @router.message(Command("stats"))
@@ -581,55 +1037,72 @@ async def stats_cmd(m: Message):
 
     Split by topic and by question type (`questions.tag`, e.g. "Physiology |
     optical compensation"), because "you are weak on optics" is far less useful
-    than knowing which kind of optics question keeps catching them out.
+    than knowing which kind of optics question keeps catching them out. Weakest
+    first throughout, since that is the list a student should act on, and it is
+    the same ranking `db.pick_question` uses to pick what to serve next.
     """
     uid = m.from_user.id
     await db.upsert_user(uid, m.from_user.username)
     level = _level(await db.get_level(uid))
 
-    board = await db.set_board(uid, level)
-    if not board:
+    total = await db.level_total(level)
+    if not total:
         return await m.answer(
-            f"🚧 No {LEVELS[level]} questions yet, so there is nothing to report on.")
+            f"🚧 No {LEVELS[level]} questions yet, so there is nothing "
+            "to report on.")
 
-    total = sum(row["size"] for row in board)
-    answered = sum(row["answered"] for row in board)
-    correct = sum(row["correct"] for row in board)
-    finished = sum(1 for row in board if row["answered"] >= row["size"])
-
+    answered = await db.answered_count(uid, level)
     if answered == 0:
         return await m.answer(
-            "📊 Nothing answered yet. Send /quizme to start your first set of five.")
+            f"📊 Nothing answered yet at {LEVELS[level]}.\n"
+            "Send /quizme for your first set of five.")
 
     rows = await db.stats(uid, level)
+    correct = sum(row["correct"] for row in rows)
+    # db.stats counts attempt *rows*, so a /review re-answer would otherwise push
+    # this denominator past the size of the bank: "Correct 102 of 106" on a
+    # 103-question level.
+    attempts = min(sum(row["answered"] for row in rows), answered)
+    total_sets = -(-total // db.SET_SIZE)
+    streak = await db.practice_streak(uid)
+    waiting = await db.wrong_count(uid, level)
+
     lines = [
         f"📊 <b>Your {LEVELS[level]} progress</b>",
-        f"Answered: {answered} of {total} ({round(100 * answered / total)}%)",
-        f"Correct: {correct} of {answered} ({round(100 * correct / answered)}%)",
-        f"Sets finished: {finished} of {len(board)}",
+        f"Answered <b>{answered}</b> of {total} "
+        f"({round(100 * answered / total)}%)",
+        f"Correct <b>{correct}</b> of {attempts} "
+        f"({round(100 * correct / attempts)}%)",
+        # A short final set never reaches the multiple, so a student who has
+        # answered all 103 clinical questions was told "20 of 21" forever.
+        f"Sets finished <b>{total_sets if answered >= total else answered // db.SET_SIZE}</b>"
+        f" of {total_sets}",
     ]
+    if streak >= 2:
+        lines.append(f"🔥 {streak} in a row right now")
+    if waiting:
+        plural = "" if waiting == 1 else "s"
+        lines.append(f"🔁 {waiting} question{plural} waiting in /review")
 
-    def _group(key) -> dict[str, list[int]]:
-        out: dict[str, list[int]] = {}
-        for row in rows:
-            name = key(row) or "(not labelled)"
-            bucket = out.setdefault(name, [0, 0])
-            bucket[0] += row["answered"]
-            bucket[1] += row["correct"]
-        return out
+    topics = _ranked(rows, lambda r: r["topic"])
+    if topics:
+        lines.append("\n<b>By topic</b>  <i>weakest first</i>")
+        lines += [_score_line(*t) for t in topics]
 
-    for heading, key in (("By topic", lambda r: r["topic"]),
-                         ("By question type", lambda r: r["tag"])):
-        grouped = _group(key)
-        if not grouped:
-            continue
-        # Weakest first: that is the list a student should actually act on.
-        ranked = sorted(grouped.items(), key=lambda kv: (kv[1][1] / kv[1][0], kv[0]))
-        lines.append(f"\n<b>{heading}</b>")
-        for name, (n, c) in ranked:
-            lines.append(f"{name}: {c}/{n}")
-        if len(ranked) > 1:
-            lines.append(f"Weakest here: {ranked[0][0]}")
+    # Question types are NOT ranked by accuracy, deliberately. `questions.tag` is
+    # close to a per-question label - 71 to 92 distinct types over 103 to 170
+    # questions, averaging 1.1 to 2.4 questions each - so "your weakest type is
+    # 0/1" is noise dressed up as a statistic. What is honest, and what a student
+    # can act on, is which kinds of question they have actually missed.
+    missed = sorted({(row["tag"] or "(not labelled)")
+                     for row in rows if row["answered"] > row["correct"]})
+    if missed:
+        shown = missed[:_TYPES_SHOWN]
+        lines.append("\n<b>Question types you have missed</b>")
+        lines += [esc(name) for name in shown]
+        rest = len(missed) - len(shown)
+        if rest:
+            lines.append(f"<i>and {rest} more. /review serves them back.</i>")
 
     await m.answer("\n".join(lines), parse_mode="HTML")
 
@@ -666,7 +1139,14 @@ async def tournament(m: Message):
 async def leaderboard(m: Message):
     rows = await db.leaderboard(limit=3)
     if rows is None:
-        return await m.answer("No tournament on right now.")
+        return await m.answer(
+            "🏆 No tournament running. When OphSoc starts one you are "
+            "entered automatically.\n\n"
+            "Meanwhile /quizme keeps your /stats moving.")
+    # Entry is automatic, so everyone sits on the board at zero the moment a
+    # tournament opens. Handing out medals for 0 pts made the race look over
+    # before it began, and buried the "nobody has scored yet" line below.
+    rows = [r for r in rows if r["points"] > 0]
     if not rows:
         return await m.answer("🏆 Nobody has scored yet. Set the pace with /quizme!")
 
@@ -676,7 +1156,7 @@ async def leaderboard(m: Message):
         for r in rows
     )
     mine = await db.my_rank(m.from_user.id)
-    if mine is None:
+    if mine is None or not mine["points"]:
         tail = "\n\nYou have no points yet. Answer some /quizme sets!"
     else:
         tail = f"\n\nYou're #{mine['rk']} with {_pts(mine['points'])}."
@@ -704,7 +1184,13 @@ async def admin_tournament_start(m: Message, bot: Bot):
         return
     if await db.active_tournament():
         return await m.answer("There's already a tournament running.")
-    tid = await db.start_tournament(jobs.TOURNAMENT_DAYS)
+    try:
+        tid = await db.start_tournament(jobs.TOURNAMENT_DAYS)
+    except UniqueViolationError:
+        # Two taps can both pass the check above before either inserts, which
+        # used to leave two live tournament rows and announce the thing twice.
+        # The partial unique index in schema.sql is what actually decides it.
+        return await m.answer("There's already a tournament running.")
     entrants = await db.enrol_everyone(tid)
     await m.answer(
         f"🏆 Tournament {tid} is live for {jobs.TOURNAMENT_DAYS} days. "
@@ -722,7 +1208,10 @@ async def admin_tournament_end(m: Message, bot: Bot):
         return await m.answer("No tournament running.")
     await m.answer(f"Closing tournament {t['id']} and messaging the top 3...")
     rows = await jobs.finish_tournament(bot, t["id"])
-    await m.answer(f"Done. {len(rows)} participant(s) scored.")
+    scored = sum(1 for r in rows if r["points"] > 0)
+    await m.answer(
+        f"Done. {scored} of {len(rows)} entrant(s) scored. "
+        "Only those are messaged about an award.")
 
 
 @router.message(Command("admin_weekly_now"))
@@ -731,14 +1220,23 @@ async def admin_weekly_now(m: Message, bot: Bot):
     if not _is_admin(m):
         return
     await m.answer("Sending this week's sets...")
-    sent = await jobs.weekly_quiz(bot)
-    await m.answer(f"Sent {sent} question(s).")
+    r = await jobs.weekly_quiz(bot)
+    # Spelled out because a bare total reads as one student's set: 3 subscribers
+    # times 5 questions is 15, which looked like a bug to the admin who saw it.
+    await m.answer(
+        f"Sent {r['sent']} question(s) in total: {jobs.SET_PER_PUSH} each to "
+        f"{r['reached']} of {r['subscribers']} subscriber(s).")
 
 
 @router.message(Command("admin_notes_now"))
 async def admin_notes_now(m: Message, bot: Bot):
     if not _is_admin(m):
         return
-    await m.answer("Sending the monthly sheets...")
-    sent = await jobs.monthly_notes(bot)
-    await m.answer(f"Sent {sent} document(s).")
+    await m.answer("Sending the fortnightly sheets...")
+    r = await jobs.fortnightly_notes(bot)
+    body = (f"Sent {r['sent']} sheet(s) in total: {jobs.SHEETS_PER_DROP} each to "
+            f"{r['reached']} of {r['subscribers']} subscriber(s).")
+    if r["finished"]:
+        body += (f"\n{r['finished']} had already had every sheet at their level, "
+                 "so they were congratulated and unsubscribed.")
+    await m.answer(body)

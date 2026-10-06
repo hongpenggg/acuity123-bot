@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot import db as real_db
-from bot import handlers, jobs
+from bot import handlers, jobs, sender
 
 #: Kept in step with bot.db.SET_SIZE; the fake mirrors the real set boundaries.
 SET_SIZE = real_db.SET_SIZE
@@ -72,9 +72,12 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self, data, user_id=1, message=None):
+    def __init__(self, data, user_id=1, message=None, bot=None):
         self.data = data
         self.message = message
+        # Handlers reach c.bot to send into the chat rather than only edit the
+        # card, so a test that wants to see that message has to supply one.
+        self.bot = bot
         self.from_user = SimpleNamespace(id=user_id, username="tester")
         self.answers = []
 
@@ -96,6 +99,9 @@ class FakeDB:
         self.notes = []
         self.calls = []
         self.streak = 0
+        self.delivered = {}        # (uid, level) -> {(tier, code), ...}
+        self.flags = {}            # (uid, column) -> bool
+        self.seq = 0
 
     # -- users
     async def upsert_user(self, uid, username):
@@ -109,6 +115,9 @@ class FakeDB:
 
     async def set_flag(self, uid, col, value):
         self.calls.append(("set_flag", uid, col, value))
+        # Stored as well as recorded: /changestreams reads a flag back to tell a
+        # push that ran out of content from one the student switched off.
+        self.flags[(uid, col)] = value
 
     async def deactivate(self, uid):
         self.users.pop(uid, None)
@@ -129,46 +138,85 @@ class FakeDB:
         return sorted((q for q in self.questions.values() if q["level"] == level),
                       key=lambda q: q["id"])
 
-    async def set_board(self, uid, level):
-        """Mirrors bot.db: consecutive blocks of five, in id order."""
-        questions = self._level_questions(level)
-        attempted = self._attempted_ids(uid)
-        correct = self._correct_ids(uid)
-        board = []
-        for index in range(0, len(questions), SET_SIZE):
-            chunk = questions[index:index + SET_SIZE]
-            board.append({
-                "set_no": index // SET_SIZE,
-                "size": len(chunk),
-                "answered": sum(1 for q in chunk if q["id"] in attempted),
-                "correct": sum(1 for q in chunk if q["id"] in correct),
-            })
-        return board
+    def _ordered_attempts(self, uid, level):
+        """Attempt records for this user at this level, oldest first."""
+        by_id = {q["id"]: q for q in self.questions.values()}
+        recs = [rec for (u, _), rec in self.attempts.items()
+                if u == uid and by_id.get(rec["qid"], {}).get("level") == level]
+        return sorted(recs, key=lambda r: r["seq"])
 
-    async def quiz_set(self, uid, level):
-        board = await self.set_board(uid, level)
-        current = next((b for b in board if b["answered"] < b["size"]), None)
-        if current is None:
+    async def answered_count(self, uid, level):
+        seen = {rec["qid"] for rec in self._ordered_attempts(uid, level)}
+        return len(seen)
+
+    async def level_total(self, level):
+        return len(self._level_questions(level))
+
+    async def current_set(self, uid, level):
+        total = len(self._level_questions(level))
+        answered = await self.answered_count(uid, level)
+        if total and answered >= total:
             return None
-        questions = self._level_questions(level)
-        chunk = questions[current["set_no"] * SET_SIZE:
-                          (current["set_no"] + 1) * SET_SIZE]
-        attempted = self._attempted_ids(uid)
-        return {**current, "number": current["set_no"] + 1,
-                "total_sets": len(board),
-                "questions": chunk,
-                "remaining": [q for q in chunk if q["id"] not in attempted]}
+        return {"number": answered // SET_SIZE + 1,
+                "answered_in_set": answered % SET_SIZE,
+                "size": SET_SIZE,
+                "total_sets": -(-total // SET_SIZE) if total else 0}
 
-    async def set_no_for(self, level, qid):
-        ids = [q["id"] for q in self._level_questions(level)]
-        return ids.index(qid) // SET_SIZE if qid in ids else 0
+    async def pick_question(self, uid, level, exclude=()):
+        """Stands in for the adaptive picker: anything unattempted, preferring a
+        topic not already in the current partial set, as the real one does.
 
-    async def set_score(self, uid, level, set_no):
-        board = await self.set_board(uid, level)
-        if not 0 <= set_no < len(board):
+        `exclude` is cards already in the air - the Monday push builds five
+        before any is answered, and sender keeps the last few per student - and
+        the real statement filters on it, so the fake has to as well or a test
+        sees a question production would never serve twice.
+        """
+        skip = self._attempted_ids(uid) | {int(qid) for qid in exclude}
+        pool = [q for q in self._level_questions(level) if q["id"] not in skip]
+        if not pool:
             return None
-        return {**board[set_no], "total_sets": len(board),
-                "total_questions": len(self._level_questions(level))}
+        answered = await self.answered_count(uid, level)
+        in_set = self._ordered_attempts(uid, level)[answered - answered % SET_SIZE:]
+        by_id = {q["id"]: q for q in self.questions.values()}
+        seen_topics = {by_id[r["qid"]]["topic"] for r in in_set if r["qid"] in by_id}
+        fresh = [q for q in pool if q.get("topic") not in seen_topics]
+        return (fresh or pool)[0]
+
+    async def last_set_score(self, uid, level):
+        recs = self._ordered_attempts(uid, level)
+        if len(recs) < SET_SIZE:
+            return None
+        window = recs[-SET_SIZE:]
+        return {"number": len(recs) // SET_SIZE,
+                "size": SET_SIZE,
+                "correct": sum(1 for r in window if r["correct"])}
+
+    async def wrong_questions(self, uid, level, limit=SET_SIZE):
+        by_id = {q["id"]: q for q in self.questions.values()}
+        latest = {}
+        for rec in self._ordered_attempts(uid, level):
+            latest[rec["qid"]] = rec["correct"]
+        missed = [qid for qid, ok in latest.items() if not ok]
+        return [by_id[qid] for qid in reversed(missed) if qid in by_id][:limit]
+
+    async def wrong_count(self, uid, level):
+        return len(await self.wrong_questions(uid, level, limit=10_000))
+
+    # -- note deliveries
+    async def record_notes_sent(self, uid, level, sheets):
+        for tier, code in sheets:
+            self.delivered.setdefault((uid, level), set()).add((tier, code))
+
+    async def notes_delivered(self, uid, level):
+        rows = self.delivered.get((uid, level), set())
+        return {"a": {c for t, c in rows if t == "a"},
+                "b": {c for t, c in rows if t == "b"}}
+
+    async def sent_note_codes(self, uid, level, tier):
+        return (await self.notes_delivered(uid, level))[tier]
+
+    async def reset_notes(self, uid, level):
+        return len(self.delivered.pop((uid, level), ()))
 
     async def stats(self, uid, level):
         by_id = {q["id"]: q for q in self.questions.values()}
@@ -200,10 +248,29 @@ class FakeDB:
         return self.streak
 
     async def record_attempt(self, uid, question, idx, correct, mode, msg_id):
+        """Both of the uniqueness rules bot.db.record_attempt relies on.
+
+        `unique (user_id, msg_id)` is what makes a double tap on one card
+        idempotent. `attempts_one_scoring_answer_idx` - unique
+        (user_id, question_id) where mode <> 'review' - is what stops two
+        *different* cards for the same question both being recorded, which is
+        reachable whenever a /quizme card is left unanswered and the Monday push
+        serves that question again. A review answer sits outside that index, so
+        re-answering through /review keeps working however often they do it.
+        """
         if (uid, msg_id) in self.attempts:
             return False
+        if mode != "review" and any(
+                user == uid and rec["qid"] == question["id"]
+                and rec["mode"] != "review"
+                for (user, _), rec in self.attempts.items()):
+            return False
+        # `seq` stands in for created_at: the new set model is "the Nth block of
+        # five answers", so the order attempts arrived in is what matters.
+        self.seq += 1
         self.attempts[(uid, msg_id)] = {"idx": idx, "correct": correct,
-                                        "qid": question["id"]}
+                                        "qid": question["id"], "mode": mode,
+                                        "seq": self.seq}
         return True
 
     # -- tournaments
@@ -279,7 +346,8 @@ class FakeDB:
         return [n for n in self.notes if n["level"] == level and n["tier"] == tier]
 
     async def subscribers(self, col):
-        return []
+        return sorted(uid for (uid, column), on in self.flags.items()
+                      if column == col and on)
 
 
 @pytest.fixture
@@ -288,6 +356,10 @@ def fake(monkeypatch):
     for name, value in vars(FakeDB).items():
         if callable(value) and not name.startswith("_"):
             monkeypatch.setattr(real_db, name, getattr(fake_db, name))
+    # sender keeps the cards it has served but not seen answered, keyed by user
+    # id and outliving any one test. Every test here is user 1, so a leftover
+    # entry would make the next test's /quizme refuse to serve a question.
+    sender._outstanding.clear()
     fake_db.bot = FakeBot()
     return fake_db
 
@@ -369,6 +441,27 @@ async def test_double_tap_is_idempotent(fake):
 
 
 @pytest.mark.asyncio
+async def test_a_second_scoring_card_for_one_question_is_refused(fake):
+    """A student can hold two live cards for the same question: a /quizme card
+    left unanswered, then the Monday push serving it again.
+
+    Only the first is recorded (attempts_one_scoring_answer_idx), so the second
+    card has to say so instead of scoring, re-reporting or redrawing itself.
+    """
+    add_question(fake, qid=1, correct_idx=0)
+    await handlers.on_answer(FakeCallback("a:1:0:practice",
+                                          message=FakeMessage(message_id=1)))
+
+    second = FakeMessage(message_id=2)
+    c = FakeCallback("a:1:0:weekly", message=second)
+    await handlers.on_answer(c)
+
+    assert c.answers[-1]["text"] == "You've already answered this one 👍"
+    assert second.edits == []
+    assert fake.points == {(1, 1): True}, "the question scored exactly once"
+
+
+@pytest.mark.asyncio
 async def test_unknown_question_id_does_not_hang(fake):
     c = FakeCallback("a:999:0:practice", message=FakeMessage())
 
@@ -389,6 +482,88 @@ async def test_malformed_callback_data_is_ignored(fake, data):
 
     assert c.answers
     assert fake.points == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["a:\u00b2:0:practice", "a:1:\u00b2:practice",
+                                  "a:\u0662:0:practice", "a:1_0:0:practice",
+                                  f"a:{2 ** 70}:0:practice",
+                                  f"a:{2 ** 31}:0:practice"])
+async def test_crafted_question_ids_never_reach_the_database(fake, monkeypatch, data):
+    """`isdigit()` is true for '²' and other non-decimal digits, which `int()`
+    then rejects, and questions.id is a `serial`, so an id wider than int4 is a
+    DataError out of asyncpg. Both ended as a logged exception and a bare ack:
+    the spinner stopped and the student was shown nothing at all."""
+    add_question(fake)
+
+    async def never(qid):
+        raise AssertionError(f"the database was queried with {qid!r}")
+
+    monkeypatch.setattr(real_db, "get_question", never)
+    c = FakeCallback(data, message=FakeMessage())
+
+    await handlers.on_answer(c)
+
+    assert c.answers == [{"text": None, "alert": False}]
+    assert fake.points == {}
+
+
+@pytest.mark.asyncio
+async def test_explain_ignores_a_crafted_question_id(fake, monkeypatch):
+    """The Explain button parsed its id the same unsafe way on_answer did."""
+
+    async def never(qid):
+        raise AssertionError(f"the database was queried with {qid!r}")
+
+    monkeypatch.setattr(real_db, "get_question", never)
+    c = FakeCallback("e:\u00b2", message=FakeMessage())
+
+    await handlers.on_explain(c, fake.bot)
+
+    assert c.answers == [{"text": None, "alert": False}]
+    assert fake.bot.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_shrunken_option_list_is_explained_not_ignored(fake):
+    """A question row can lose options after its card was sent, which puts a tap
+    that was in range for the card out of range for the row.
+
+    That ended in a bare ack: nothing recorded, no text, and every button still
+    live, so the student tapped and tapped and nothing ever happened.
+    """
+    from bot.sender import question_kb
+
+    add_question(fake, qid=1, n_options=5, correct_idx=0)
+    card = FakeMessage(reply_markup=question_kb(1, 5, "practice"))
+    fake.questions[1]["options"] = json.dumps(["only", "two"])
+
+    c = FakeCallback("a:1:4:practice", message=card)
+    await handlers.on_answer(c)
+
+    assert c.answers[-1]["alert"] is True
+    assert "not on this question any more" in c.answers[-1]["text"]
+    assert fake.attempts == {}, "an out-of-range pick must not be recorded"
+    assert card.markup_edits == [None], "the dead answer buttons are taken away"
+
+
+@pytest.mark.asyncio
+async def test_a_question_row_too_small_to_render_says_so(fake):
+    """Shrunk below the two-option floor, parse_options raises: that used to be a
+    logged exception and a bare ack, which looks identical to a dead button."""
+    from bot.sender import question_kb
+
+    add_question(fake, qid=1, n_options=5, correct_idx=0)
+    card = FakeMessage(reply_markup=question_kb(1, 5, "practice"))
+    fake.questions[1]["options"] = json.dumps(["alone"])
+
+    c = FakeCallback("a:1:0:practice", message=card)
+    await handlers.on_answer(c)
+
+    assert c.answers[-1]["alert"] is True
+    assert "wrong with that question" in c.answers[-1]["text"]
+    assert fake.attempts == {}
+    assert card.markup_edits == [None]
 
 
 @pytest.mark.asyncio
@@ -567,6 +742,86 @@ async def test_level_callback_rejects_unknown_value(fake):
     assert c.answers[-1]["alert"] is True
 
 
+async def _finished_preclin(fake):
+    """Put the student in the state the scheduled pushes switch themselves off
+    in: every preclinical sheet read and every preclinical question answered.
+    Clinical keeps its content, so switching there has something to send."""
+    from bot import resources
+
+    fake.users[1] = "preclin"
+    await real_db.record_notes_sent(
+        1, "preclin", [(n.tier, n.code) for n in resources.all_for("preclin")])
+    only = add_question(fake, qid=1, level="preclin", correct_idx=0)
+    await real_db.record_attempt(1, only, 0, True, "practice", msg_id=1)
+    add_question(fake, qid=2, level="clin", correct_idx=0)
+
+
+@pytest.mark.asyncio
+async def test_switching_stream_revives_a_push_that_ran_out_of_content(fake):
+    """Finishing a level switches both pushes off, and nothing turned them back on.
+
+    The fortnightly drop clears notes_sub once a student has had every sheet, and
+    the Monday push clears weekly_sub once they have answered every question,
+    both by design. But /changestreams to a level with 47 unread sheets left the
+    drop dead, with nothing to show the student why.
+    """
+    await _finished_preclin(fake)
+    fake.calls.clear()
+
+    picker = FakeMessage(text="the picker")
+    await handlers.set_level(FakeCallback("lv:clin", message=picker, bot=fake.bot))
+
+    assert ("set_flag", 1, "weekly_sub", True) in fake.calls
+    assert ("set_flag", 1, "notes_sub", True) in fake.calls
+    said = fake.bot.sent[-1]
+    assert "Monday question sets and fortnightly cheat sheets" in said["text"]
+    assert "finished Pre-Clinical" in said["text"]
+    assert "Clinical content waiting" in said["text"]
+    assert said["parse_mode"] == "HTML", "the confirmation carries markup"
+    # And they can turn them straight back off, which is how every other
+    # subscription confirmation works.
+    off = [b.callback_data for row in said["reply_markup"].inline_keyboard
+           for b in row]
+    assert off == ["sub:off:weekly", "sub:off:notes"]
+
+
+@pytest.mark.asyncio
+async def test_switching_stream_respects_a_deliberate_unsubscribe(fake):
+    """/stopmonthly is a choice, not an accident.
+
+    What tells the two apart is whether the level they are leaving still had
+    content: a push only switches itself off when there is nothing left to send.
+    """
+    fake.users[1] = "preclin"
+    add_question(fake, qid=1, level="preclin", correct_idx=0)
+    add_question(fake, qid=2, level="clin", correct_idx=0)
+    fake.calls.clear()
+
+    await handlers.set_level(FakeCallback("lv:clin", message=FakeMessage(),
+                                          bot=fake.bot))
+
+    assert [call for call in fake.calls if call[0] == "set_flag"] == []
+    assert "back on" not in fake.bot.sent[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_switching_stream_leaves_a_live_subscription_alone(fake):
+    """A subscription that is already on needs no repair, and writing it again
+    would be a pointless round trip on every stream switch."""
+    await _finished_preclin(fake)
+    await real_db.set_flag(1, "notes_sub", True)
+    fake.calls.clear()
+
+    await handlers.set_level(FakeCallback("lv:clin", message=FakeMessage(),
+                                          bot=fake.bot))
+
+    assert ("set_flag", 1, "weekly_sub", True) in fake.calls
+    assert ("set_flag", 1, "notes_sub", True) not in fake.calls
+    changed = fake.bot.sent[-1]["text"].split("🔔")[-1]
+    assert "Monday question sets stopped" in changed
+    assert "cheat sheets" not in changed, "only what actually changed is reported"
+
+
 @pytest.mark.asyncio
 async def test_tournament_reports_status_rather_than_joining(fake):
     """Entry is automatic now, so /tournament only reports. It must never remove
@@ -597,9 +852,13 @@ async def test_start_enters_a_running_tournament_automatically(fake):
 def _recorder():
     async def _answer(text, **kw):
         _answer.messages.append(text)
+        # Keyboards matter now that the sheet pickers are built per level, so the
+        # kwargs are kept alongside the text rather than dropped.
+        _answer.kwargs.append(kw)
         return SimpleNamespace(message_id=1)
 
     _answer.messages = []
+    _answer.kwargs = []
     return _answer
 
 
@@ -688,8 +947,60 @@ async def test_start_greets_by_name_and_escapes_it(fake):
     await handlers.start(msg, fake.bot)
 
     text = msg.answer.messages[-1]
-    assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b>")
+    assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b> This is the <b>LKC OphSoc Bot</b>.")
     assert "/quizme" in text and "Acuity Team" in text
+
+
+def test_html_is_never_sent_without_parse_mode():
+    """Copy rule: a message containing markup must declare parse_mode="HTML".
+
+    Telegram does not guess. Without it a student sees the literal characters
+    "<b>Revision sheets</b>", which is exactly what happened to RESOURCES_INTRO
+    the moment it gained a bold heading. Static rather than per-handler, so a new
+    message cannot slip through untested.
+    """
+    import ast
+    import re
+    from pathlib import Path as _Path
+
+    tag = re.compile(r"</?(?:b|i|code|pre|u|s|a)\b")
+    senders = ("answer", "edit_text", "send_message", "safe_send")
+    offenders = []
+
+    for path in sorted((_Path(__file__).resolve().parent.parent / "bot").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        # Module-level string constants, so a message held in one is checked at
+        # its send site rather than only where it is defined.
+        consts = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)):
+                try:
+                    value = ast.literal_eval(node.value)
+                except Exception:
+                    continue
+                if isinstance(value, str):
+                    consts[node.targets[0].id] = value
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            # `m.answer(...)` is an Attribute; bare `safe_send(...)` is a Name.
+            # Only checking the first let every safe_send call in bot/ through,
+            # and the tournament announcement shipped literal <b> tags to every
+            # user because of it.
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if name not in senders or "parse_mode" in {k.arg for k in node.keywords}:
+                continue
+            # safe_send(bot, uid, text); everything else takes the text first.
+            index = 2 if name == "safe_send" else 0
+            if len(node.args) <= index:
+                continue
+            source = ast.unparse(node.args[index])
+            if tag.search(consts.get(source, source)):
+                offenders.append(f"{path.name}:{node.lineno} {name}({source[:40]})")
+
+    assert offenders == [], offenders
 
 
 def test_no_em_dashes_in_anything_students_see():
@@ -751,11 +1062,72 @@ async def test_start_states_the_functions_and_the_level(fake):
 
     text = msg.answer.messages[-1]
     assert "Acuity Team" in text
+    assert "Zhong Han (Vice-Pres, LKC OphSoc 26/27)" in text
     assert "lkceye" in text
-    assert "WHAT THIS BOT DOES" in text
-    assert "3a." in text and "3b." in text
+    assert "Revision only, not clinical advice." in text
+    assert "<b>Functions</b>" in text
+    for item in ("<b>1. 🧠", "<b>2. 🗒", "<b>3. 📬"):
+        assert item in text, item
+    assert "Annual Eye Trivia Tournament" in text
     assert "Pre-Clinical" in text
     assert "/changestreams" in text
+    # The sets really are adaptive now (db.pick_question weights by per-topic
+    # accuracy), so the copy is allowed to claim it. This assertion used to run
+    # the other way, back when sets were a fixed block of five in id order.
+    assert "Adaptive" in text
+    assert "/review" in text
+
+
+@pytest.mark.asyncio
+async def test_welcome_only_names_commands_that_exist(fake):
+    """Every /command printed in the welcome has to be registered.
+
+    A draft of this copy advertised /subscribeqn, /subscribenotes, /unsub_qns
+    and /unsub_notes, none of which existed - a student tapping one would have
+    got silence. The welcome now uses the canonical names from commands.PUBLIC,
+    and this walks the router rather than a hand-kept list, so a renamed handler
+    fails here too.
+    """
+    import re
+
+    from aiogram.filters import Command
+
+    registered = set()
+    for handler in handlers.router.message.handlers:
+        for flt in handler.filters or ():
+            callback = getattr(flt, "callback", None)
+            if isinstance(callback, Command):
+                registered |= {str(c) for c in callback.commands}
+
+    msg = _chat_message()
+    await handlers.start(msg, fake.bot)
+    # (?<!<) so the closing "</b>" of an HTML tag is not read as a command.
+    mentioned = set(re.findall(r"(?<!<)/([a-z_]+)", msg.answer.messages[-1]))
+
+    assert mentioned, "the welcome should name some commands"
+    assert mentioned <= registered, f"not registered: {sorted(mentioned - registered)}"
+
+    # And they must be the canonical names, so the welcome and Telegram's own
+    # command menu read as one vocabulary rather than two sets of synonyms.
+    from bot import commands as cmds
+    menu = {c.command for c in cmds.PUBLIC}
+    assert mentioned <= menu, f"not in the menu: {sorted(mentioned - menu)}"
+
+
+@pytest.mark.asyncio
+async def test_help_adds_the_full_command_list(fake):
+    """The welcome names the headline commands; /help still lists everything, so
+    /stats and the sheet browsers stay reachable."""
+    from aiogram.filters import CommandObject
+
+    msg = _chat_message()
+    await handlers.start(msg, fake.bot,
+                         CommandObject(prefix="/", command="help", args=None))
+
+    text = msg.answer.messages[-1]
+    assert "All commands" in text
+    for cmd in ("/stats", "/topicalnotes", "/randomnotes", "/resources"):
+        assert cmd in text, cmd
 
 
 # ----------------------------------------------------------------- resources
@@ -787,12 +1159,103 @@ async def test_resources_by_code_sends_the_pdf_itself(fake):
 
 @pytest.mark.asyncio
 async def test_tapping_a_sheet_sends_it(fake):
-    c = FakeCallback("res:get:b:B14", message=FakeMessage())
+    fake.users[1] = "preclin"
+    c = FakeCallback("res:get:preclin:b:B14", message=FakeMessage())
 
     await handlers.resources_cb(c, fake.bot)
 
     assert c.answers, "the client spinner must always be closed"
     assert any("document" in m for m in fake.bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_a_sheet_button_from_another_stream_is_refused(fake):
+    """Codes repeat across levels, so a button drawn before the student switched
+    stream would otherwise hand over whatever carries that code at the new level,
+    silently, and mark it delivered so /notes skips it."""
+    fake.users[1] = "clin"
+    c = FakeCallback("res:get:preclin:b:B14", message=FakeMessage())
+
+    await handlers.resources_cb(c, fake.bot)
+
+    assert not any("document" in m for m in fake.bot.sent), "wrong level served"
+    assert any("switched stream" in (a.get("text") or "") for a in c.answers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail", ["abc", "", "²", "-5", "1_0",
+                                  "../../etc", "99999999999999999999"])
+async def test_res_page_never_crashes_on_its_callback_data(fake, tail):
+    """`int(parts[3])` raised on a non-numeric or empty page number, which logged
+    an exception, answered the callback a second time and left the tap doing
+    nothing visible: the student presses the arrow and the list never moves."""
+    fake.users[1] = "postmbbs"
+    card = FakeMessage()
+    c = FakeCallback(f"res:page:b:{tail}", message=card)
+
+    await handlers.resources_cb(c, fake.bot)
+
+    assert len(c.answers) == 1, "every callback path answers exactly once"
+    assert card.edits, "and the student gets a usable list back"
+    labels = [b.text for row in card.edits[-1]["reply_markup"].inline_keyboard
+              for b in row]
+    assert "1/4" in labels, labels
+
+
+@pytest.mark.asyncio
+async def test_res_page_still_turns_the_page(fake):
+    """The guard above must not flatten every page to the first one."""
+    fake.users[1] = "postmbbs"
+    card = FakeMessage()
+
+    await handlers.resources_cb(FakeCallback("res:page:b:2", message=card), fake.bot)
+
+    labels = [b.text for row in card.edits[-1]["reply_markup"].inline_keyboard
+              for b in row]
+    assert "3/4" in labels, labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["notes", "resources"])
+async def test_a_sheet_that_cannot_be_sent_is_never_silent(fake, monkeypatch, door):
+    """send_note returning False means neither the PDF nor the GitHub link got
+    through. /notes then returned without replying at all: zero sends, zero
+    replies, nothing recorded, and a student staring at absolute silence."""
+
+    async def nothing_gets_through(bot, uid, note):
+        return False
+
+    monkeypatch.setattr(handlers, "send_note", nothing_gets_through)
+    fake.users[1] = "preclin"
+    msg = _chat_message()
+
+    if door == "notes":
+        await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+    else:
+        await handlers.resources_cmd(msg, SimpleNamespace(args="B14"), fake.bot)
+
+    said = [m["text"] for m in fake.bot.sent if "text" in m] + msg.answer.messages
+    assert any("Could not send" in text for text in said), said
+    assert any("/resources" in text for text in said), said
+    assert fake.delivered == {}, "a sheet that never arrived stays in the queue"
+
+
+@pytest.mark.asyncio
+async def test_notes_does_not_congratulate_on_an_empty_catalogue(fake, monkeypatch):
+    """An empty queue means "nothing on disk" as well as "you have read them
+    all". Telling a student they finished a syllabus they were never sent a page
+    of is the one reading that cannot be true. /topicalnotes and /randomnotes
+    both guard this already."""
+    from bot import resources
+
+    monkeypatch.setitem(resources.CATALOGUE, "preclin", {"a": [], "b": []})
+    fake.users[1] = "preclin"
+    msg = _chat_message()
+
+    await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+
+    assert msg.answer.messages == ["No cheat sheets on disk for your level yet."]
+    assert not [m for m in fake.bot.sent if "document" in m]
 
 
 @pytest.mark.asyncio
@@ -805,13 +1268,87 @@ async def test_unknown_sheet_code_is_handled(fake):
 
 
 @pytest.mark.asyncio
-async def test_notes_falls_back_to_the_sheets_when_the_table_is_empty(fake):
-    """The notes table is empty; /notes must not dead-end."""
-    msg = _chat_message()
+async def test_notes_walks_overview_then_focused_then_congratulates(fake):
+    """/notes is a progression: every overview sheet, then every focused one,
+    then the syllabus-complete message, and never the same sheet twice."""
+    from bot import resources
 
+    fake.users[1] = "preclin"
+    overview = [n.path.name for n in resources.overview("preclin")]
+    focused = [n.path.name for n in resources.focused("preclin")]
+
+    handed = []
+    for _ in range(len(overview) + len(focused)):
+        msg = _chat_message()
+        await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+        handed.append([m for m in fake.bot.sent if "document" in m][-1]
+                      ["document"].path.name)
+
+    assert handed == overview + focused, "wrong order, or a sheet repeated"
+    assert len(set(handed)) == len(handed)
+
+    # One more and there is nothing left to send.
+    msg = _chat_message()
+    before = len([m for m in fake.bot.sent if "document" in m])
     await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
 
-    assert "Revision sheets" in msg.answer.messages[-1]
+    assert len([m for m in fake.bot.sent if "document" in m]) == before
+    assert "completed the notes" in msg.answer.messages[-1]
+    assert "Pre-Clinical syllabus" in msg.answer.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_sheet_pulled_by_hand_is_not_pushed_again(fake):
+    """/resources, /notes and the fortnightly drop share one delivery history, so
+    browsing to a sheet takes it out of the queue."""
+    from bot import resources
+
+    fake.users[1] = "preclin"
+    first = resources.overview("preclin")[0]
+
+    msg = _chat_message()
+    await handlers.resources_cmd(msg, SimpleNamespace(args=first.code), fake.bot)
+    msg = _chat_message()
+    await handlers.notes(msg, SimpleNamespace(args=None), fake.bot)
+
+    served = [m for m in fake.bot.sent if "document" in m][-1]
+    assert served["document"].path.name != first.path.name
+
+
+@pytest.mark.asyncio
+async def test_review_does_not_re_announce_a_finished_set(fake):
+    """A /review answer re-answers a question that already counted, so it must not
+    close a set again.
+
+    answered_count counts *distinct* questions, so it does not move on a
+    re-answer. Before this was guarded, a student sitting exactly on a set
+    boundary was congratulated with "Set N done" after every review answer.
+    """
+    for qid in range(1, SET_SIZE + 1):
+        add_question(fake, qid=qid, correct_idx=0)
+
+    # Answer a full set, the last one wrongly so it lands in the review pile.
+    messages = []
+    for qid in range(1, SET_SIZE + 1):
+        message = FakeMessage(message_id=qid)
+        messages.append(message)
+        wrong = qid == SET_SIZE
+        await handlers.on_answer(
+            FakeCallback(f"a:{qid}:{1 if wrong else 0}:practice", message=message))
+
+    reports = [r for msg in messages for r in msg.replies if "Set" in r["text"]]
+    assert len(reports) == 1, f"the set should close exactly once, got {len(reports)}"
+
+    # Now re-answer the missed one through the route /review actually serves:
+    # a fresh card, under `review` mode, which is the only mode exempt from
+    # attempts_one_scoring_answer_idx.
+    again = FakeMessage(message_id=99)
+    await handlers.on_answer(FakeCallback("a:5:0:review", message=again))
+
+    assert fake.attempts[(1, 99)]["mode"] == "review", "the re-answer was recorded"
+
+    assert not [r for r in again.replies if "Set" in r["text"]], (
+        "a review answer must not announce the set again")
 
 
 # ------------------------------------------------------------- sets of five
@@ -880,6 +1417,53 @@ async def test_finishing_a_set_reports_the_score(fake):
 
 
 @pytest.mark.asyncio
+async def test_a_set_closed_by_the_monday_push_is_reported(fake):
+    """A weekly answer fills a set slot, so it can be the fifth of a set.
+
+    db.answered_count counts every first answer, whatever door it came through,
+    and the report fires on that count crossing a multiple of five - which
+    happens exactly once. Gating the report on /quizme therefore did not delay
+    the score, it destroyed it: the student answered five questions and was
+    never told how the set went.
+    """
+    questions = _set_of_five(fake)
+    fake.users[1] = "preclin"
+    for offset, question in enumerate(questions[:4]):
+        await real_db.record_attempt(1, question, 0, True, "practice",
+                                     msg_id=100 + offset)
+
+    message = FakeMessage()
+    await handlers.on_answer(FakeCallback(f"a:{questions[4]['id']}:1:weekly",
+                                          message=message))
+
+    reported = "\n".join(reply["text"] for reply in message.replies)
+    assert "Set 1 of 1" in reported, message.replies
+    assert "score <b>4/5</b>" in reported, message.replies
+    assert fake.points == {}, "and the Monday set still scores no tournament points"
+
+
+@pytest.mark.asyncio
+async def test_a_review_answer_never_closes_a_set(fake):
+    """/review is excluded by mode as well as by the count.
+
+    A re-answer cannot move answered_count, so this is belt and braces, but it is
+    the pin that keeps "report the weekly push too" from turning into "report
+    every answer".
+    """
+    questions = _set_of_five(fake)
+    fake.users[1] = "preclin"
+    for offset, question in enumerate(questions[:4]):
+        await real_db.record_attempt(1, question, 0, True, "practice",
+                                     msg_id=100 + offset)
+
+    message = FakeMessage()
+    await handlers.on_answer(FakeCallback(f"a:{questions[4]['id']}:0:review",
+                                          message=message))
+
+    assert not [r for r in message.replies if "Set" in r["text"]], message.replies
+
+
+@pytest.mark.asyncio
 async def test_a_partly_answered_set_does_not_report_a_score(fake):
     questions = _set_of_five(fake)
     fake.users[1] = "preclin"
@@ -923,11 +1507,23 @@ async def test_stats_breaks_the_running_total_down(fake):
     await handlers.stats_cmd(msg)
 
     text = msg.answer.messages[-1]
-    assert "Correct: 2 of 3 (67%)" in text
-    assert "Optics: 1/2" in text
-    assert "Retina: 1/1" in text
-    assert "Weakest here: Optics" in text
-    assert "Physiology | optics: 1/2" in text, "broken down by question type too"
+    assert "Correct <b>2</b> of 3 (67%)" in text
+    # Topics are ranked by accuracy, weakest first, with the percentage spelled
+    # out: there are only 6 to 18 of them per level and each carries enough
+    # answers for a percentage to mean something.
+    assert "Optics \u00b7 1/2 (50%)" in text
+    assert "Retina \u00b7 1/1 (100%)" in text
+    assert text.index("Optics \u00b7") < text.index("Retina \u00b7"), "weakest first"
+
+    # Question types are listed, NOT ranked. `questions.tag` is close to a
+    # per-question label (71 to 92 distinct types over 103 to 170 questions), so
+    # a percentage on one of them would be fake precision. What the student gets
+    # is which kinds of question they actually missed.
+    assert "Question types you have missed" in text
+    assert "Physiology | optics" in text
+    assert "Pathology | retina" not in text, "they got that one right"
+    assert "%)" not in text.split("Question types you have missed")[1], (
+        "a type with one or two answers must not be given a percentage")
 
 
 @pytest.mark.asyncio
@@ -957,18 +1553,123 @@ async def test_randomnotes_never_sends_a_reserved_sheet(fake):
         sent = [m for m in fake.bot.sent if "document" in m]
         seen.add(sent[-1]["document"].path.name)
 
-    reserved = {note.path.name for note in resources.MONTHLY}
+    # The fake user's level is preclin, which is the only level with a curated
+    # monthly reserve today.
     assert seen, "a sheet should have been sent"
-    assert not (seen & reserved), seen & reserved
+    # Nothing is reserved any more: deliveries are tracked, so the guarantee is
+    # simply that /randomnotes never hands over the same sheet twice.
+    assert len(seen) == len(resources.focused("preclin")), (
+        "every focused sheet should come round exactly once")
 
 
 @pytest.mark.asyncio
-async def test_monthly_subscription_reports_what_it_sends(fake):
+@pytest.mark.parametrize("level,prefix", [("preclin", "B"), ("clin", "B"),
+                                          ("postmbbs", "B")])
+async def test_randomnotes_serves_the_students_own_level(fake, level, prefix):
+    """Codes repeat across levels, so the only proof a sheet came from the right
+    place is its path. A clinical student must never be handed a preclinical
+    sheet."""
+    from bot import resources
+
+    fake.users[1] = level
     msg = _chat_message()
 
-    await handlers.monthlynotes(msg)
+    await handlers.randomnotes(msg, SimpleNamespace(args=None), fake.bot)
+
+    sent = [m for m in fake.bot.sent if "document" in m][-1]
+    path = sent["document"].path.as_posix()
+    assert f"/notes/{level}/tier_b/" in path, path
+    assert path.rsplit("/", 1)[-1].startswith(prefix)
+    assert sent["document"].path.name in {
+        n.path.name for n in resources.focused(level)}
+
+
+@pytest.mark.asyncio
+async def test_topicalnotes_lists_the_students_own_level(fake):
+    """The overview picker is built from the student's level, so the clinical
+    student sees C01-C07 and the post-MBBS student A01-A15."""
+    from bot import resources
+
+    for level, expected in (("preclin", "01"), ("clin", "C01"),
+                            ("postmbbs", "A01")):
+        fake.users[1] = level
+        msg = _chat_message()
+
+        await handlers.topicalnotes(msg, SimpleNamespace(args=None), fake.bot)
+
+        keyboard = msg.answer.kwargs[-1]["reply_markup"].inline_keyboard
+        labels = [b.text for row in keyboard for b in row]
+        assert any(label.startswith(expected) for label in labels), (level, labels)
+        # and nothing from another level leaked in
+        own = {n.label for n in resources.overview(level)}
+        assert {lab for lab in labels if lab != "⬅ Back"} <= own
+
+
+@pytest.mark.asyncio
+async def test_a_code_resolves_to_the_students_own_level(fake):
+    """B01 exists at all three levels. Whichever one the student is on is the one
+    they must get."""
+    paths = {}
+    for level in ("preclin", "clin", "postmbbs"):
+        fake.users[1] = level
+        msg = _chat_message()
+        await handlers.resources_cmd(msg, SimpleNamespace(args="B01"), fake.bot)
+        sent = [m for m in fake.bot.sent if "document" in m][-1]
+        paths[level] = sent["document"].path.as_posix()
+
+    for level, path in paths.items():
+        assert f"/notes/{level}/tier_b/" in path, path
+    assert len(set(paths.values())) == 3, "the same file was served three times"
+
+
+@pytest.mark.asyncio
+async def test_subscribenotes_does_not_claim_you_read_an_empty_catalogue(fake, monkeypatch):
+    """An empty catalogue and a finished one both leave nothing unsent, so the
+    "you have already had every sheet" branch was telling a student who had
+    received none that they had read them all."""
+    from bot import resources
+
+    monkeypatch.setattr(resources, "unsent", lambda *a, **k: [])
+    monkeypatch.setattr(resources, "all_for", lambda *a, **k: [])
+    fake.users[1] = "preclin"
+    msg = _chat_message()
+
+    await handlers.subscribenotes(msg)
 
     text = msg.answer.messages[-1]
-    assert "overview sheets" in text
-    assert "focused ones" in text
+    assert "no Pre-Clinical cheat sheets on disk yet" in text
+    assert "already had every" not in text
+    assert ("set_flag", 1, "notes_sub", True) in fake.calls, "still subscribed"
+
+
+@pytest.mark.asyncio
+async def test_notes_subscription_reports_what_is_left_for_this_student(fake):
+    from bot import resources
+
+    fake.users[1] = "preclin"
+    msg = _chat_message()
+
+    await handlers.subscribenotes(msg)
+
+    text = msg.answer.messages[-1]
+    assert "1st and the 15th" in text
+    assert str(len(resources.all_for("preclin"))) in text, "should count what is left"
     assert ("set_flag", 1, "notes_sub", True) in fake.calls
+    # The confirmation carries its own off switch, since the stop command is not
+    # in the menu.
+    keyboard = msg.answer.kwargs[-1]["reply_markup"].inline_keyboard
+    assert any(b.callback_data == "sub:off:notes"
+               for row in keyboard for b in row)
+
+
+@pytest.mark.asyncio
+async def test_the_off_button_turns_a_subscription_off(fake):
+    c = SimpleNamespace(data="sub:off:notes",
+                        from_user=SimpleNamespace(id=1, username="t"),
+                        message=SimpleNamespace(answer=_recorder(),
+                                                reply_markup=None),
+                        answer=_recorder(), bot=fake.bot)
+
+    await handlers.sub_off(c)
+
+    assert ("set_flag", 1, "notes_sub", False) in fake.calls

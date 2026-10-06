@@ -1,21 +1,50 @@
 """The revision-note PDFs under resources/notes, and how a student gets one.
 
+Sheets are **per audience level**, exactly like the question banks, so a
+Post-MBBS student is never handed a preclinical sheet:
+
+```
+resources/notes/
+  preclin/tier_a/   01-06     preclin/tier_b/   B01-B20
+  clin/tier_a/      C01-C07   clin/tier_b/      B01-B40
+  postmbbs/tier_a/  A01-A15   postmbbs/tier_b/  B01-B65
+```
+
+Note that a bare code is only unique *within* a level - `B01` exists in all
+three - so every lookup here takes a level. Getting that wrong is how a clinical
+student ends up with a preclinical sheet, which is why there is no level-free
+accessor left in this module.
+
 Two *kinds* of sheet. The folders and code names are the content team's
-("tier_a" / "tier_b", ``01``-``06`` / ``B01``-``B20``), but students are never
-shown "Tier A" or "Tier B" - they see what the sheet actually is:
+("tier_a" / "tier_b"), but students are never shown "Tier A" or "Tier B" - they
+see what the sheet actually is:
 
-* **Overview** - one broad sheet per topic (``01``-``06``).
-* **Focused** - a deeper sheet on a single point (``B01``-``B20``).
+* **Overview** - one broad sheet per topic.
+* **Focused** - a deeper sheet on a single point.
 
-The monthly drop sends the six overview sheets plus six focused sheets that are
-reserved for it (:data:`MONTHLY_CODES`, one per overview topic). ``/randomnotes``
-draws from the *rest* of the focused sheets, so the monthly bundle is not made up
-of things students have already been handed at random.
+Clinical sheets arrived named `B01_Clinical_Type_B_...`; that shorthand was
+stripped when they were imported, because it would otherwise have been shown to
+students verbatim. Clinical overview sheets were renamed to the seven clinical
+question topics, so the overview sheets and the bank describe the same seven
+things (asserted by tests/test_resources.py).
+
+Who gets which sheet is **not** decided here. A student's delivery history lives
+in the database (``db.notes_delivered``), so ``/notes`` can walk them through the
+overview sheets and then the focused ones, ``/randomnotes`` can avoid repeating
+itself, and the fortnightly drop can work through the focused catalogue. This
+module only answers "what sheets exist at this level"; the caller passes in what
+has already been sent.
+
+That replaced an earlier scheme where six focused sheets were reserved for the
+monthly drop and ``/randomnotes`` drew from the other fourteen. Tracking
+deliveries properly makes a reserved subset unnecessary: nothing is ever sent
+twice, at any level, without needing a curated list per level.
 
 The catalogue is built by **scanning the directory**, not hard-coded, so adding a
-note is: drop the PDF in, commit it. No code change, no database row. A test
-asserts the catalogue matches what is actually on disk, so a commit that breaks
-the naming convention fails CI rather than silently hiding a sheet from students.
+note is: drop the PDF in the right level folder, commit it. No code change, no
+database row. A test asserts the catalogue matches what is actually on disk, so a
+commit that breaks the naming convention fails CI rather than silently hiding a
+sheet from students.
 
 Delivery: the files are served straight from the deployed working copy, so
 Telegram receives the real document and nothing needs hosting. If a file is
@@ -26,10 +55,11 @@ from __future__ import annotations
 
 import random
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import REPO_REF, REPO_SLUG
+from .config import DEFAULT_LEVEL, LEVELS, REPO_REF, REPO_SLUG
 
 ROOT = Path(__file__).resolve().parent.parent
 NOTES_DIR = ROOT / "resources" / "notes"
@@ -40,7 +70,7 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # Student-facing names. Never "Tier A"/"Tier B" - that is internal shorthand.
 TIERS: dict[str, str] = {"a": "Overview", "b": "Focused"}
 
-# "01_Development_and_ocular_histology" / "B14_Saccades_and_the_VOR"
+# "01_Development_and_ocular_histology", "C03_Glaucoma", "B14_Saccades_and_the_VOR"
 _CODE_RE = re.compile(r"^(?P<code>[A-Z]{0,2}\d{1,2})_(?P<topic>.+)$")
 
 
@@ -48,8 +78,9 @@ _CODE_RE = re.compile(r"^(?P<code>[A-Z]{0,2}\d{1,2})_(?P<topic>.+)$")
 class Note:
     """One note PDF on disk."""
 
+    level: str         # "preclin", "clin" or "postmbbs"
     tier: str          # "a" or "b"
-    code: str          # "03" or "B14"
+    code: str          # "03", "C03" or "B14"
     topic: str         # "Optics and visual transduction"
     path: Path
 
@@ -72,8 +103,8 @@ class Note:
 
     @property
     def url(self) -> str:
-        """A GitHub page a student can open in a browser, with the tier folder
-        visible so it maps onto the same names they see in Telegram."""
+        """A GitHub page a student can open in a browser, with the level and tier
+        folders visible so it maps onto the same names they see in Telegram."""
         return f"https://github.com/{REPO_SLUG}/blob/{REPO_REF}/{self.relpath}"
 
     @property
@@ -84,9 +115,9 @@ class Note:
                 f"{REPO_REF}/{self.relpath}")
 
 
-def _scan(tier: str) -> list[Note]:
-    """Every well-named PDF in a tier directory, in code order."""
-    directory = NOTES_DIR / f"tier_{tier}"
+def _scan(level: str, tier_code: str) -> list[Note]:
+    """Every well-named PDF in one level's tier directory, in code order."""
+    directory = NOTES_DIR / level / f"tier_{tier_code}"
     if not directory.is_dir():
         return []
     notes: list[Note] = []
@@ -94,58 +125,109 @@ def _scan(tier: str) -> list[Note]:
         match = _CODE_RE.match(path.stem)
         if not match:
             continue          # ignore anything that is not `CODE_Topic.pdf`
-        notes.append(Note(tier=tier,
+        notes.append(Note(level=level,
+                          tier=tier_code,
                           code=match.group("code"),
                           topic=match.group("topic").replace("_", " "),
                           path=path))
     return notes
 
 
-TIER_A: list[Note] = _scan("a")
-TIER_B: list[Note] = _scan("b")
-ALL: list[Note] = TIER_A + TIER_B
+#: level -> tier -> sheets. Built once at import, by scanning the directory.
+CATALOGUE: dict[str, dict[str, list[Note]]] = {
+    level: {tier_code: _scan(level, tier_code) for tier_code in TIERS}
+    for level in LEVELS
+}
 
-#: Tier A topics are the same six topics the question bank is built around.
-TIER_A_TOPICS: list[str] = [note.topic for note in TIER_A]
-
-#: The focused sheets held back for the monthly drop: one per overview topic, so
-#: the bundle reads as a complete pass over the course rather than a random grab.
-MONTHLY_CODES: tuple[str, ...] = ("B02", "B05", "B08", "B13", "B15", "B17")
-
-#: What `/monthlynotes` sends, in code order.
-MONTHLY: list[Note] = [note for note in TIER_B if note.code in MONTHLY_CODES]
-
-#: What `/randomnotes` draws from: every focused sheet the monthly drop does not.
-RANDOM_POOL: list[Note] = [note for note in TIER_B
-                           if note.code not in MONTHLY_CODES]
+def _lv(level: str | None) -> str:
+    """Levels come from the database, so treat anything unknown as the default
+    rather than raising inside a handler."""
+    return level if level in CATALOGUE else DEFAULT_LEVEL
 
 
-def random_focused(rng: random.Random | None = None) -> Note | None:
-    """One focused sheet, excluding the ones reserved for the monthly drop."""
-    if not RANDOM_POOL:
+def tier(level: str | None, tier_code: str) -> list[Note]:
+    """One kind of sheet at one level."""
+    return CATALOGUE[_lv(level)].get(tier_code.lower(), [])
+
+
+def overview(level: str | None) -> list[Note]:
+    return tier(level, "a")
+
+
+def focused(level: str | None) -> list[Note]:
+    return tier(level, "b")
+
+
+def all_for(level: str | None) -> list[Note]:
+    return overview(level) + focused(level)
+
+
+def topics(level: str | None) -> list[str]:
+    """The topics the overview sheets cover at this level, in code order."""
+    return [note.topic for note in overview(level)]
+
+
+def unsent(level: str | None, tier_code: str,
+           already: Collection[str] = ()) -> list[Note]:
+    """Sheets of one kind this student has not been sent, in code order.
+
+    `already` is the set of codes from `db.notes_delivered`. Kept as a plain
+    argument rather than a database call so this module stays free of db imports
+    and testable without a database.
+    """
+    seen = {code.lower() for code in already}
+    return [note for note in tier(level, tier_code)
+            if note.code.lower() not in seen]
+
+
+def next_unsent(level: str | None, tier_code: str,
+                already: Collection[str] = ()) -> Note | None:
+    """The next sheet of one kind to hand over, in code order, or None when this
+    student has had them all."""
+    remaining = unsent(level, tier_code, already)
+    return remaining[0] if remaining else None
+
+
+def random_focused(level: str | None, already: Collection[str] = (),
+                   rng: random.Random | None = None) -> Note | None:
+    """One focused sheet at random that this student has not been sent.
+
+    Returns None once they have had every focused sheet at their level, which is
+    what lets the caller congratulate them instead of repeating one.
+    """
+    pool = unsent(level, "b", already)
+    if not pool:
         return None
-    return (rng or random).choice(RANDOM_POOL)
+    return (rng or random).choice(pool)
 
 
-def tier(code: str) -> list[Note]:
-    return TIER_A if code.lower() == "a" else TIER_B
-
-
-def find(code: str) -> Note | None:
-    """Look a sheet up by its code, accepting 'B14', 'b14' and '14'."""
+def find(level: str | None, code: str) -> Note | None:
+    """Look a sheet up by its code within a level, accepting 'B14', 'b14' and
+    '14'. Codes repeat across levels, so this never searches outside one."""
     wanted = code.strip().lower()
-    for note in ALL:
+    if not wanted:
+        return None
+    pool = all_for(level)
+    for note in pool:
         if note.code.lower() == wanted:
             return note
-    loose = wanted.lstrip("b").lstrip("0")
-    for note in ALL:
-        if note.code.lower().lstrip("b").lstrip("0") == loose:
+    # A bare number matches whichever code carries it, so "14" still finds "B14".
+    # A query that spells out a letter prefix is taken literally: "C01" is a
+    # clinical code and must not fall through to the preclinical "01".
+    if not wanted.isdigit():
+        return None
+    loose = wanted.lstrip("0")
+    if not loose:
+        return None
+    for note in pool:
+        if re.sub(r"^[a-z]+", "", note.code.lower()).lstrip("0") == loose:
             return note
     return None
 
 
-def get(tier_code: str, code: str) -> Note | None:
-    """Exact lookup inside one tier. Callback data always carries both, so there
-    is no need to guess which tier a bare code belongs to."""
+def get(level: str | None, tier_code: str, code: str) -> Note | None:
+    """Exact lookup inside one level and one kind. Callback data carries both, so
+    there is no need to guess which kind a bare code belongs to."""
     wanted = code.strip().lower()
-    return next((n for n in tier(tier_code) if n.code.lower() == wanted), None)
+    return next((n for n in tier(level, tier_code) if n.code.lower() == wanted),
+                None)
