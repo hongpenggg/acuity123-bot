@@ -1,0 +1,213 @@
+From 6b65a17f5b1a28fe1494c2bc7954e9fa15c7d417 Mon Sep 17 00:00:00 2001
+From: Jeromy <jeromytann@gmail.com>
+Date: Tue, 6 Oct 2026 09:40:58 +0800
+Subject: [PATCH] Use the society's wording for the /start welcome
+
+Replaces the welcome copy with ZH's version and registers the command
+names it advertises, so none of them answers with silence:
+
+  /subscribeqn  -> same handler as /weeklyquiz
+  /unsub_qns    -> same handler as /stopweekly
+  /unsub_notes  -> same handler as /stopmonthly
+  /practice was already an alias of /quizme.
+
+The welcome no longer lists /review, /stats or /resources; /help still
+does. The "->" arrows are escaped as -&gt; because the message is sent as
+HTML.
+
+test_welcome_only_names_commands_that_exist still requires every command
+in the welcome to be registered, but no longer requires it to be in the
+menu, since the society's names are aliases. A new test checks each alias
+reaches the same handler as the command it stands for.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nuc625m5Lx4uuL3GmgUgMZ
+---
+ bot/handlers.py        | 47 ++++++++++++++++++++----------------------
+ tests/test_handlers.py | 42 +++++++++++++++++++++++++------------
+ 2 files changed, 51 insertions(+), 38 deletions(-)
+
+diff --git a/bot/handlers.py b/bot/handlers.py
+index bc0d8c7..4c88442 100644
+--- a/bot/handlers.py
++++ b/bot/handlers.py
+@@ -50,35 +50,32 @@ _MAX_QUESTION_ID = 2 ** 31 - 1
+ 
+ TAGLINE = (
+     "Your high-yield, one-stop ophthalmology hub for medical students and "
+-    "residents, anytime, anywhere. 🤩"
++    "residents - anytime, anywhere. 🤩"
+ )
+ 
+-# The welcome's numbered list.
++# The welcome's numbered list, worded by the society (ZH).
+ #
+ # Every claim here has to be something the code actually does, and every command
+-# named has to be one of the canonical names in commands.PUBLIC, so the welcome
+-# and Telegram's own command menu read as one vocabulary. Two tests enforce that
+-# (test_welcome_only_names_commands_that_exist) and the no-em-dash copy rule.
++# it names has to be registered, or a student who taps it gets silence.
++# test_welcome_only_names_commands_that_exist walks the router to enforce that.
++# The welcome uses the society's names (/practice, /subscribeqn, /unsub_qns,
++# /unsub_notes); they are aliases of /quizme, /weeklyquiz, /stopweekly and
++# /stopmonthly, so either spelling works.
+ #
+-# The older aliases (/practice, /subscribe, /notes_sub, /topicalnotes ...) still
+-# work for anyone who has them in their chat history; they are just not
+-# advertised here or in the menu.
++# "->" is written as "-&gt;": the welcome is sent as HTML, and Telegram's HTML
++# mode wants a literal ">" escaped.
+ FUNCTIONS = (
+     "<b>Functions</b>\n"
+     "<b>1. 🧠 Adaptive MCQs</b>\n"
+-    "Sets of five, spread across topics and weighted towards the ones you keep "
+-    "getting wrong. /quizme\n"
+-    "Redo your wrong answers: /review\n"
+-    "Your weakest topics, ranked: /stats\n"
++    "5-question sets that revisit your weaker topics until they stick. /practice\n"
+     "<b>2. 🗒 High-Yield Cheat Sheets</b>\n"
+-    "Quick summaries, flowcharts, clinical approaches, one at a time. /notes\n"
+-    "Jump to any sheet by code or topic: /resources\n"
++    "Quick summaries, flowcharts, clinical approaches. /notes\n"
+     "<b>3. 📬 Be Consistent Automatically</b>\n"
+-    "A question set every Monday -> /weeklyquiz\n"
+-    "Cheat sheets every fortnight -> /subscribenotes\n\n"
++    "Weekly questions -&gt; /subscribeqn\n"
++    "Fortnightly notes -&gt; /subscribenotes\n\n"
+     "<b>🏆 Annual Eye Trivia Tournament</b>\n"
+     "Compete for prizes! /tournament /leaderboard\n\n"
+-    "<b>Start now!</b> /quizme"
++    "<b>Start now!</b> /practice"
+ )
+ 
+ HELP = (
+@@ -223,16 +220,16 @@ def welcome(user, level: str | None) -> str:
+     """The /start screen. Greets by the sender's own first name, which Telegram
+     supplies on every message, and falls back to a bare hello when it does not."""
+     name = getattr(user, "first_name", None)
+-    hello = (f"👋 <b>Hi {esc(name)}!</b> This is the <b>LKC OphSoc Bot</b>."
+-             if name else "👋 <b>Hi! This is the LKC OphSoc Bot.</b>")
++    hello = (f"👋 <b>Hi {esc(name)} - this is LKC OphSoc Bot!</b>"
++             if name else "👋 <b>Hi - this is LKC OphSoc Bot!</b>")
+     lv = _level(level)
+     return (
+         f"{hello}\n"
+         f"{TAGLINE}\n\n"
+         f"{FUNCTIONS}\n\n"
+         f"Level: {LEVEL_EMOJI[lv]} <b>{LEVELS[lv]}</b>\n"
+-        "Choose below 👇 or use /changestreams. Your questions and sheets both "
+-        "follow it.\n\n"
++        "Choose below 👇 or use /changestreams\n"
++        "Unsubscribe: /unsub_qns ; /unsub_notes\n\n"
+         f"<i>{esc(CREDIT)} {esc(DISCLAIMER)}</i>"
+     )
+ 
+@@ -724,12 +721,12 @@ async def sub_off(c: CallbackQuery):
+             await ack(c)
+ 
+ 
+-@router.message(Command("weeklyquiz", "subscribe"))
++@router.message(Command("weeklyquiz", "subscribe", "subscribeqn"))
+ async def weeklyquiz(m: Message):
+     """The Monday set of five.
+ 
+     `/subscribe` stays as an alias so an older message in a student's chat still
+-    does what it says.
++    does what it says. `/subscribeqn` is the name the welcome advertises.
+     """
+     await db.upsert_user(m.from_user.id, m.from_user.username)
+     await db.set_flag(m.from_user.id, "weekly_sub", True)
+@@ -741,7 +738,7 @@ async def weeklyquiz(m: Message):
+     )
+ 
+ 
+-@router.message(Command("stopweekly", "unsubscribe"))
++@router.message(Command("stopweekly", "unsubscribe", "unsub_qns"))
+ async def stopweekly(m: Message):
+     # upsert first, otherwise the flag write hits no rows and the confirmation lies.
+     await db.upsert_user(m.from_user.id, m.from_user.username)
+@@ -955,7 +952,7 @@ async def subscribenotes(m: Message):
+     await m.answer(body, reply_markup=_sub_off_kb("notes"))
+ 
+ 
+-@router.message(Command("stopmonthly", "notes_unsub", "unsubscribenotes"))
++@router.message(Command("stopmonthly", "notes_unsub", "unsubscribenotes", "unsub_notes"))
+ async def subscribenotes_off(m: Message):
+     await db.upsert_user(m.from_user.id, m.from_user.username)
+     await db.set_flag(m.from_user.id, "notes_sub", False)
+diff --git a/tests/test_handlers.py b/tests/test_handlers.py
+index 1d63c6d..4a38e8d 100644
+--- a/tests/test_handlers.py
++++ b/tests/test_handlers.py
+@@ -947,8 +947,8 @@ async def test_start_greets_by_name_and_escapes_it(fake):
+     await handlers.start(msg, fake.bot)
+ 
+     text = msg.answer.messages[-1]
+-    assert text.startswith("👋 <b>Hi &lt;Zay&gt;!</b> This is the <b>LKC OphSoc Bot</b>.")
+-    assert "/quizme" in text and "Acuity Team" in text
++    assert text.startswith("👋 <b>Hi &lt;Zay&gt; - this is LKC OphSoc Bot!</b>")
++    assert "/practice" in text and "Acuity Team" in text
+ 
+ 
+ def test_html_is_never_sent_without_parse_mode():
+@@ -1075,18 +1075,22 @@ async def test_start_states_the_functions_and_the_level(fake):
+     # accuracy), so the copy is allowed to claim it. This assertion used to run
+     # the other way, back when sets were a fixed block of five in id order.
+     assert "Adaptive" in text
+-    assert "/review" in text
++    for cmd in ("/practice", "/notes", "/subscribeqn", "/subscribenotes",
++                "/unsub_qns", "/unsub_notes"):
++        assert cmd in text, cmd
++    # Sent as HTML, so the arrows must be escaped or Telegram can reject the
++    # whole message.
++    assert "-&gt; /subscribeqn" in text and "->" not in text
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_welcome_only_names_commands_that_exist(fake):
+     """Every /command printed in the welcome has to be registered.
+ 
+-    A draft of this copy advertised /subscribeqn, /subscribenotes, /unsub_qns
+-    and /unsub_notes, none of which existed - a student tapping one would have
+-    got silence. The welcome now uses the canonical names from commands.PUBLIC,
+-    and this walks the router rather than a hand-kept list, so a renamed handler
+-    fails here too.
++    An earlier draft of this copy advertised /subscribeqn, /unsub_qns and
++    /unsub_notes before any of them existed - a student tapping one would have
++    got silence. They are now registered aliases, and this walks the router
++    rather than a hand-kept list, so a renamed handler fails here too.
+     """
+     import re
+ 
+@@ -1107,11 +1111,23 @@ async def test_welcome_only_names_commands_that_exist(fake):
+     assert mentioned, "the welcome should name some commands"
+     assert mentioned <= registered, f"not registered: {sorted(mentioned - registered)}"
+ 
+-    # And they must be the canonical names, so the welcome and Telegram's own
+-    # command menu read as one vocabulary rather than two sets of synonyms.
+-    from bot import commands as cmds
+-    menu = {c.command for c in cmds.PUBLIC}
+-    assert mentioned <= menu, f"not in the menu: {sorted(mentioned - menu)}"
++
++def test_welcome_aliases_reach_the_right_handlers():
++    """The society's command names are aliases, so each must land on the same
++    handler as the name it stands for - not merely exist."""
++    from aiogram.filters import Command
++
++    owner = {}
++    for handler in handlers.router.message.handlers:
++        for flt in handler.filters or ():
++            callback = getattr(flt, "callback", None)
++            if isinstance(callback, Command):
++                for c in callback.commands:
++                    owner[str(c)] = handler.callback
++
++    for alias, canonical in (("practice", "quizme"), ("subscribeqn", "weeklyquiz"),
++                             ("unsub_qns", "stopweekly"), ("unsub_notes", "stopmonthly")):
++        assert owner[alias] is owner[canonical], alias
+ 
+ 
+ @pytest.mark.asyncio
+-- 
+2.43.0
+
